@@ -23,45 +23,7 @@ class 静默处理器(BaseHTTPRequestHandler):
 
 class 目标处理器(静默处理器):
     protocol_version = "HTTP/1.1"
-    活跃批量请求 = 0
-    最大批量并发 = 0
-    批量锁 = threading.Lock()
-
     def do_GET(self):
-        if self.path.startswith("/batch/"):
-            with self.批量锁:
-                type(self).活跃批量请求 += 1
-                type(self).最大批量并发 = max(
-                    type(self).最大批量并发,
-                    type(self).活跃批量请求,
-                )
-            try:
-                if self.path == "/batch/fail":
-                    self.send_response(200)
-                    self.send_header("Content-Length", "10")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(b"bad")
-                    self.wfile.flush()
-                    self.close_connection = True
-                    return
-                time.sleep(1 if "slow" in self.path else 0.1)
-                body = json.dumps(
-                    {
-                        "path": self.path,
-                        "request_id": self.headers.get("X-Request-Id", ""),
-                    }
-                ).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            finally:
-                with self.批量锁:
-                    type(self).活跃批量请求 -= 1
-            return
-
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/headers")
@@ -556,55 +518,6 @@ def main():
                 assert await first_read == b"abcd"
                 await concurrent.aclose()
 
-                目标处理器.最大批量并发 = 0
-                configs = [
-                    {
-                        "method": "GET",
-                        "url": target_url + f"/batch/{index}",
-                        "headers": {"X-Request-Id": str(index)},
-                        "timeout": 2,
-                        "proxy": None,
-                    }
-                    for index in range(6)
-                ]
-                configs.append(
-                    {
-                        "method": "POST",
-                        "url": target_url + "/echo-json",
-                        "json": {"文字": "可序列化", "items": [1, True, None]},
-                        "read_timeout": 2,
-                    }
-                )
-                batch = await session.amap(configs, concurrency=2)
-                assert [response.json()["path"] for response in batch[:6]] == [
-                    f"/batch/{index}" for index in range(6)
-                ]
-                assert [response.json()["request_id"] for response in batch[:6]] == [
-                    str(index) for index in range(6)
-                ]
-                assert batch[-1].json()["json"] == {
-                    "文字": "可序列化",
-                    "items": [1, True, None],
-                }
-                assert batch[-1].json()["content_type"] == "application/json"
-                assert 1 < 目标处理器.最大批量并发 <= 2
-
-                started = time.perf_counter()
-                try:
-                    await session.amap(
-                        [
-                            {"url": target_url + "/batch/slow-a"},
-                            {"url": target_url + "/batch/fail", "timeout": 2},
-                            {"url": target_url + "/batch/slow-b"},
-                        ],
-                        concurrency=3,
-                    )
-                except RuntimeError as error:
-                    assert "批量请求[1]失败" in str(error)
-                else:
-                    raise AssertionError("批量请求没有快速返回首个错误")
-                assert time.perf_counter() - started < 0.5
-
                 active = asyncio.create_task(session.get(target_url + "/slow-headers"))
                 await asyncio.sleep(0.1)
                 await session.close()
@@ -646,7 +559,7 @@ def main():
             native.close()
 
         asyncio.run(测试异步API())
-        print("动态代理、Cookie、重复头、重定向、超时、原生异步流、批量请求、异步multipart和API验证通过")
+        print("动态代理、Cookie、重复头、重定向、超时、原生异步流、异步multipart和API验证通过")
     finally:
         for server in (proxy_b, proxy_a, target):
             server.shutdown()

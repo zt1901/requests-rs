@@ -119,33 +119,26 @@ asyncio.run(main())
 
 取消Python awaitable会丢弃对应Rust Future。已经发出的网络数据不能撤回，但不会占用Python工作线程。
 
-## 可选Rust批量并发
+## 独立任务与重试
+
+真实爬虫应复用一个 `AsyncSession`，由固定数量 Worker 持续取得单条任务并独立发包。每一条请求都可带自己的 Header、Cookie、代理和超时；成功任务立即确认，失败任务只重试自身，不会因同批其他任务成功或失败而被阻塞。
 
 ```python
-responses = await session.amap(
-    [
-        {"url": "https://example.com/1"},
-        {
-            "method": "POST",
-            "url": "https://example.com/2",
-            "json": {"name": "测试"},
-            "headers": [("X-Id", "2")],
-            "proxy": None,
-            "timeout": 10,
-        },
-    ],
-    concurrency=20,
-)
+async def worker(session, queue):
+    while task := await queue.get():
+        try:
+            response = await session.get(
+                task["url"],
+                headers=task.get("headers"),
+                cookies=task.get("cookies"),
+                proxy=task.get("proxy"),
+            )
+            await confirm_success(task, response)
+        except Exception as error:
+            await retry_task(task, error)
+        finally:
+            queue.task_done()
 ```
-
-`amap`是保留的可选功能，不是项目默认性能模式。真实爬虫优先使用一个 `AsyncSession`和固定数量普通请求Worker。`amap`行为：
-
-- 每项具有独立方法、URL、参数、Header、Body、JSON、代理、超时和重定向策略。
-- Rust内部有界并发，返回顺序与输入顺序一致。
-- 首个完成的错误立即终止批次并丢弃其他未完成Future；错误包含请求下标。
-- 指纹轮换序号按输入顺序预先分配，不按完成顺序分配。
-- 不支持批量 `files`或 `stream=True`，这两种模式使用单请求异步API。
-- 仅在业务明确需要一次提交完整列表、Rust有界并发和输入保序结果时使用。长期运行场景不要一次创建数千个Task，也不需要 `amap`；应启动固定数量Worker，每个Worker循环执行普通 `session.request()`。
 
 ## 流式响应
 
@@ -239,7 +232,7 @@ Session默认代理在设置时解析一次。单请求代理只影响该请求�
 
 ## 400并发动态请求
 
-不用 `amap`时，可以直接让同一个业务Session执行400个原生请求Future，每次切换Header、请求Cookie覆盖值和代理：
+同一个业务Session可以执行多个原生请求 Future，每次切换 Header、请求 Cookie 覆盖值和代理：
 
 ```python
 responses = await asyncio.gather(*(
@@ -303,7 +296,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 需要GIL的阶段：解析Python参数、Python JSON编码、创建Python awaitable、把Rust结果转换为Python对象、执行用户Python代码。
 
-不持有GIL的阶段：DNS、TCP、代理握手、TLS、HTTP、连接池、重定向、Body读写、multipart文件读取、Cookie更新、超时、指纹轮换和Rust批量调度。
+不持有GIL的阶段：DNS、TCP、代理握手、TLS、HTTP、连接池、重定向、Body读写、multipart文件读取、Cookie更新、超时和指纹轮换。
 
 同步请求等待期间通过PyO3释放GIL。异步请求不使用Python线程池。冷Client构建在Tokio `spawn_blocking`中执行，不阻塞Python事件循环。进程级Tokio Runtime将blocking线程上限固定为32，防止大量异步结果转换扩张到数百个线程。
 
@@ -323,7 +316,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 - Chrome 150真实浏览器与requests_rust：41/41，100%。
 - Firefox 151真实浏览器与requests_rust：5个变体均41/41，100%。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
-- Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、批量首错、multipart、Session关闭竞态和JSON兼容。
+- Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
 
 ## 已知边界
 

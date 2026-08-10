@@ -605,53 +605,6 @@ class AsyncSession:
         )
         return _response_from_native(result)
 
-    async def amap(
-        self,
-        requests: Sequence[Mapping[str, Any]],
-        *,
-        concurrency: int = 10,
-    ) -> list[Response]:
-        if concurrency <= 0:
-            raise ValueError("concurrency必须大于0")
-        prepared_requests = []
-        for index, config in enumerate(requests):
-            config = dict(config)
-            try:
-                url = config.pop("url")
-            except KeyError:
-                raise TypeError(f"requests[{index}]缺少url") from None
-            method = config.pop("method", "GET")
-            if config.get("files") is not None or config.get("stream", False):
-                raise ValueError("amap暂不支持files或stream=True")
-            config.pop("files", None)
-            config.pop("stream", None)
-            allow_redirects = config.pop("allow_redirects", True)
-            max_redirects = config.pop("max_redirects", 10)
-            prepared = self._session._prepare_request(
-                method,
-                url,
-                params=config.pop("params", None),
-                headers=config.pop("headers", None),
-                cookies=config.pop("cookies", None),
-                data=config.pop("data", None),
-                json=config.pop("json", None),
-                timeout=config.pop("timeout", None),
-                read_timeout=config.pop("read_timeout", None),
-                proxy=config.pop("proxy", _UNSET),
-                max_redirects=max_redirects,
-            )
-            if config:
-                unexpected = next(iter(config))
-                raise TypeError(
-                    f"requests[{index}] got an unexpected keyword argument {unexpected!r}"
-                )
-            prepared_requests.append((*prepared, allow_redirects, max_redirects))
-        results = await self._session._native.request_batch_async(
-            prepared_requests,
-            concurrency,
-        )
-        return [_response_from_native(result) for result in results]
-
     async def get(self, url: str, **kwargs: Any) -> Response:
         return await self.request("GET", url, **kwargs)
 

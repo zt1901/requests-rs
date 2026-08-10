@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt};
 use pyo3::{
     exceptions::PyRuntimeError,
     prelude::*,
@@ -60,18 +60,6 @@ type RawNativeResponse = (
     Vec<NativeHistoryEntry>,
 );
 type NativeBodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send>>;
-type NativeRequestConfig = (
-    String,
-    String,
-    Vec<(String, String)>,
-    Option<Vec<u8>>,
-    f64,
-    Option<f64>,
-    bool,
-    Option<String>,
-    bool,
-    usize,
-);
 
 static 共享运行时: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
 static 指纹记录缓存: OnceLock<Result<Vec<Arc<Record>>, String>> = OnceLock::new();
@@ -692,10 +680,6 @@ fn ensure_open(state: &SessionState) -> PyResult<()> {
     Ok(())
 }
 
-fn batch_error(index: usize, error: PyErr) -> PyErr {
-    PyRuntimeError::new_err(format!("批量请求[{index}]失败: {error}"))
-}
-
 fn selected_proxy(
     state: &SessionState,
     proxy_override: bool,
@@ -1307,126 +1291,6 @@ impl NativeSession {
                 profile,
             )
             .await
-        })
-    }
-
-    // 批量入口预先固定每条请求的指纹序号，再在Rust运行时内限制并发。
-    #[pyo3(signature = (requests, concurrency))]
-    fn request_batch_async<'py>(
-        &self,
-        py: Python<'py>,
-        requests: Vec<NativeRequestConfig>,
-        concurrency: usize,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        ensure_open(&self.state)?;
-        if concurrency == 0 {
-            return Err(PyRuntimeError::new_err("concurrency必须大于0"));
-        }
-        let mut prepared = Vec::with_capacity(requests.len());
-        for (position, request) in requests.into_iter().enumerate() {
-            let (
-                method,
-                url,
-                headers,
-                body,
-                timeout,
-                read_timeout,
-                proxy_override,
-                proxy,
-                allow_redirects,
-                max_redirects,
-            ) = request;
-            let index = if self.state.rotation {
-                self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-            } else {
-                0
-            };
-            prepared.push((
-                position,
-                index,
-                parse_method(&method).map_err(|error| batch_error(position, error))?,
-                url,
-                parse_headers(headers).map_err(|error| batch_error(position, error))?,
-                body,
-                parse_timeout("timeout", timeout).map_err(|error| batch_error(position, error))?,
-                parse_optional_timeout("read_timeout", read_timeout)
-                    .map_err(|error| batch_error(position, error))?,
-                selected_proxy(&self.state, proxy_override, proxy)
-                    .map_err(|error| batch_error(position, error))?,
-                allow_redirects,
-                max_redirects,
-                self.state.variants[index].record.id.clone(),
-                self.state.profile.clone(),
-            ));
-        }
-        let state = self.state.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let request_count = prepared.len();
-            let mut clients = HashMap::new();
-            let mut first_positions = HashMap::new();
-            for request in &prepared {
-                first_positions.entry(request.1).or_insert(request.0);
-            }
-            for (variant_index, position) in first_positions {
-                let client = cached_client_async(state.clone(), variant_index)
-                    .await
-                    .map_err(|error| batch_error(position, error))?;
-                clients.insert(variant_index, client);
-            }
-            let requests = futures_util::stream::iter(prepared.into_iter().map(|request| {
-                let client = clients
-                    .get(&request.1)
-                    .expect("批量请求使用的Client已经准备完成")
-                    .clone();
-                async move {
-                    let (
-                        position,
-                        _variant_index,
-                        method,
-                        url,
-                        headers,
-                        body,
-                        timeout,
-                        read_timeout,
-                        proxy,
-                        allow_redirects,
-                        max_redirects,
-                        fingerprint_id,
-                        profile,
-                    ) = request;
-                    execute_request(
-                        client,
-                        method,
-                        url,
-                        headers,
-                        body,
-                        timeout,
-                        read_timeout,
-                        proxy,
-                        allow_redirects,
-                        max_redirects,
-                        fingerprint_id,
-                        profile,
-                    )
-                    .await
-                    .map_err(|error| {
-                        PyRuntimeError::new_err(format!("批量请求[{position}]失败: {error}"))
-                    })
-                    .map(|response| (position, response))
-                }
-            }))
-            .buffer_unordered(concurrency);
-            futures_util::pin_mut!(requests);
-            let mut ordered = std::iter::repeat_with(|| None)
-                .take(request_count)
-                .collect::<Vec<_>>();
-            while let Some((position, response)) = requests.try_next().await? {
-                ordered[position] = Some(response);
-            }
-            Ok(ordered
-                .into_iter()
-                .map(|response| response.expect("批量请求结果已经完整收集"))
-                .collect::<Vec<_>>())
         })
     }
 
