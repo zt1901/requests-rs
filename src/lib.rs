@@ -106,7 +106,8 @@ struct Record {
 
 #[derive(Debug, Clone, Deserialize)]
 struct TlsCapture {
-    server_name: Option<String>,
+    #[serde(rename = "server_name")]
+    _server_name: Option<String>,
     cipher_suites: Vec<u16>,
     extensions: Vec<u16>,
     supported_groups: Vec<u16>,
@@ -606,7 +607,8 @@ fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
         .map_err(|error| anyhow::anyhow!(error.clone()))?;
     let mut builder = Client::builder()
         .emulation(emulation.clone())
-        .tls_sni(variant.record.tls.server_name.is_some())
+        // 浏览器按当前请求目标的域名发送SNI，不能由采集记录某次请求是否带SNI决定。
+        .tls_sni(true)
         .tls_session_cache(variant.session_cache.clone())
         .cookie_provider(state.cookie_jar.clone());
     if let Some(timeout) = state.connect_timeout {

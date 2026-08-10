@@ -12,6 +12,7 @@ from ._native import NativeSession, available_profiles
 
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
 FileInput = Mapping[str, str | os.PathLike[str] | tuple[str, str | os.PathLike[str], str | None]]
+浏览器自动请求头 = {"user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
 _UNSET = object()
 
 
@@ -260,17 +261,25 @@ class Session:
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         fingerprints_path: str | os.PathLike[str] | None = None,
+        auto_profile_headers: bool = False,
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
         _validate_timeout("read_timeout", read_timeout, optional=True)
         self.impersonate = impersonate
         self.headers = _header_items(headers)
+        if auto_profile_headers:
+            self.headers = [
+                (name, value)
+                for name, value in self.headers
+                if name.lower() not in 浏览器自动请求头
+            ]
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.proxy = proxy
         self.fingerprints_path = fingerprints_path
+        self.auto_profile_headers = auto_profile_headers
         self._native = NativeSession(
             impersonate,
             fingerprint_rotation,
@@ -316,6 +325,13 @@ class Session:
             url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
         request_headers = _header_items(headers)
+        if self.auto_profile_headers:
+            # 使用profile采集的UA和Chromium Client Hints，避免请求级覆盖混搭浏览器版本。
+            request_headers = [
+                (name, value)
+                for name, value in request_headers
+                if name.lower() not in 浏览器自动请求头
+            ]
         overridden_names = {name.lower() for name, _ in request_headers}
         merged_headers = [
             (name, value)
@@ -650,6 +666,7 @@ def request(
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
     fingerprints_path: str | os.PathLike[str] | None = None,
+    auto_profile_headers: bool = False,
     **kwargs: Any,
 ) -> Response:
     with Session(
@@ -660,6 +677,7 @@ def request(
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
         fingerprints_path=fingerprints_path,
+        auto_profile_headers=auto_profile_headers,
     ) as session:
         return session.request(method, url, **kwargs)
 

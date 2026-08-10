@@ -76,6 +76,8 @@ class 目标处理器(静默处理器):
             {
                 "duplicate_request_headers": self.headers.get_all("X-Repeat") or [],
                 "cookie": self.headers.get("Cookie", ""),
+                "user_agent": self.headers.get("User-Agent", ""),
+                "sec_ch_ua": self.headers.get("sec-ch-ua", ""),
             }
         ).encode()
         self.send_response(200)
@@ -192,13 +194,43 @@ def main():
             assert first.json()["duplicate_request_headers"] == ["one", "two"]
             assert first.headers.get_list("set-cookie") == ["first=1; Path=/", "second=2; Path=/"]
             assert first.headers.get_list("x-test-proxy") == ["A"]
+            assert proxy_a_handler.命中记录 == ["A"]
+            assert proxy_b_handler.命中记录 == []
+
+            # 默认允许业务覆盖；开启后始终采用profile采集的UA和Chromium Client Hints。
+            profile记录 = next(
+                记录
+                for 记录 in json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
+                if 记录["profile"] == 测试版本
+            )
+            profile请求头 = {
+                name.lower(): value for name, value in profile记录["http"]["headers"]
+            }
+            覆盖请求头 = {
+                "User-Agent": "RequestsRustOverride/1.0",
+                "sec-ch-ua": '"RequestsRustOverride";v="1"',
+            }
+            默认覆盖 = session.get(target_url + "/headers", headers=覆盖请求头).json()
+            assert 默认覆盖["user_agent"] == 覆盖请求头["User-Agent"], 默认覆盖
+            assert 默认覆盖["sec_ch_ua"] == 覆盖请求头["sec-ch-ua"], 默认覆盖
+
+            with Session(
+                impersonate=测试版本,
+                headers=覆盖请求头,
+                auto_profile_headers=True,
+            ) as 自动匹配会话:
+                自动匹配 = 自动匹配会话.get(
+                    target_url + "/headers",
+                    headers=覆盖请求头,
+                ).json()
+            assert 自动匹配["user_agent"] == profile请求头["user-agent"]
+            assert 自动匹配["sec_ch_ua"] == profile请求头["sec-ch-ua"]
 
             session.set_proxy(proxy_b_url)
             second = session.get(target_url + "/headers")
             assert second.headers["x-test-proxy"] == "B"
             assert "first=1" in second.json()["cookie"]
             assert "second=2" in second.json()["cookie"]
-            assert proxy_a_handler.命中记录 == ["A"]
             assert proxy_b_handler.命中记录 == ["B"]
 
             direct = session.get(target_url + "/headers", proxy=None)

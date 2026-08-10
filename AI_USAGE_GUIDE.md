@@ -47,10 +47,13 @@ Session(
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
     fingerprints_path: str | None = None,
+    auto_profile_headers: bool = False,
 )
 ```
 
 `fingerprints_path`传入指纹JSON文件路径时，该实例在构造时独立读取并解析文件（提前单实例加载），指纹只属于这个实例，不进入进程级全局缓存；多个实例可同时各读各的文件，互不干扰。文件格式与内置 `fingerprints.json` 一致（`id`、`profile`、`tls`、`http` 字段的指纹记录列表）。不传时回退到编译进wheel的内置指纹。文件不存在或解析失败在构造时直接抛错；实例选择的版本在该文件中不存在时，错误信息会列出该文件里的可用版本。
+
+`auto_profile_headers=False`是默认行为，调用方传入的 `User-Agent`、`sec-ch-ua`、`sec-ch-ua-mobile`、`sec-ch-ua-platform` 可覆盖 profile 默认 Header。设为 `True` 时，这些调用方覆盖会被忽略，始终使用当前 profile JSON 采集的默认 Header，避免把不同浏览器版本的 TLS 与 UA/Client Hints 混搭。其他请求 Header 不受影响。
 
 同步示例：
 

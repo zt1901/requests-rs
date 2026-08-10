@@ -53,6 +53,8 @@ response = get(
 
 `fingerprints_path` 会在创建 Session 时读取并解析 JSON。文件内容仅属于当前实例，多个实例可同时使用不同文件。文件格式与仓库的 `fingerprints.json` 一致。
 
+`auto_profile_headers=False` 默认允许业务覆盖 `User-Agent` 与 `sec-ch-ua*`。设为 `True` 时，这些 Header 强制使用当前 profile 采集值，避免 TLS profile 与浏览器 Header 版本混搭。
+
 ## 核心能力
 
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
