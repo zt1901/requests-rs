@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "requests_rust"
+version = "0.2.3"
+description = "基于wreq和内置采集指纹的浏览器网络客户端"
+requires-python = ">=3.10"
+license = "Proprietary"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "requests_rust._native"
+bindings = "pyo3"
+features = ["pyo3/abi3-py310", "pyo3/bytes", "pyo3/extension-module"]
+include = ["fingerprints.json", "README.md", "AI_USAGE_GUIDE.md"]

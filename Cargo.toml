@@ -1,0 +1,36 @@
+[package]
+name = "requests_rust"
+version = "0.2.3"
+edition = "2024"
+license = "Proprietary"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+brotli = "8"
+bytes = "1"
+flate2 = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pyo3 = { version = "0.28", features = ["abi3-py310", "bytes", "extension-module"] }
+pyo3-async-runtimes = { version = "0.28", default-features = false, features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+webpki-root-certs = "1"
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart"] }
+zstd = "0.13"
+
+[target.'cfg(not(windows))'.dependencies]
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "prefix-symbols"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[patch.crates-io]
+http2 = { path = "vendor/http2" }
+btls-sys = { path = "vendor/btls/btls-sys" }

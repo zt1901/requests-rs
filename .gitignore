@@ -1,0 +1,19 @@
+# Rust构建产物
+/target/
+
+# Python产物
+/__pycache__/
+*.pyc
+*.pyd
+*.so
+/.venv/
+
+# wheel输出
+/dist/
+
+# 历史审查归档，不属于当前源码发行物
+/xreq-*-ai-review-package.zip
+
+# IDE
+/.idea/
+/.vscode/

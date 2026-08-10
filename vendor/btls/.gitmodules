@@ -1,0 +1,4 @@
+[submodule "btls-sys/deps/boringssl"]
+	path = btls-sys/deps/boringssl
+	url = https://github.com/google/boringssl.git
+	ignore = dirty
