@@ -43,7 +43,8 @@ struct Record {
 
 #[derive(Debug, Deserialize)]
 struct TlsCapture {
-    server_name: Option<String>,
+    #[serde(rename = "server_name")]
+    _server_name: Option<String>,
     cipher_suites: Vec<u16>,
     extensions: Vec<u16>,
     supported_groups: Vec<u16>,
@@ -365,7 +366,9 @@ fn build_tls(capture: &TlsCapture, limitations: &mut Vec<String>) -> Result<TlsO
         .min_tls_version(TlsVersion::TLS_1_2)
         .max_tls_version(TlsVersion::TLS_1_3)
         .session_ticket(capture.has_session_ticket)
-        .pre_shared_key(capture.extensions.contains(&41))
+        // ClientHello中的PSK扩展只在命中先前服务端ticket时出现，不能用一次采集
+        // 是否出现41决定会话缓存；支持Session Ticket的profile应允许后续自然恢复。
+        .pre_shared_key(capture.has_session_ticket)
         .enable_ocsp_stapling(capture.has_status_request)
         .enable_signed_cert_timestamps(capture.has_signed_certificate_timestamp)
         .enable_ech_grease(capture.has_ech)
@@ -421,10 +424,10 @@ fn build_tls(capture: &TlsCapture, limitations: &mut Vec<String>) -> Result<TlsO
     if !extension_order.is_empty() {
         builder = builder.extension_permutation(extension_order);
     }
-    if capture.extensions.contains(&17613) {
+    if capture.extensions.contains(&17613) || capture.extensions.contains(&17513) {
         builder = builder
             .alps_protocols([wreq::tls::AlpsProtocol::HTTP2])
-            .alps_use_new_codepoint(true);
+            .alps_use_new_codepoint(capture.extensions.contains(&17613));
     }
 
     Ok(builder.build())
@@ -526,6 +529,7 @@ fn build_http2(capture: &HttpCapture, limitations: &mut Vec<String>) -> Http2Opt
 }
 
 fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
+    // 导航上下文与业务/API请求不一致，不能把一次导航采集值固化到每条请求。
     let ignored = [
         "host",
         "content-length",
@@ -533,6 +537,15 @@ fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
         "cookie",
         "authorization",
         "proxy-authorization",
+        "accept",
+        "origin",
+        "referer",
+        "upgrade-insecure-requests",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-user",
+        "sec-fetch-dest",
+        "priority",
     ];
     let mut headers = HeaderMap::new();
     let mut original = OrigHeaderMap::new();
@@ -568,7 +581,8 @@ fn build_client(
     }
     let mut builder = Client::builder()
         .emulation(emulation.build(Default::default()))
-        .tls_sni(record.tls.server_name.is_some())
+        // 每次握手由请求目标的URI host决定SNI，不能依赖采集记录中的一次性值。
+        .tls_sni(true)
         .tls_session_cache(session_cache)
         .connect_timeout(Duration::from_secs(请求超时秒数));
 

@@ -78,6 +78,12 @@ class 目标处理器(静默处理器):
                 "cookie": self.headers.get("Cookie", ""),
                 "user_agent": self.headers.get("User-Agent", ""),
                 "sec_ch_ua": self.headers.get("sec-ch-ua", ""),
+                "accept": self.headers.get("Accept", ""),
+                "sec_fetch_site": self.headers.get("sec-fetch-site", ""),
+                "sec_fetch_mode": self.headers.get("sec-fetch-mode", ""),
+                "sec_fetch_dest": self.headers.get("sec-fetch-dest", ""),
+                "upgrade_insecure_requests": self.headers.get("Upgrade-Insecure-Requests", ""),
+                "priority": self.headers.get("Priority", ""),
             }
         ).encode()
         self.send_response(200)
@@ -225,6 +231,18 @@ def main():
                 ).json()
             assert 自动匹配["user_agent"] == profile请求头["user-agent"]
             assert 自动匹配["sec_ch_ua"] == profile请求头["sec-ch-ua"]
+
+            # 一次顶层导航的上下文头不能作为所有业务请求的默认画像发送。
+            默认上下文 = session.get(target_url + "/headers").json()
+            for key in (
+                "accept",
+                "sec_fetch_site",
+                "sec_fetch_mode",
+                "sec_fetch_dest",
+                "upgrade_insecure_requests",
+                "priority",
+            ):
+                assert 默认上下文[key] == "", (key, 默认上下文)
 
             session.set_proxy(proxy_b_url)
             second = session.get(target_url + "/headers")

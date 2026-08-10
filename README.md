@@ -55,6 +55,8 @@ response = get(
 
 `auto_profile_headers=False` 默认允许业务覆盖 `User-Agent` 与 `sec-ch-ua*`。设为 `True` 时，这些 Header 强制使用当前 profile 采集值，避免 TLS profile 与浏览器 Header 版本混搭。
 
+profile 默认 Header 仅包含稳定浏览器画像。`accept`、`origin`、`referer`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 必须由具体请求上下文传入。
+
 ## 核心能力
 
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`

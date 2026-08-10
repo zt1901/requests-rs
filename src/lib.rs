@@ -373,7 +373,10 @@ fn build_tls(capture: &TlsCapture) -> Result<TlsOptions> {
         .min_tls_version(TlsVersion::TLS_1_2)
         .max_tls_version(TlsVersion::TLS_1_3)
         .session_ticket(capture.has_session_ticket)
-        .pre_shared_key(capture.extensions.contains(&41))
+        // 扩展41只会在已经拿到服务器ticket的后续握手中出现。以采集到的一次
+        // ClientHello 是否包含41决定缓存，会让首次握手未恢复的profile永远无法恢复。
+        // 浏览器支持Session Ticket时先建立缓存，BTLS仅在缓存命中后自然发送PSK。
+        .pre_shared_key(capture.has_session_ticket)
         .enable_ocsp_stapling(capture.has_status_request)
         .enable_signed_cert_timestamps(capture.has_signed_certificate_timestamp)
         .enable_ech_grease(capture.has_ech)
@@ -537,6 +540,8 @@ fn build_http2(capture: &HttpCapture) -> Http2Options {
 }
 
 fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
+    // 这些字段取决于当前请求类型、发起页面和调度优先级；采集自一次顶层导航，
+    // 不能作为所有 API、资源或跨站请求的固定浏览器默认值发送。
     let ignored = [
         "host",
         "content-length",
@@ -544,6 +549,15 @@ fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
         "cookie",
         "authorization",
         "proxy-authorization",
+        "accept",
+        "origin",
+        "referer",
+        "upgrade-insecure-requests",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-user",
+        "sec-fetch-dest",
+        "priority",
     ];
     let mut headers = HeaderMap::new();
     let mut original = OrigHeaderMap::new();

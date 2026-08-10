@@ -55,6 +55,8 @@ Session(
 
 `auto_profile_headers=False`是默认行为，调用方传入的 `User-Agent`、`sec-ch-ua`、`sec-ch-ua-mobile`、`sec-ch-ua-platform` 可覆盖 profile 默认 Header。设为 `True` 时，这些调用方覆盖会被忽略，始终使用当前 profile JSON 采集的默认 Header，避免把不同浏览器版本的 TLS 与 UA/Client Hints 混搭。其他请求 Header 不受影响。
 
+profile 默认 Header 只保留跨请求稳定的浏览器画像，例如 `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding` 与 HTTP/2 的 `te`。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化；调用方应按实际请求传入。
+
 同步示例：
 
 ```python
