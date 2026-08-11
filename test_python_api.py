@@ -213,7 +213,12 @@ def main():
                     proxies={"http://": proxy_a_url},
                 )
                 assert request_mapped.headers["x-test-proxy"] == "A"
-            assert len(proxy_a_handler.命中记录) == 映射前A次数 + 1
+                fallback_mapped = 映射代理会话.get(
+                    target_url + "/headers",
+                    proxies={"all": proxy_a_url},
+                )
+                assert fallback_mapped.headers["x-test-proxy"] == "A"
+            assert len(proxy_a_handler.命中记录) == 映射前A次数 + 2
             assert len(proxy_b_handler.命中记录) == 映射前B次数 + 1
             try:
                 Session(impersonate=测试版本, proxy=proxy_a_url, proxies={"http": proxy_b_url})

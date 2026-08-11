@@ -713,6 +713,28 @@ fn selected_proxy(
     Ok(state.proxy.load_full().map(|proxy| (*proxy).clone()))
 }
 
+fn select_proxy_mapping(
+    url: &str,
+    proxies: Vec<(String, Option<String>)>,
+) -> PyResult<Option<String>> {
+    let scheme = Uri::from_maybe_shared(url.to_string())
+        .map_err(to_py_error)?
+        .scheme_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for key in [
+        format!("{scheme}://"),
+        scheme,
+        "all://".to_string(),
+        "all".to_string(),
+    ] {
+        if let Some((_, proxy)) = proxies.iter().find(|(name, _)| name == &key) {
+            return Ok(proxy.clone());
+        }
+    }
+    Ok(None)
+}
+
 fn parse_method(method: &str) -> PyResult<Method> {
     Ok(match method {
         "GET" => Method::GET,
@@ -1557,6 +1579,15 @@ impl NativeSession {
             variant.client.store(None);
         }
         Ok(())
+    }
+
+    fn select_proxy(
+        &self,
+        url: String,
+        proxies: Vec<(String, Option<String>)>,
+    ) -> PyResult<Option<String>> {
+        ensure_open(&self.state)?;
+        select_proxy_mapping(&url, proxies)
     }
 
     fn set_default_headers(&self, headers: Vec<(String, String)>) -> PyResult<()> {

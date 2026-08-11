@@ -138,18 +138,6 @@ def _validate_timeout(name: str, value: float | None, *, optional: bool = False)
         raise ValueError(f"{name}必须是有限正数")
 
 
-def _select_proxy(url: str, proxies: ProxyInput) -> str | None:
-    """按目标协议选择 curl_cffi 风格的代理映射项。"""
-    scheme = urlsplit(url).scheme.lower()
-    for key in (f"{scheme}://", scheme, "all://", "all"):
-        if key in proxies:
-            proxy = proxies[key]
-            if proxy is not None and not isinstance(proxy, str):
-                raise TypeError(f"proxies[{key!r}]必须是str或None")
-            return proxy
-    return None
-
-
 class Response:
     def __init__(
         self,
@@ -373,10 +361,10 @@ class Session:
             request_proxy = proxy
         elif proxies is not None:
             proxy_override = True
-            request_proxy = _select_proxy(url, proxies)
+            request_proxy = self._native.select_proxy(url, list(proxies.items()))
         elif self.proxies is not None:
             proxy_override = True
-            request_proxy = _select_proxy(url, self.proxies)
+            request_proxy = self._native.select_proxy(url, list(self.proxies.items()))
         else:
             proxy_override = False
             request_proxy = None
