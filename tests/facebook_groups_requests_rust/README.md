@@ -23,3 +23,5 @@
 测试入口强制使用代理：未传 `--proxy` 时回退到原项目同一份 IPIPGO 默认代理，并为每条请求生成随机 sticky session。启动时只打印代理主机，不打印认证信息。
 
 Cookie、`x-fb-lsd`、`jazoest`、`__spin_*` 等仍由原 Facebook 业务流程产生，不属于 `fingerprints.json`；不要写入指纹库。
+
+Cookie 对照只发生在本测试运行时：`--cookie-mode home` 将主页 `Set-Cookie` 原样用于 GraphQL 分页；`--cookie-mode fake` 使用相同 Cookie 名称和值长度的伪值。两种模式都不会打印真实 Cookie，也不会写入 `fingerprints.json`。

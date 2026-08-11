@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -235,15 +236,38 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
                     has_next_page = bool(page_info.get("has_next_page"))
             return [self._post(edge, group_url, group_id) for edge in edges], cursor, has_next_page
 
-    def __init__(self, *, proxies: dict | None = None, fallback_proxies: dict | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        proxies: dict | None = None,
+        fallback_proxies: dict | None = None,
+        cookie_mode: str = "home",
+        **kwargs: Any,
+    ) -> None:
+        if cookie_mode not in {"home", "fake"}:
+            raise ValueError("cookie_mode 只能是 home 或 fake")
         proxy = (proxies or {}).get("https") or (proxies or {}).get("http")
         fallback_proxy = (fallback_proxies or {}).get("https") or (fallback_proxies or {}).get("http")
         super().__init__(proxy=proxy, fallback_proxy=fallback_proxy, **kwargs)
         self._parser = self.Parser()
+        self.cookie_mode = cookie_mode
 
     async def _parse(self, function: Any, *args: Any) -> Any:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.parse_thread_pool, function, *args)
+
+    @staticmethod
+    def _homepage_cookies(response, fake: bool) -> dict[str, str]:
+        """读取主页 Set-Cookie；fake 模式仅保留名称和值长度，不保留真实会话值。"""
+        cookies: dict[str, str] = {}
+        for value in response.headers.get_list("set-cookie"):
+            pair = value.split(";", 1)[0]
+            if "=" not in pair:
+                continue
+            name, cookie_value = pair.split("=", 1)
+            if name:
+                cookies[name] = "A" * max(1, len(cookie_value)) if fake else cookie_value
+        return cookies
 
     @staticmethod
     def _variables(cursor: str, group_id: str, count: int) -> dict[str, Any]:
@@ -268,10 +292,18 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
         return variables
 
     async def _crawl_one(self, group_url: str, results_limit: int) -> list[dict[str, Any]]:
+        # 首页与本组所有 GraphQL 分页共享同一个 sticky 代理 session。
+        # 只有 process() 发生可重试失败时才会替换该 sessionid。
+        proxy_state: dict[str, Any] = {}
         page_data = None
         last_error = None
         for _ in range(self.RETRY_TIMES):
-            response = await self.get(group_url, headers=self.headers, timeout=self.REQUEST_TIMEOUT)
+            response = await self.get(
+                group_url,
+                headers=self.headers,
+                timeout=self.REQUEST_TIMEOUT,
+                proxy_state=proxy_state,
+            )
             try:
                 page_data = await self._parse(self._parser.extract_page_data, response.text)
                 print(
@@ -286,6 +318,10 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
                 f"{group_url} 首页缺少群组协议数据；最后响应状态={response.status_code}，"
                 f"最终URL={response.url}，内容前缀={response.text[:300]!r}"
             ) from last_error
+
+        request_cookies = self._homepage_cookies(response, fake=self.cookie_mode == "fake")
+        print(f"主页 Cookie: 模式={self.cookie_mode}，数量={len(request_cookies)}", flush=True)
+
         headers = {
             "accept": "*/*",
             "content-type": "application/x-www-form-urlencoded",
@@ -307,62 +343,66 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
         posts: list[dict[str, Any]] = []
         request_number = 0
         while len(posts) < results_limit:
-            request_number += 1
-            count = min(self.POSTS_PER_PAGE, results_limit - len(posts))
-            form = {
-                "av": "0",
-                "__aaid": "0",
-                "__user": "0",
-                "__a": "1",
-                "__req": format(request_number + 11, "x"),
-                "dpr": "1",
-                "__ccg": "EXCELLENT",
-                "__rev": page_data["spin_r"],
-                "__hsi": page_data["hsi"],
-                "__comet_req": "15",
-                "lsd": page_data["lsd"],
-                "jazoest": page_data["jazoest"],
-                "__spin_r": page_data["spin_r"],
-                "__spin_b": page_data["spin_b"],
-                "__spin_t": page_data["spin_t"],
-                "__crn": "comet.fbweb.CometGroupDiscussionRoute",
-                "fb_api_caller_class": "RelayModern",
-                "fb_api_req_friendly_name": self.FRIENDLY_NAME,
-                "server_timestamps": "true",
-                "variables": json.dumps(
-                    self._variables(cursor, page_data["group_id"], count), separators=(",", ":")
-                ),
-                "doc_id": self.DOC_ID,
-            }
-            page_posts: list[dict[str, Any]] = []
-            next_cursor = None
-            has_next_page = False
-            for _ in range(self.RETRY_TIMES):
-                response = await self.post(
-                    self.GRAPHQL_URL,
-                    headers=headers,
-                    data=form,
-                    timeout=self.GRAPHQL_TIMEOUT,
-                )
-                page_posts, next_cursor, has_next_page = await self._parse(
-                    self._parser.parse_graphql,
-                    response.text,
-                    group_url,
-                    page_data["group_id"],
-                )
-                print(
-                    f"分页成功: 第{request_number}页，帖子={len(page_posts)}，"
-                    f"下一页={'是' if has_next_page and next_cursor else '否'}，HTTP={response.status_code}",
-                    flush=True,
-                )
-                if page_posts and (len(page_posts) >= count or has_next_page):
-                    break
-            posts.extend(page_posts[: results_limit - len(posts)])
-            if len(posts) >= results_limit or not next_cursor or not has_next_page:
-                break
-            if next_cursor == cursor:
-                raise RuntimeError(f"{group_url} 分页 cursor 未变化，停止避免无限循环")
-            cursor = next_cursor
+                request_number += 1
+                count = min(self.POSTS_PER_PAGE, results_limit - len(posts))
+                form = {
+                    "av": "0",
+                    "__aaid": "0",
+                    "__user": "0",
+                    "__a": "1",
+                    "__req": format(request_number + 11, "x"),
+                    "dpr": "1",
+                    "__ccg": "EXCELLENT",
+                    "__rev": page_data["spin_r"],
+                    "__hsi": page_data["hsi"],
+                    "__comet_req": "15",
+                    "lsd": page_data["lsd"],
+                    "jazoest": page_data["jazoest"],
+                    "__spin_r": page_data["spin_r"],
+                    "__spin_b": page_data["spin_b"],
+                    "__spin_t": page_data["spin_t"],
+                    "__crn": "comet.fbweb.CometGroupDiscussionRoute",
+                    "fb_api_caller_class": "RelayModern",
+                    "fb_api_req_friendly_name": self.FRIENDLY_NAME,
+                    "server_timestamps": "true",
+                    "variables": json.dumps(
+                        self._variables(cursor, page_data["group_id"], count), separators=(",", ":")
+                    ),
+                    "doc_id": self.DOC_ID,
+                }
+                page_posts: list[dict[str, Any]] = []
+                next_cursor = None
+                has_next_page = False
+                for _ in range(self.RETRY_TIMES):
+                    翻页开始时间 = time.perf_counter()
+                    response = await self.post(
+                        self.GRAPHQL_URL,
+                        headers=headers,
+                        data=form,
+                        cookies=request_cookies,
+                        timeout=self.GRAPHQL_TIMEOUT,
+                        proxy_state=proxy_state,
+                    )
+                    page_posts, next_cursor, has_next_page = await self._parse(
+                        self._parser.parse_graphql,
+                        response.text,
+                        group_url,
+                        page_data["group_id"],
+                    )
+                    print(
+                        f"分页成功: 第{request_number}页，帖子={len(page_posts)}，"
+                        f"下一页={'是' if has_next_page and next_cursor else '否'}，HTTP={response.status_code}，"
+                        f"耗时={time.perf_counter() - 翻页开始时间:.3f}秒",
+                        flush=True,
+                    )
+                    if page_posts and (len(page_posts) >= count or has_next_page):
+                        break
+                posts.extend(page_posts[: results_limit - len(posts)])
+                if len(posts) >= results_limit or not next_cursor or not has_next_page:
+                    return posts
+                if next_cursor == cursor:
+                    raise RuntimeError(f"{group_url} 分页 cursor 未变化，停止避免无限循环")
+                cursor = next_cursor
         return posts
 
     async def crawl(self, group_urls: list[str], results_limit: int, max_count: int | None = None) -> list[dict[str, Any]]:

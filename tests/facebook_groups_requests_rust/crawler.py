@@ -112,6 +112,7 @@ class RequestsRustCrawler:
         sources = proxy_state.setdefault("sources", [self.proxy, self.fallback_proxy])
         proxy_state.setdefault("source_index", 0)
         proxy_state.setdefault("proxy", _带随机代理会话(sources[proxy_state["source_index"]]))
+        proxy_state.setdefault("generation", 0)
         last_error: Exception | None = None
         for attempt in range(5):
             self.request_attempts += 1
@@ -125,6 +126,8 @@ class RequestsRustCrawler:
                         proxy=proxy_state["proxy"],
                         **kwargs,
                     )
+                # 对齐原 CurlCrawler 的 discard_cookies=True：本测试链路不保留响应 Set-Cookie。
+                self.session.cookies.clear()
                 if response.status_code >= 500 or response.status_code == 429:
                     raise 可重试请求错误(f"HTTP {response.status_code}: {response.text[:300]!r}")
                 if response.status_code >= 400:
@@ -143,15 +146,14 @@ class RequestsRustCrawler:
                 self.request_retries += 1
                 proxy_state["source_index"] = (proxy_state["source_index"] + 1) % len(sources)
                 proxy_state["proxy"] = _带随机代理会话(sources[proxy_state["source_index"]])
+                proxy_state["generation"] += 1
                 print(f"请求重试 {attempt + 2}/5: {type(error).__name__}", flush=True)
         raise RuntimeError("请求重试状态异常") from last_error
 
     async def get(self, url: str, **kwargs: Any) -> Response:
-        kwargs.setdefault("proxy_state", {})
         return await self.process("GET", url, **kwargs)
 
     async def post(self, url: str, **kwargs: Any) -> Response:
-        kwargs.setdefault("proxy_state", {})
         return await self.process("POST", url, **kwargs)
 
     async def aclose(self) -> None:

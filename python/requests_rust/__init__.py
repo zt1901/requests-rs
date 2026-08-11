@@ -1,5 +1,22 @@
-from .requests import AsyncSession, Cookie, Cookies, CookieTypes, Headers, Response, Session, delete, get, head, options, patch, post, put, request
-from ._native import available_profiles
+from ._native import (
+    AsyncSession,
+    Cookie,
+    CookieTypes,
+    Cookies,
+    Headers,
+    Response,
+    Session,
+    available_profiles,
+    delete,
+    get,
+    head,
+    options,
+    patch,
+    post,
+    put,
+    readme,
+    request,
+)
 
 __all__ = [
     "Response",
@@ -18,4 +35,5 @@ __all__ = [
     "head",
     "options",
     "available_profiles",
+    "readme",
 ]

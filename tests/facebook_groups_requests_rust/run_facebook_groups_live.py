@@ -25,6 +25,8 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 默认指纹版本 = "chrome142"
 默认指纹文件 = 项目目录 / "fingerprints.json"
 默认代理地址 = ""
+# home：主页 Set-Cookie 原样带到 GraphQL；fake：同名称、同长度但不用真实 Cookie 值。
+默认Cookie模式 = "fake"
 # ══════════════════════════════════════════════════
 
 
@@ -35,6 +37,7 @@ def 解析参数() -> argparse.Namespace:
     parser.add_argument("--proxy", default=默认代理地址)
     parser.add_argument("--impersonate", default=默认指纹版本)
     parser.add_argument("--fingerprints-path", default=str(默认指纹文件))
+    parser.add_argument("--cookie-mode", choices=("home", "fake"), default=默认Cookie模式)
     return parser.parse_args()
 
 
@@ -50,10 +53,17 @@ async def main() -> None:
         fallback_proxies=proxies,
         fingerprints_path=args.fingerprints_path,
         impersonate=args.impersonate,
+        cookie_mode=args.cookie_mode,
     )
     try:
         print("请求参数:")
-        print(json.dumps({"groupUrls": group_urls, "resultsLimit": args.results_limit}, ensure_ascii=True, indent=2))
+        print(
+            json.dumps(
+                {"groupUrls": group_urls, "resultsLimit": args.results_limit, "cookieMode": args.cookie_mode},
+                ensure_ascii=True,
+                indent=2,
+            )
+        )
         print("代理主机:", urlsplit(proxy).hostname)
         results = await crawler.crawl(group_urls, args.results_limit) if args.results_limit else []
         print("=== Facebook Groups requests_rust 最终结果 ===")

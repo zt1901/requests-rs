@@ -16,6 +16,7 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use futures_util::{Stream, StreamExt};
 use pyo3::{
     exceptions::PyRuntimeError,
+    ffi::c_str,
     prelude::*,
     types::{PyAny, PyBytes, PyModule},
 };
@@ -39,6 +40,9 @@ use wreq::{
 };
 
 const 内置指纹: &str = include_str!("../fingerprints.json");
+const 版权说明: &str = include_str!("../NOTICE.txt");
+// 公开 API 包装作为资源编译进原生扩展，分发 wheel 不再包含明文 requests.py。
+const API包装源码: &std::ffi::CStr = c_str!(include_str!("api_wrapper.py"));
 type NativeHistoryEntry = (u16, String, String, Vec<(String, String)>);
 type NativeCookie = (String, String, Option<String>, Option<String>, bool, bool);
 type NativeResponse = (
@@ -1666,5 +1670,31 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
     module.add_class::<NativeStreamResponse>()?;
     module.add_function(wrap_pyfunction!(available_profiles, module)?)?;
+    module.add("readme", 版权说明)?;
+    let api_module = PyModule::from_code(
+        module.py(),
+        API包装源码,
+        c"requests_rust._embedded_api",
+        c"requests_rust._embedded_api",
+    )?;
+    for name in [
+        "Response",
+        "Headers",
+        "Cookie",
+        "Cookies",
+        "CookieTypes",
+        "Session",
+        "AsyncSession",
+        "request",
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+    ] {
+        module.add(name, api_module.getattr(name)?)?;
+    }
     Ok(())
 }

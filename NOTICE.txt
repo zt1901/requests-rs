@@ -1,0 +1,9 @@
+requests_rust
+Copyright (c) 2026 zt1901. All rights reserved.
+
+The original requests_rust source code, build scripts, test projects,
+fingerprint record organization, and release artifacts are proprietary.
+Use of this software does not transfer copyright, trademark, or redistribution rights.
+
+Third-party components remain subject to their respective licenses.
+See the repository vendor directories for applicable third-party notices.

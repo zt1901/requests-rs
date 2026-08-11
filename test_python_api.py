@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import json
 import socket
 import tempfile
@@ -417,8 +416,9 @@ def main():
             from requests_rust import Response
             from requests_rust._native import NativeSession
 
-            assert "to_thread" not in inspect.getsource(AsyncSession)
-            assert "to_thread" not in inspect.getsource(Response.aiter_content)
+            # 公共包装已编译进_native.pyd，源码不可再由inspect读取；异步行为以下方真实并发与流式请求验证。
+            assert AsyncSession.__module__ == "requests_rust._embedded_api"
+            assert Response.__module__ == "requests_rust._embedded_api"
             async with AsyncSession(impersonate=测试版本) as session:
                 responses = await asyncio.gather(
                     session.get(target_url + "/headers"),
