@@ -20,11 +20,11 @@ pyo3 = { version = "0.28", features = ["abi3-py310", "bytes", "extension-module"
 pyo3-async-runtimes = { version = "0.28", default-features = false, features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 webpki-root-certs = "1"
-wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate"] }
 zstd = "0.13"
 
 [target.'cfg(not(windows))'.dependencies]
-wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "prefix-symbols"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "prefix-symbols"] }
 
 [profile.release]
 codegen-units = 1
