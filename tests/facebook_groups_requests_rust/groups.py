@@ -274,6 +274,10 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
             response = await self.get(group_url, headers=self.headers, timeout=self.REQUEST_TIMEOUT)
             try:
                 page_data = await self._parse(self._parser.extract_page_data, response.text)
+                print(
+                    f"主页成功: 群组={page_data['group_id']}，cursor已获取，HTTP={response.status_code}",
+                    flush=True,
+                )
                 break
             except RuntimeError as error:
                 last_error = error
@@ -345,6 +349,11 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
                     response.text,
                     group_url,
                     page_data["group_id"],
+                )
+                print(
+                    f"分页成功: 第{request_number}页，帖子={len(page_posts)}，"
+                    f"下一页={'是' if has_next_page and next_cursor else '否'}，HTTP={response.status_code}",
+                    flush=True,
                 )
                 if page_posts and (len(page_posts) >= count or has_next_page):
                     break
