@@ -17,7 +17,7 @@
 |---|---|---:|---|
 | TLS cipher suites、扩展顺序、Supported Groups、Signature Algorithms、KeyShare groups | 浏览器采集 JSON | 是 | 固定为 profile 的传输画像；实际随机字节不写入 JSON。 |
 | ALPN、ALPS、HTTP/2 SETTINGS、HPACK、伪 Header 顺序、初始优先级 | 浏览器采集 JSON | 是 | 固定为 profile 的连接画像。 |
-| `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | 浏览器采集 JSON | 仅缺失时兜底 | 都是普通 HTTP Header。默认模式下，cURL/调用方的同名 Header 原样优先；仅未传时使用 profile 默认值。`auto_profile_headers=True` 才强制采用 profile 的 UA/Client Hints。 |
+| `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | 浏览器采集 JSON | 仅缺失时兜底 | 都是普通 HTTP Header。cURL/调用方的同名 Header 始终原样优先；仅未传时使用 profile 默认值。 |
 | SNI | 当前请求 URL | 是 | 每次 TLS 握手根据当前 URL host 生成；不读取采集 JSON 的历史 `server_name`。 |
 | TLS Random、Session ID、KeyShare 公钥、ticket、PSK binder | TLS 运行时 | 是 | 禁止从 JSON 或 cURL 固定；由 BTLS/BoringSSL 与 Session ticket cache 自然生成。 |
 | `Host`、`Content-Length`、`Connection` | HTTP 运行时 | 是 | 禁止由 profile 或模板强制固定。 |
@@ -82,8 +82,6 @@ from requests_rust import Session
 
 with Session(
     impersonate="chrome150",
-    # 复制的cURL自带真实UA/Client Hints时，库不覆盖它们。
-    auto_profile_headers=False,
 ) as session:
     response = session.post(
         "https://example.com/api/action",
@@ -93,7 +91,7 @@ with Session(
     )
 ```
 
-若只保存业务 Header、未保存或不信任 cURL 的 UA/Client Hints，则改为 `auto_profile_headers=True`，由 `chrome150` profile 自动注入匹配的 UA 与 `sec-ch-ua*`；其他业务 Header 仍按调用方传入值发送。
+若未保存 cURL 的 UA/Client Hints，则不传这些 Header，`chrome150` profile 会仅在缺失时提供自身默认值；库不会覆盖任何调用方显式传入的 Header。
 
 ## 实现原则
 
