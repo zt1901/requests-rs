@@ -202,6 +202,25 @@ def main():
             assert proxy_a_handler.命中记录 == ["A"]
             assert proxy_b_handler.命中记录 == []
 
+            映射前A次数 = len(proxy_a_handler.命中记录)
+            映射前B次数 = len(proxy_b_handler.命中记录)
+            with Session(impersonate=测试版本, proxies={"http": proxy_b_url}) as 映射代理会话:
+                mapped = 映射代理会话.get(target_url + "/headers")
+                assert mapped.headers["x-test-proxy"] == "B"
+                request_mapped = 映射代理会话.get(
+                    target_url + "/headers",
+                    proxies={"http://": proxy_a_url},
+                )
+                assert request_mapped.headers["x-test-proxy"] == "A"
+            assert len(proxy_a_handler.命中记录) == 映射前A次数 + 1
+            assert len(proxy_b_handler.命中记录) == 映射前B次数 + 1
+            try:
+                Session(impersonate=测试版本, proxy=proxy_a_url, proxies={"http": proxy_b_url})
+            except TypeError as error:
+                assert "proxy和proxies" in str(error)
+            else:
+                raise AssertionError("proxy和proxies同时传入没有被拒绝")
+
             # 浏览器cURL与业务代码传入的Header原样优先，库不接管UA或Client Hints。
             覆盖请求头 = {
                 "User-Agent": "RequestsRustOverride/1.0",
@@ -224,11 +243,12 @@ def main():
                 assert 默认上下文[key] == "", (key, 默认上下文)
 
             session.set_proxy(proxy_b_url)
+            切换前B次数 = len(proxy_b_handler.命中记录)
             second = session.get(target_url + "/headers")
             assert second.headers["x-test-proxy"] == "B"
             assert "first=1" in second.json()["cookie"]
             assert "second=2" in second.json()["cookie"]
-            assert proxy_b_handler.命中记录 == ["B"]
+            assert len(proxy_b_handler.命中记录) == 切换前B次数 + 1
 
             direct = session.get(target_url + "/headers", proxy=None)
             assert "x-test-proxy" not in direct.headers
@@ -426,6 +446,8 @@ def main():
                     session.get(target_url + "/headers"),
                 )
                 assert all(response.status_code == 200 for response in responses)
+                mapped = await session.get(target_url + "/headers", proxies={"http": proxy_a_url})
+                assert mapped.headers["x-test-proxy"] == "A"
                 streamed = await session.get(target_url + "/stream", stream=True)
                 body = bytearray()
                 async for chunk in streamed.aiter_content(4):

@@ -12,6 +12,7 @@ from ._native import NativeSession, available_profiles
 
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
 FileInput = Mapping[str, str | os.PathLike[str] | tuple[str, str | os.PathLike[str], str | None]]
+ProxyInput = Mapping[str, str | None]
 _UNSET = object()
 
 
@@ -137,6 +138,18 @@ def _validate_timeout(name: str, value: float | None, *, optional: bool = False)
         raise ValueError(f"{name}必须是有限正数")
 
 
+def _select_proxy(url: str, proxies: ProxyInput) -> str | None:
+    """按目标协议选择 curl_cffi 风格的代理映射项。"""
+    scheme = urlsplit(url).scheme.lower()
+    for key in (f"{scheme}://", scheme, "all://", "all"):
+        if key in proxies:
+            proxy = proxies[key]
+            if proxy is not None and not isinstance(proxy, str):
+                raise TypeError(f"proxies[{key!r}]必须是str或None")
+            return proxy
+    return None
+
+
 class Response:
     def __init__(
         self,
@@ -255,6 +268,7 @@ class Session:
         fingerprint_rotation: bool = False,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
+        proxies: ProxyInput | None = None,
         verify: bool = True,
         timeout: float = 30,
         connect_timeout: float | None = None,
@@ -264,12 +278,17 @@ class Session:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
         _validate_timeout("read_timeout", read_timeout, optional=True)
+        if proxy is not None and proxies is not None:
+            raise TypeError("proxy和proxies不能同时传入")
+        if proxies is not None and not isinstance(proxies, Mapping):
+            raise TypeError("proxies必须是Mapping或None")
         self.impersonate = impersonate
         self.headers = _header_items(headers)
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.proxy = proxy
+        self.proxies = dict(proxies) if proxies is not None else None
         self.fingerprints_path = fingerprints_path
         self._native = NativeSession(
             impersonate,
@@ -302,6 +321,7 @@ class Session:
         timeout: float | None,
         read_timeout: float | None,
         proxy: str | None | object,
+        proxies: ProxyInput | None,
         max_redirects: int,
     ):
         request_timeout = self.timeout if timeout is None else timeout
@@ -343,8 +363,22 @@ class Session:
                 merged_headers.append(
                     ("Cookie", "; ".join(f"{name}={value}" for name, value in values))
                 )
-        proxy_override = proxy is not _UNSET
-        request_proxy = None if proxy is _UNSET else proxy
+        if proxy is not _UNSET and proxies is not None:
+            raise TypeError("proxy和proxies不能同时传入")
+        if proxies is not None and not isinstance(proxies, Mapping):
+            raise TypeError("proxies必须是Mapping或None")
+        if proxy is not _UNSET:
+            proxy_override = True
+            request_proxy = proxy
+        elif proxies is not None:
+            proxy_override = True
+            request_proxy = _select_proxy(url, proxies)
+        elif self.proxies is not None:
+            proxy_override = True
+            request_proxy = _select_proxy(url, self.proxies)
+        else:
+            proxy_override = False
+            request_proxy = None
         if json is not None:
             body = json_module.dumps(json, ensure_ascii=False, separators=(",", ":")).encode()
             if "content-type" not in header_names:
@@ -383,6 +417,7 @@ class Session:
         read_timeout: float | None = None,
         stream: bool = False,
         proxy: str | None | object = _UNSET,
+        proxies: ProxyInput | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
     ) -> Response:
@@ -399,6 +434,7 @@ class Session:
             timeout=timeout,
             read_timeout=read_timeout,
             proxy=proxy,
+            proxies=proxies,
             max_redirects=max_redirects,
         )
         (
@@ -556,6 +592,7 @@ class AsyncSession:
             timeout=kwargs.pop("timeout", None),
             read_timeout=kwargs.pop("read_timeout", None),
             proxy=kwargs.pop("proxy", _UNSET),
+            proxies=kwargs.pop("proxies", None),
             max_redirects=max_redirects,
         )
         if kwargs:
@@ -646,6 +683,7 @@ def request(
     impersonate: str,
     fingerprint_rotation: bool = False,
     proxy: str | None = None,
+    proxies: ProxyInput | None = None,
     verify: bool = True,
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
@@ -656,6 +694,7 @@ def request(
         impersonate=impersonate,
         fingerprint_rotation=fingerprint_rotation,
         proxy=proxy,
+        proxies=proxies,
         verify=verify,
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,

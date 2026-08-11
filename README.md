@@ -4,7 +4,7 @@
 
 ## API 命名兼容
 
-公开 API 优先沿用 `curl_cffi.requests` 的高频命名与调用习惯：`Session`、`AsyncSession`、`Response`、`Headers`、`Cookies`，以及 `request/get/post/put/patch/delete/head/options`。常用请求参数如 `params`、`headers`、`cookies`、`data`、`json`、`files`、`timeout`、`stream`、`proxy`、`allow_redirects` 同样保持对应名称。
+公开 API 优先沿用 `curl_cffi.requests` 的高频命名与调用习惯：`Session`、`AsyncSession`、`Response`、`Headers`、`Cookies`，以及 `request/get/post/put/patch/delete/head/options`。常用请求参数如 `params`、`headers`、`cookies`、`data`、`json`、`files`、`timeout`、`stream`、`proxy`、`proxies`、`allow_redirects` 同样保持对应名称。
 
 这是迁移便利性的兼容目标，而非逐项复刻承诺。`requests_rust` 不兼容或尚未实现 `curl_cffi` 的专有选项时会明确报错，不会静默忽略；指纹数据模型、TLS/HTTP2 实现、代理参数形式与响应内部对象以本库的 Rust 实现为准。
 

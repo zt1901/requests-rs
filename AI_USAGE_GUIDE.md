@@ -92,6 +92,7 @@ with Session(impersonate="chrome150") as session:
 | `read_timeout` | Body读取超时，必须是有限正数 |
 | `stream` | `True`时不预读完整Body |
 | `proxy` | 单请求代理覆盖；`None`表示该请求直连；省略表示使用Session代理 |
+| `proxies` | curl_cffi 风格代理映射，如 `{"http": "http://...", "https": "http://..."}`；按目标 URL 协议选择，也接受 `http://`、`https://`、`all://`、`all` 键；不能与 `proxy` 同时传入 |
 | `allow_redirects` | 是否跟随重定向 |
 | `max_redirects` | 最大跳转次数，不能小于0 |
 
