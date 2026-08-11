@@ -1524,6 +1524,11 @@ impl NativeSession {
             .map(|value| Proxy::all(&value).map_err(to_py_error))
             .transpose()?;
         self.state.proxy.store(proxy.map(Arc::new));
+        // 默认代理切换后不能复用旧 client 的连接池，否则存量代理隧道可能继续承载后续请求。
+        // 清空只影响下一次按默认代理发包的懒初始化；正在执行的请求仍持有自己的 Client 快照。
+        for variant in &self.state.variants {
+            variant.client.store(None);
+        }
         Ok(())
     }
 
