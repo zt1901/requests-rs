@@ -23,6 +23,7 @@ use pyo3::{
 };
 use serde::Deserialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use url::Url;
 use wreq::{
     Client, Emulation, Method, Proxy, Uri, Version,
     cookie::{CookieStore, Cookies as RequestCookies, Jar},
@@ -733,6 +734,21 @@ fn select_proxy_mapping(
         }
     }
     Ok(None)
+}
+
+fn append_query(url: &str, params: Vec<(String, Vec<String>)>) -> PyResult<String> {
+    if params.is_empty() {
+        return Ok(url.to_string());
+    }
+    let mut parsed = Url::parse(url).map_err(to_py_error)?;
+    let mut serializer = parsed.query_pairs_mut();
+    for (name, values) in params {
+        for value in values {
+            serializer.append_pair(&name, &value);
+        }
+    }
+    drop(serializer);
+    Ok(parsed.into())
 }
 
 fn parse_method(method: &str) -> PyResult<Method> {
@@ -1588,6 +1604,11 @@ impl NativeSession {
     ) -> PyResult<Option<String>> {
         ensure_open(&self.state)?;
         select_proxy_mapping(&url, proxies)
+    }
+
+    fn append_query(&self, url: String, params: Vec<(String, Vec<String>)>) -> PyResult<String> {
+        ensure_open(&self.state)?;
+        append_query(&url, params)
     }
 
     fn set_default_headers(&self, headers: Vec<(String, String)>) -> PyResult<()> {

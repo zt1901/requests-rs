@@ -71,6 +71,15 @@ class 目标处理器(静默处理器):
             self.close_connection = True
             return
 
+        if self.path.startswith("/query"):
+            body = json.dumps({"path": self.path}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         body = json.dumps(
             {
                 "duplicate_request_headers": self.headers.get_all("X-Repeat") or [],
@@ -235,6 +244,19 @@ def main():
             默认覆盖 = session.get(target_url + "/headers", headers=覆盖请求头).json()
             assert 默认覆盖["user_agent"] == 覆盖请求头["User-Agent"], 默认覆盖
             assert 默认覆盖["sec_ch_ua"] == 覆盖请求头["sec-ch-ua"], 默认覆盖
+
+            query = session.get(
+                target_url + "/query?existing=one#fragment",
+                params={"tag": ["A B", "中文"], "empty": "", "skip": None},
+                proxy=None,
+            ).json()["path"]
+            assert query == "/query?existing=one&tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=", query
+            tuple_query = session.get(
+                target_url + "/query",
+                params={"bool": True, "number": 7, "tuple": ("x/y", b"raw bytes")},
+                proxy=None,
+            ).json()["path"]
+            assert tuple_query == "/query?bool=True&number=7&tuple=x%2Fy&tuple=raw+bytes", tuple_query
 
             # 默认Header由Rust预解析缓存，但保留用户对session.headers的运行时修改习惯。
             session.headers.append(("X-Runtime-Default", "changed"))

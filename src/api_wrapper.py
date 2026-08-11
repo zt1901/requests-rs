@@ -5,7 +5,7 @@ from http.cookiejar import CookieJar
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode
 
 from ._native import NativeSession, available_profiles
 
@@ -117,6 +117,24 @@ def _header_items(headers: HeaderInput | None) -> list[tuple[str, str]]:
     if isinstance(headers, Mapping):
         return list(headers.items())
     return list(headers)
+
+
+def _query_items(params: Mapping[str, Any] | None) -> list[tuple[str, list[str]]]:
+    if not params:
+        return []
+    result = []
+    for name, value in params.items():
+        values = value if isinstance(value, (list, tuple)) else (value,)
+        normalized = []
+        for item in values:
+            if item is None:
+                continue
+            if isinstance(item, bytes):
+                normalized.append(item.decode("latin1"))
+            else:
+                normalized.append(str(item))
+        result.append((str(name), normalized))
+    return result
 
 
 def _cookie_items(cookies: Any) -> list[tuple[str, str]]:
@@ -321,9 +339,7 @@ class Session:
         if max_redirects < 0:
             raise ValueError("max_redirects不能小于0")
         if params:
-            parts = urlsplit(url)
-            query = "&".join(filter(None, (parts.query, urlencode(params, doseq=True))))
-            url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+            url = self._native.append_query(url, _query_items(params))
 
         # 保持session.headers可变的兼容语义；仅在实际变更后同步到原生默认Header快照。
         current_headers = tuple(self.headers)
