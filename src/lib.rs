@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self, Write},
     pin::Pin,
     sync::{
@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -605,6 +605,8 @@ struct SessionState {
     rotation: bool,
     // 默认代理由set_proxy原子替换，请求仅加载快照，不阻塞其他并发请求。
     proxy: ArcSwapOption<Proxy>,
+    // Session默认请求头构造期预解析，普通请求只合并请求级增量头。
+    default_headers: ArcSwap<HeaderMap>,
     verify: bool,
     connect_timeout: Option<Duration>,
     cookie_jar: Arc<Jar>,
@@ -733,6 +735,29 @@ fn parse_headers(headers: Vec<(String, String)>) -> PyResult<HeaderMap> {
         );
     }
     Ok(result)
+}
+
+fn merge_headers(
+    default_headers: &HeaderMap,
+    request_headers: Vec<(String, String)>,
+) -> PyResult<HeaderMap> {
+    let overridden: HashSet<String> = request_headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    let mut headers = HeaderMap::with_capacity(default_headers.len() + request_headers.len());
+    for (name, value) in default_headers {
+        if !overridden.contains(name.as_str()) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in request_headers {
+        headers.append(
+            HeaderName::from_bytes(name.as_bytes()).map_err(to_py_error)?,
+            HeaderValue::from_str(&value).map_err(to_py_error)?,
+        );
+    }
+    Ok(headers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1136,7 +1161,7 @@ struct NativeSession {
 #[pymethods]
 impl NativeSession {
     #[new]
-    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None))]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new()))]
     fn new(
         py: Python<'_>,
         impersonate: String,
@@ -1145,6 +1170,7 @@ impl NativeSession {
         verify: bool,
         connect_timeout: Option<f64>,
         fingerprints_path: Option<String>,
+        default_headers: Vec<(String, String)>,
     ) -> PyResult<Self> {
         let normalized = normalize_profile(&impersonate);
         let proxy = proxy
@@ -1192,6 +1218,7 @@ impl NativeSession {
                 .collect(),
             rotation: fingerprint_rotation,
             proxy: ArcSwapOption::from(proxy.map(Arc::new)),
+            default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
             cookie_jar: Arc::new(Jar::default()),
@@ -1234,7 +1261,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
             let variant = &state.variants[index];
@@ -1285,7 +1312,7 @@ impl NativeSession {
         };
         let state = self.state.clone();
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
@@ -1337,7 +1364,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         py.detach(move || {
             let variant = &state.variants[index];
@@ -1386,7 +1413,7 @@ impl NativeSession {
             0
         };
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&self.state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
@@ -1440,7 +1467,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
             let variant = &state.variants[index];
@@ -1492,7 +1519,7 @@ impl NativeSession {
             0
         };
         let method = parse_method(&method)?;
-        let headers = parse_headers(headers)?;
+        let headers = merge_headers(&self.state.default_headers.load(), headers)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
@@ -1529,6 +1556,14 @@ impl NativeSession {
         for variant in &self.state.variants {
             variant.client.store(None);
         }
+        Ok(())
+    }
+
+    fn set_default_headers(&self, headers: Vec<(String, String)>) -> PyResult<()> {
+        ensure_open(&self.state)?;
+        self.state
+            .default_headers
+            .store(Arc::new(parse_headers(headers)?));
         Ok(())
     }
 

@@ -284,6 +284,7 @@ class Session:
             raise TypeError("proxies必须是Mapping或None")
         self.impersonate = impersonate
         self.headers = _header_items(headers)
+        self._native_headers = tuple(self.headers)
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -297,6 +298,7 @@ class Session:
             verify,
             connect_timeout,
             None if fingerprints_path is None else os.fspath(fingerprints_path),
+            self.headers,
         )
         self.cookies = Cookies(self._native)
 
@@ -335,15 +337,14 @@ class Session:
             query = "&".join(filter(None, (parts.query, urlencode(params, doseq=True))))
             url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
-        request_headers = _header_items(headers)
-        overridden_names = {name.lower() for name, _ in request_headers}
-        merged_headers = [
-            (name, value)
-            for name, value in self.headers
-            if name.lower() not in overridden_names
-        ]
-        merged_headers.extend(request_headers)
-        header_names = {name.lower() for name, _ in merged_headers}
+        # 保持session.headers可变的兼容语义；仅在实际变更后同步到原生默认Header快照。
+        current_headers = tuple(self.headers)
+        if current_headers != self._native_headers:
+            self._native.set_default_headers(self.headers)
+            self._native_headers = current_headers
+        merged_headers = _header_items(headers)
+        header_names = {name.lower() for name, _ in self.headers}
+        header_names.update(name.lower() for name, _ in merged_headers)
         if cookies is not None:
             merged_headers = [
                 (name, value)

@@ -83,6 +83,7 @@ class 目标处理器(静默处理器):
                 "sec_fetch_dest": self.headers.get("sec-fetch-dest", ""),
                 "upgrade_insecure_requests": self.headers.get("Upgrade-Insecure-Requests", ""),
                 "priority": self.headers.get("Priority", ""),
+                "runtime_default": self.headers.get("X-Runtime-Default", ""),
             }
         ).encode()
         self.send_response(200)
@@ -229,6 +230,11 @@ def main():
             默认覆盖 = session.get(target_url + "/headers", headers=覆盖请求头).json()
             assert 默认覆盖["user_agent"] == 覆盖请求头["User-Agent"], 默认覆盖
             assert 默认覆盖["sec_ch_ua"] == 覆盖请求头["sec-ch-ua"], 默认覆盖
+
+            # 默认Header由Rust预解析缓存，但保留用户对session.headers的运行时修改习惯。
+            session.headers.append(("X-Runtime-Default", "changed"))
+            修改后默认头 = session.get(target_url + "/headers").json()
+            assert 修改后默认头["runtime_default"] == "changed", 修改后默认头
 
             # 一次顶层导航的上下文头不能作为所有业务请求的默认画像发送。
             默认上下文 = session.get(target_url + "/headers").json()

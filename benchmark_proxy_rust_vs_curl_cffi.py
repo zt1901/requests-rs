@@ -177,12 +177,33 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
     latencies: list[float] = []
 
     if name == "requests_rust":
-        session = AsyncSession(impersonate=测试指纹版本, proxy=proxy_url, verify=False)
+        session = AsyncSession(
+            impersonate=测试指纹版本,
+            proxy=proxy_url,
+            verify=False,
+            headers=[
+                ("Accept", "application/json"),
+                ("Accept-Language", "zh-CN,zh;q=0.9"),
+                ("Cache-Control", "no-cache"),
+                ("X-Benchmark-Default", "cached"),
+            ],
+        )
         async def request_once(index: int) -> bool:
             response = await session.get(target_url + f"?id={index}")
             return response.status_code == 200 and response.content == b"{}"
     else:
-        session = curl_requests.AsyncSession(impersonate="chrome", max_clients=并发Worker数, proxy=proxy_url, verify=False)
+        session = curl_requests.AsyncSession(
+            impersonate="chrome",
+            max_clients=并发Worker数,
+            proxy=proxy_url,
+            verify=False,
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Cache-Control": "no-cache",
+                "X-Benchmark-Default": "cached",
+            },
+        )
         async def request_once(index: int) -> bool:
             response = await session.get(target_url + f"?id={index}")
             return response.status_code == 200 and response.content == b"{}"
