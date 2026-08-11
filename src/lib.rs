@@ -751,6 +751,16 @@ fn append_query(url: &str, params: Vec<(String, Vec<String>)>) -> PyResult<Strin
     Ok(parsed.into())
 }
 
+fn encode_form(params: Vec<(String, Vec<String>)>) -> Vec<u8> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, values) in params {
+        for value in values {
+            serializer.append_pair(&name, &value);
+        }
+    }
+    serializer.finish().into_bytes()
+}
+
 fn parse_method(method: &str) -> PyResult<Method> {
     Ok(match method {
         "GET" => Method::GET,
@@ -1609,6 +1619,11 @@ impl NativeSession {
     fn append_query(&self, url: String, params: Vec<(String, Vec<String>)>) -> PyResult<String> {
         ensure_open(&self.state)?;
         append_query(&url, params)
+    }
+
+    fn encode_form(&self, params: Vec<(String, Vec<String>)>) -> PyResult<Vec<u8>> {
+        ensure_open(&self.state)?;
+        Ok(encode_form(params))
     }
 
     fn set_default_headers(&self, headers: Vec<(String, String)>) -> PyResult<()> {

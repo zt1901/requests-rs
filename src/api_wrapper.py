@@ -119,16 +119,14 @@ def _header_items(headers: HeaderInput | None) -> list[tuple[str, str]]:
     return list(headers)
 
 
-def _query_items(params: Mapping[str, Any] | None) -> list[tuple[str, list[str]]]:
-    if not params:
+def _urlencoded_items(values: Mapping[str, Any] | None) -> list[tuple[str, list[str]]]:
+    if not values:
         return []
     result = []
-    for name, value in params.items():
+    for name, value in values.items():
         values = value if isinstance(value, (list, tuple)) else (value,)
         normalized = []
         for item in values:
-            if item is None:
-                continue
             if isinstance(item, bytes):
                 normalized.append(item.decode("latin1"))
             else:
@@ -339,7 +337,7 @@ class Session:
         if max_redirects < 0:
             raise ValueError("max_redirects不能小于0")
         if params:
-            url = self._native.append_query(url, _query_items(params))
+            url = self._native.append_query(url, _urlencoded_items(params))
 
         # 保持session.headers可变的兼容语义；仅在实际变更后同步到原生默认Header快照。
         current_headers = tuple(self.headers)
@@ -389,7 +387,7 @@ class Session:
             if "content-type" not in header_names:
                 merged_headers.append(("content-type", "application/json"))
         elif isinstance(data, Mapping):
-            body = urlencode(data, doseq=True).encode()
+            body = self._native.encode_form(_urlencoded_items(data))
             if "content-type" not in header_names:
                 merged_headers.append(("content-type", "application/x-www-form-urlencoded"))
         elif isinstance(data, str):

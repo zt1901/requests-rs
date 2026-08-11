@@ -121,6 +121,19 @@ class 目标处理器(静默处理器):
             self.end_headers()
             self.wfile.write(result)
             return
+        if self.path == "/echo-form":
+            result = json.dumps(
+                {
+                    "content_type": content_type,
+                    "body": body.decode("ascii"),
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+            return
         result = json.dumps(
             {
                 "content_type": content_type,
@@ -250,13 +263,22 @@ def main():
                 params={"tag": ["A B", "中文"], "empty": "", "skip": None},
                 proxy=None,
             ).json()["path"]
-            assert query == "/query?existing=one&tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=", query
+            assert query == "/query?existing=one&tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=&skip=None", query
             tuple_query = session.get(
                 target_url + "/query",
                 params={"bool": True, "number": 7, "tuple": ("x/y", b"raw bytes")},
                 proxy=None,
             ).json()["path"]
             assert tuple_query == "/query?bool=True&number=7&tuple=x%2Fy&tuple=raw+bytes", tuple_query
+            form = session.post(
+                target_url + "/echo-form",
+                data={"tag": ["A B", "中文"], "empty": "", "none": None, "raw": b"raw bytes"},
+                proxy=None,
+            ).json()
+            assert form == {
+                "content_type": "application/x-www-form-urlencoded",
+                "body": "tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=&none=None&raw=raw+bytes",
+            }, form
 
             # 默认Header由Rust预解析缓存，但保留用户对session.headers的运行时修改习惯。
             session.headers.append(("X-Runtime-Default", "changed"))
