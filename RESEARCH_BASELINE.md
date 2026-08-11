@@ -17,7 +17,7 @@
 |---|---|---:|---|
 | TLS cipher suites、扩展顺序、Supported Groups、Signature Algorithms、KeyShare groups | 浏览器采集 JSON | 是 | 固定为 profile 的传输画像；实际随机字节不写入 JSON。 |
 | ALPN、ALPS、HTTP/2 SETTINGS、HPACK、伪 Header 顺序、初始优先级 | 浏览器采集 JSON | 是 | 固定为 profile 的连接画像。 |
-| `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | 浏览器采集 JSON | 是 | 作为稳定默认 Header。`auto_profile_headers=True` 时，UA/Client Hints 强制采用 profile 值。 |
+| `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | 浏览器采集 JSON | 仅缺失时兜底 | 都是普通 HTTP Header。默认模式下，cURL/调用方的同名 Header 原样优先；仅未传时使用 profile 默认值。`auto_profile_headers=True` 才强制采用 profile 的 UA/Client Hints。 |
 | SNI | 当前请求 URL | 是 | 每次 TLS 握手根据当前 URL host 生成；不读取采集 JSON 的历史 `server_name`。 |
 | TLS Random、Session ID、KeyShare 公钥、ticket、PSK binder | TLS 运行时 | 是 | 禁止从 JSON 或 cURL 固定；由 BTLS/BoringSSL 与 Session ticket cache 自然生成。 |
 | `Host`、`Content-Length`、`Connection` | HTTP 运行时 | 是 | 禁止由 profile 或模板强制固定。 |
@@ -30,6 +30,7 @@
 | 字段类别 | cURL 常见形式 | 是否允许业务模板写死 | 指纹库是否自动配置 | 备注 |
 |---|---|---:|---:|---|
 | 方法、URL、Query | `-X POST`、`https://...?...` | 是 | 否 | 属于具体网站动作。 |
+| `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | `-H 'user-agent: ...'` 等 | 是 | 仅缺失时兜底 | cURL 已指定时原样优先；应选择与 TLS profile 相同浏览器版本/平台的值。 |
 | `Accept` | `-H 'accept: application/json, text/plain, */*'` | 是 | 否 | 页面、XHR、图像、脚本的值不同，以浏览器复制值为准。 |
 | `Origin` | `-H 'origin: https://example.com'` | 是 | 否 | CORS/POST 业务上下文。 |
 | `Referer` | `-H 'referer: https://example.com/page'` | 是 | 否 | 若该动作固定来自同一页面，可原样固定。 |
