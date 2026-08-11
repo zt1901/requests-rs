@@ -112,6 +112,7 @@ class 目标处理器(静默处理器):
                 {
                     "content_type": content_type,
                     "json": json.loads(body),
+                    "raw_body": body.decode("utf-8"),
                 },
                 ensure_ascii=False,
             ).encode()
@@ -279,6 +280,22 @@ def main():
                 "content_type": "application/x-www-form-urlencoded",
                 "body": "tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=&none=None&raw=raw+bytes",
             }, form
+            encoded_json = session.post(
+                target_url + "/echo-json",
+                json={"text": "中文", "items": [True, None, 7], "nested": {"space": "A B"}},
+                proxy=None,
+            ).json()
+            assert encoded_json == {
+                "content_type": "application/json",
+                "json": {"text": "中文", "items": [True, None, 7], "nested": {"space": "A B"}},
+                "raw_body": '{"text":"中文","items":[true,null,7],"nested":{"space":"A B"}}',
+            }, encoded_json
+            fallback_json = session.post(
+                target_url + "/echo-json",
+                json={"large": 10**100},
+                proxy=None,
+            ).json()
+            assert fallback_json["raw_body"] == json.dumps({"large": 10**100}, ensure_ascii=False, separators=(",", ":"))
 
             # 默认Header由Rust预解析缓存，但保留用户对session.headers的运行时修改习惯。
             session.headers.append(("X-Runtime-Default", "changed"))

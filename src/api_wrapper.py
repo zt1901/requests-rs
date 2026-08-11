@@ -383,7 +383,9 @@ class Session:
             proxy_override = False
             request_proxy = None
         if json is not None:
-            body = json_module.dumps(json, ensure_ascii=False, separators=(",", ":")).encode()
+            body = self._native.encode_json(json)
+            if body is None:
+                body = json_module.dumps(json, ensure_ascii=False, separators=(",", ":")).encode()
             if "content-type" not in header_names:
                 merged_headers.append(("content-type", "application/json"))
         elif isinstance(data, Mapping):

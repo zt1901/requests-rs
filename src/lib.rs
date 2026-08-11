@@ -19,9 +19,10 @@ use pyo3::{
     exceptions::PyRuntimeError,
     ffi::c_str,
     prelude::*,
-    types::{PyAny, PyBytes, PyModule},
+    types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple},
 };
 use serde::Deserialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use url::Url;
 use wreq::{
@@ -759,6 +760,65 @@ fn encode_form(params: Vec<(String, Vec<String>)>) -> Vec<u8> {
         }
     }
     serializer.finish().into_bytes()
+}
+
+fn json_value(value: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
+    if value.is_none() {
+        return Ok(Some(JsonValue::Null));
+    }
+    if value.is_instance_of::<PyBool>() {
+        return Ok(Some(JsonValue::Bool(value.extract()?)));
+    }
+    if value.is_instance_of::<PyString>() {
+        return Ok(Some(JsonValue::String(value.extract()?)));
+    }
+    if value.is_instance_of::<PyInt>() {
+        if let Ok(number) = value.extract::<i64>() {
+            return Ok(Some(JsonValue::Number(number.into())));
+        }
+        if let Ok(number) = value.extract::<u64>() {
+            return Ok(Some(JsonValue::Number(number.into())));
+        }
+        return Ok(None);
+    }
+    if value.is_instance_of::<PyFloat>() {
+        let number = value.extract::<f64>()?;
+        return Ok(serde_json::Number::from_f64(number).map(JsonValue::Number));
+    }
+    if let Ok(values) = value.cast::<PyList>() {
+        let mut result = Vec::with_capacity(values.len());
+        for item in values.iter() {
+            let Some(item) = json_value(&item)? else {
+                return Ok(None);
+            };
+            result.push(item);
+        }
+        return Ok(Some(JsonValue::Array(result)));
+    }
+    if let Ok(values) = value.cast::<PyTuple>() {
+        let mut result = Vec::with_capacity(values.len());
+        for item in values.iter() {
+            let Some(item) = json_value(&item)? else {
+                return Ok(None);
+            };
+            result.push(item);
+        }
+        return Ok(Some(JsonValue::Array(result)));
+    }
+    if let Ok(values) = value.cast::<PyDict>() {
+        let mut result = JsonMap::with_capacity(values.len());
+        for (key, item) in values.iter() {
+            let Ok(key) = key.extract::<String>() else {
+                return Ok(None);
+            };
+            let Some(item) = json_value(&item)? else {
+                return Ok(None);
+            };
+            result.insert(key, item);
+        }
+        return Ok(Some(JsonValue::Object(result)));
+    }
+    Ok(None)
 }
 
 fn parse_method(method: &str) -> PyResult<Method> {
@@ -1624,6 +1684,13 @@ impl NativeSession {
     fn encode_form(&self, params: Vec<(String, Vec<String>)>) -> PyResult<Vec<u8>> {
         ensure_open(&self.state)?;
         Ok(encode_form(params))
+    }
+
+    fn encode_json(&self, value: Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+        ensure_open(&self.state)?;
+        json_value(&value)?
+            .map(|value| serde_json::to_vec(&value).map_err(to_py_error))
+            .transpose()
     }
 
     fn set_default_headers(&self, headers: Vec<(String, String)>) -> PyResult<()> {
