@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 brotli = "8"
 bytes = "1"
 flate2 = "1"

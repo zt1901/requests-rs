@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwapOption;
 use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -593,14 +594,17 @@ fn build_emulation(record: &Record) -> Result<Emulation> {
 struct Variant {
     record: Arc<Record>,
     session_cache: Arc<LruTlsSessionCache>,
-    client: Mutex<Option<Client>>,
+    // 热路径通过原子快照读取已构建Client；初始化锁只在首个请求竞争构建时使用。
+    client: ArcSwapOption<Client>,
+    client_init: Mutex<()>,
 }
 
 struct SessionState {
     profile: String,
     variants: Vec<Variant>,
     rotation: bool,
-    proxy: Mutex<Option<Proxy>>,
+    // 默认代理由set_proxy原子替换，请求仅加载快照，不阻塞其他并发请求。
+    proxy: ArcSwapOption<Proxy>,
     verify: bool,
     connect_timeout: Option<Duration>,
     cookie_jar: Arc<Jar>,
@@ -648,33 +652,27 @@ fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
 }
 
 fn cached_client(state: &SessionState, variant: &Variant) -> PyResult<Client> {
-    if let Some(client) = variant
-        .client
+    if let Some(client) = variant.client.load_full() {
+        return Ok((*client).clone());
+    }
+    let _init_guard = variant
+        .client_init
         .lock()
-        .map_err(|_| PyRuntimeError::new_err("Client缓存锁已损坏"))?
-        .clone()
-    {
-        return Ok(client);
+        .map_err(|_| PyRuntimeError::new_err("Client初始化锁已损坏"))?;
+    if let Some(client) = variant.client.load_full() {
+        return Ok((*client).clone());
     }
     let client = build_client(state, variant).map_err(to_py_error)?;
     if state.closed.load(Ordering::Acquire) {
         return Ok(client);
     }
-    let mut cached = variant
-        .client
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("Client缓存锁已损坏"))?;
-    Ok(cached.get_or_insert_with(|| client.clone()).clone())
+    variant.client.store(Some(Arc::new(client.clone())));
+    Ok(client)
 }
 
 async fn cached_client_async(state: Arc<SessionState>, index: usize) -> PyResult<Client> {
-    if let Some(client) = state.variants[index]
-        .client
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("Client缓存锁已损坏"))?
-        .clone()
-    {
-        return Ok(client);
+    if let Some(client) = state.variants[index].client.load_full() {
+        return Ok((*client).clone());
     }
     tokio::task::spawn_blocking(move || cached_client(&state, &state.variants[index]))
         .await
@@ -710,11 +708,7 @@ fn selected_proxy(
             .map(|value| Proxy::all(&value).map_err(to_py_error))
             .transpose();
     }
-    state
-        .proxy
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("代理配置锁已损坏"))
-        .map(|proxy| proxy.clone())
+    Ok(state.proxy.load_full().map(|proxy| (*proxy).clone()))
 }
 
 fn parse_method(method: &str) -> PyResult<Method> {
@@ -1192,11 +1186,12 @@ impl NativeSession {
                 .map(|record| Variant {
                     record,
                     session_cache: Arc::new(LruTlsSessionCache::new(8)),
-                    client: Mutex::new(None),
+                    client: ArcSwapOption::empty(),
+                    client_init: Mutex::new(()),
                 })
                 .collect(),
             rotation: fingerprint_rotation,
-            proxy: Mutex::new(proxy),
+            proxy: ArcSwapOption::from(proxy.map(Arc::new)),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
             cookie_jar: Arc::new(Jar::default()),
@@ -1528,12 +1523,7 @@ impl NativeSession {
         let proxy = proxy
             .map(|value| Proxy::all(&value).map_err(to_py_error))
             .transpose()?;
-        let mut current = self
-            .state
-            .proxy
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("代理配置锁已损坏"))?;
-        *current = proxy;
+        self.state.proxy.store(proxy.map(Arc::new));
         Ok(())
     }
 
@@ -1599,11 +1589,7 @@ impl NativeSession {
             return Ok(());
         }
         for variant in &self.state.variants {
-            let mut client = variant
-                .client
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("Client缓存锁已损坏"))?;
-            *client = None;
+            variant.client.store(None);
         }
         Ok(())
     }
