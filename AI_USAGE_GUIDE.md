@@ -76,6 +76,8 @@ with Session(impersonate="chrome150") as session:
 
 支持方法：`request`、`get`、`post`、`put`、`patch`、`delete`、`head`、`options`。
 
+`requests_rust` 优先与 `curl_cffi.requests` 保持高频名称和参数一致，方便替换既有调用；但不承诺兼容其全部专有参数、底层对象或 TLS 行为。未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
+
 请求关键字参数：
 
 | 参数 | 语义 |
