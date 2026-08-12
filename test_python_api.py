@@ -464,7 +464,11 @@ def main():
                     assert 自定义firefox.fingerprint_count == len(
                         [记录 for 记录 in 全部记录 if 记录["profile"] == "firefox151"]
                     )
-                    assert 自定义chrome.get(target_url + "/headers").status_code == 200
+                    chrome_ids = [
+                        自定义chrome.get(target_url + f"/headers?variant={index}").fingerprint_id
+                        for index in range(min(3, 自定义chrome.fingerprint_count))
+                    ]
+                    assert len(set(chrome_ids)) == len(chrome_ids)
                     assert 自定义firefox.get(target_url + "/headers").status_code == 200
                     assert (
                         自定义firefox.get(target_url + "/headers").impersonate

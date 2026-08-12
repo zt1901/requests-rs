@@ -267,7 +267,6 @@ class Session:
         self,
         *,
         impersonate: str,
-        fingerprint_rotation: bool = False,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
         proxies: ProxyInput | None = None,
@@ -295,7 +294,6 @@ class Session:
         self.fingerprints_path = fingerprints_path
         self._native = NativeSession(
             impersonate,
-            fingerprint_rotation,
             proxy,
             verify,
             connect_timeout,
@@ -672,7 +670,6 @@ def request(
     url: str,
     *,
     impersonate: str,
-    fingerprint_rotation: bool = False,
     proxy: str | None = None,
     proxies: ProxyInput | None = None,
     verify: bool = True,
@@ -683,7 +680,6 @@ def request(
 ) -> Response:
     with Session(
         impersonate=impersonate,
-        fingerprint_rotation=fingerprint_rotation,
         proxy=proxy,
         proxies=proxies,
         verify=verify,

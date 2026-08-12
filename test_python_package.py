@@ -81,7 +81,6 @@ def main():
         print("内置版本:", available_profiles())
         with Session(
             impersonate=测试版本,
-            fingerprint_rotation=True,
             verify=False,
         ) as session:
             ids = []

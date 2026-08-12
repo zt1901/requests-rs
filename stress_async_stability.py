@@ -48,7 +48,6 @@ async def main():
     try:
         async with AsyncSession(
             impersonate=测试版本,
-            fingerprint_rotation=True,
         ) as session:
             for 轮次 in range(1, 测试轮数 + 1):
                 next_index = 0

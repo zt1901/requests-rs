@@ -39,7 +39,6 @@ from requests_rust import Session
 
 with Session(
     impersonate="firefox151",
-    fingerprint_rotation=True,
 ) as session:
     response = session.get("https://example.com/api")
     print(response.status_code, response.fingerprint_id)

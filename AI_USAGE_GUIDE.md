@@ -39,7 +39,6 @@ print(available_profiles())
 Session(
     *,
     impersonate: str,
-    fingerprint_rotation: bool = False,
     headers=None,
     proxy: str | None = None,
     verify: bool = True,
@@ -110,7 +109,6 @@ from requests_rust import AsyncSession
 async def main():
     async with AsyncSession(
         impersonate="firefox151",
-        fingerprint_rotation=True,
     ) as session:
         first, second = await asyncio.gather(
             session.get("https://example.com/1"),
@@ -293,9 +291,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 指纹轮换与隔离
 
-`fingerprint_rotation=False`固定使用Profile首个变体并复用Client、连接池和TLS Session Cache。
-
-`fingerprint_rotation=True`按原子计数器循环变体。每个变体独立拥有Client、连接池和TLS Session Cache，不同指纹绝不共享H2/TLS连接；同一Session共享Cookie Jar。多个Session不共享Cookie、代理、连接池或TLS Session Cache。
+每个 Session 默认按原子计数器循环其 `impersonate` profile 的全部变体。每个变体独立拥有 Client、连接池和 TLS Session Cache，不同指纹绝不共享 H2/TLS 连接；同一 Session 共享 Cookie Jar。多个 Session 不共享 Cookie、代理、连接池或 TLS Session Cache。
 
 ## GIL模型
 
