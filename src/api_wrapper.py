@@ -347,25 +347,7 @@ class Session:
         merged_headers = _header_items(headers)
         header_names = {name.lower() for name, _ in self.headers}
         header_names.update(name.lower() for name, _ in merged_headers)
-        if cookies is not None:
-            merged_headers = [
-                (name, value)
-                for name, value in merged_headers
-                if name.lower() != "cookie"
-            ]
-            request_values = dict(_cookie_items(cookies))
-            values = self._native.get_cookie_pairs(url)
-            positions = {name: index for index, (name, _value) in enumerate(values)}
-            for name, value in request_values.items():
-                if name in positions:
-                    values[positions[name]] = (name, value)
-                else:
-                    positions[name] = len(values)
-                    values.append((name, value))
-            if values:
-                merged_headers.append(
-                    ("Cookie", "; ".join(f"{name}={value}" for name, value in values))
-                )
+        request_cookies = None if cookies is None else _cookie_items(cookies)
         if proxy is not _UNSET and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
@@ -405,6 +387,7 @@ class Session:
             request_read_timeout,
             proxy_override,
             request_proxy,
+            request_cookies,
         )
 
     def request(
@@ -451,6 +434,7 @@ class Session:
             request_read_timeout,
             proxy_override,
             request_proxy,
+            request_cookies,
         ) = prepared
         if files is not None:
             if stream:
@@ -477,6 +461,7 @@ class Session:
                 request_read_timeout,
                 proxy_override,
                 request_proxy,
+                request_cookies,
                 allow_redirects,
                 max_redirects,
             )
@@ -500,6 +485,7 @@ class Session:
                 request_read_timeout,
                 proxy_override,
                 request_proxy,
+                request_cookies,
                 allow_redirects,
                 max_redirects,
             )
@@ -523,6 +509,7 @@ class Session:
             request_read_timeout,
             proxy_override,
             request_proxy,
+            request_cookies,
             allow_redirects,
             max_redirects,
         )
@@ -618,7 +605,7 @@ class AsyncSession:
                     native_files.append((name, os.fspath(path), filename, content_type))
                 else:
                     native_files.append((name, os.fspath(file_value), None, None))
-            method, url, headers, _body, timeout, read_timeout, proxy_override, proxy = prepared
+            method, url, headers, _body, timeout, read_timeout, proxy_override, proxy, request_cookies = prepared
             result = await self._session._native.request_multipart_async(
                 method,
                 url,
@@ -629,6 +616,7 @@ class AsyncSession:
                 read_timeout,
                 proxy_override,
                 proxy,
+                request_cookies,
                 allow_redirects,
                 max_redirects,
             )

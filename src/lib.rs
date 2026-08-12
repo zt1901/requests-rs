@@ -868,6 +868,64 @@ fn merge_headers(
     Ok(headers)
 }
 
+fn cookie_pairs(jar: &Jar, url: &str) -> PyResult<Vec<(String, String)>> {
+    let uri = url.parse::<Uri>().map_err(to_py_error)?;
+    let values = match jar.cookies(&uri, Version::HTTP_11) {
+        RequestCookies::Compressed(value) => vec![value],
+        RequestCookies::Uncompressed(values) => values,
+        RequestCookies::Empty => Vec::new(),
+        _ => Vec::new(),
+    };
+    let mut result = Vec::new();
+    for value in values {
+        for item in value.to_str().map_err(to_py_error)?.split(';') {
+            if let Some((name, value)) = item.trim().split_once('=') {
+                result.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn prepare_headers(
+    state: &SessionState,
+    url: &str,
+    request_headers: Vec<(String, String)>,
+    request_cookies: Option<Vec<(String, String)>>,
+) -> PyResult<HeaderMap> {
+    let mut headers = merge_headers(&state.default_headers.load(), request_headers)?;
+    let Some(request_cookies) = request_cookies else {
+        return Ok(headers);
+    };
+    headers.remove("cookie");
+    let mut values = cookie_pairs(&state.cookie_jar, url)?;
+    let mut positions: HashMap<String, usize> = values
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect();
+    for (name, value) in request_cookies {
+        if let Some(index) = positions.get(&name) {
+            values[*index] = (name, value);
+        } else {
+            positions.insert(name.clone(), values.len());
+            values.push((name, value));
+        }
+    }
+    if !values.is_empty() {
+        let cookie = values
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        headers.append(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_str(&cookie).map_err(to_py_error)?,
+        );
+    }
+    Ok(headers)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_request(
     client: Client,
@@ -1343,7 +1401,7 @@ impl NativeSession {
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request(
         &self,
         py: Python<'_>,
@@ -1355,6 +1413,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<NativeResponse> {
@@ -1369,7 +1428,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = merge_headers(&state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
             let variant = &state.variants[index];
@@ -1395,7 +1454,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -1407,6 +1466,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1420,7 +1480,7 @@ impl NativeSession {
         };
         let state = self.state.clone();
         let method = parse_method(&method)?;
-        let headers = merge_headers(&state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
@@ -1446,7 +1506,7 @@ impl NativeSession {
 
     // 流式入口与普通入口使用相同选项，确保两种响应模式语义一致。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request_stream(
         &self,
         py: Python<'_>,
@@ -1458,6 +1518,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<NativeStreamResponse> {
@@ -1472,7 +1533,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = merge_headers(&state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         py.detach(move || {
             let variant = &state.variants[index];
@@ -1497,7 +1558,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request_stream_async<'py>(
         &self,
         py: Python<'py>,
@@ -1509,6 +1570,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1521,7 +1583,7 @@ impl NativeSession {
             0
         };
         let method = parse_method(&method)?;
-        let headers = merge_headers(&self.state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
@@ -1548,7 +1610,7 @@ impl NativeSession {
 
     // multipart文件由Tokio直接流式读取，Python只传路径和元数据。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request_multipart(
         &self,
         py: Python<'_>,
@@ -1561,6 +1623,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<NativeResponse> {
@@ -1575,7 +1638,7 @@ impl NativeSession {
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
-        let headers = merge_headers(&state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
             let variant = &state.variants[index];
@@ -1602,7 +1665,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
     fn request_multipart_async<'py>(
         &self,
         py: Python<'py>,
@@ -1615,6 +1678,7 @@ impl NativeSession {
         read_timeout: Option<f64>,
         proxy_override: bool,
         proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1627,7 +1691,7 @@ impl NativeSession {
             0
         };
         let method = parse_method(&method)?;
-        let headers = merge_headers(&self.state.default_headers.load(), headers)?;
+        let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();

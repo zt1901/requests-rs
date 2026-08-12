@@ -31,6 +31,13 @@ class 目标处理器(静默处理器):
             self.end_headers()
             return
 
+        if self.path == "/set-path-cookie":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Set-Cookie", "nested=only; Path=/nested")
+            self.end_headers()
+            return
+
         if self.path == "/slow":
             self.send_response(200)
             self.send_header("Content-Length", "4")
@@ -331,6 +338,10 @@ def main():
             assert session.cookies["manual"] == "value"
             assert any(cookie.name == "manual" for cookie in session.cookies.get_all())
             assert "manual=value" in session.get(target_url + "/headers").json()["cookie"]
+            session.get(target_url + "/set-path-cookie")
+            assert "nested=only" not in session.get(target_url + "/headers").json()["cookie"]
+            nested_cookie = session.get(target_url + "/nested/headers").json()["cookie"]
+            assert "nested=only" in nested_cookie
             request_cookie = session.get(
                 target_url + "/headers",
                 cookies={"first": "override", "request_only": "snapshot"},
@@ -672,6 +683,7 @@ def main():
                         invalid_timeout,
                         None,
                         False,
+                        None,
                         None,
                         True,
                         10,
