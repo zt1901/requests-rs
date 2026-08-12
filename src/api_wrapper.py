@@ -287,6 +287,7 @@ class Session:
         self.impersonate = impersonate
         self.headers = _header_items(headers)
         self._native_headers = tuple(self.headers)
+        self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -342,9 +343,8 @@ class Session:
         if current_headers != self._native_headers:
             self._native.set_default_headers(self.headers)
             self._native_headers = current_headers
+            self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
         merged_headers = _header_items(headers)
-        header_names = {name.lower() for name, _ in self.headers}
-        header_names.update(name.lower() for name, _ in merged_headers)
         request_cookies = None if cookies is None else _cookie_items(cookies)
         if proxy is not _UNSET and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
@@ -366,11 +366,11 @@ class Session:
             body = self._native.encode_json(json)
             if body is None:
                 body = json_module.dumps(json, ensure_ascii=False, separators=(",", ":")).encode()
-            if "content-type" not in header_names:
+            if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/json"))
         elif isinstance(data, Mapping):
             body = self._native.encode_form(_urlencoded_items(data))
-            if "content-type" not in header_names:
+            if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/x-www-form-urlencoded"))
         elif isinstance(data, str):
             body = data.encode()

@@ -908,6 +908,9 @@ fn merge_headers(
     default_headers: &HeaderMap,
     request_headers: Vec<(String, String)>,
 ) -> PyResult<HeaderMap> {
+    if request_headers.is_empty() {
+        return Ok(default_headers.clone());
+    }
     let overridden: HashSet<String> = request_headers
         .iter()
         .map(|(name, _)| name.to_ascii_lowercase())
