@@ -21,6 +21,7 @@ use pyo3::{
     prelude::*,
     types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple},
 };
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -693,8 +694,12 @@ struct SessionState {
     profile: String,
     variants: Vec<Variant>,
     rotation: bool,
+    // 固定模式下当前代理会话绑定的指纹变体；切换代理会话时重新随机选择。
+    selected_variant: AtomicUsize,
     // 默认代理由set_proxy原子替换，请求仅加载快照，不阻塞其他并发请求。
     proxy: ArcSwapOption<Proxy>,
+    // 仅用于识别代理会话是否从 A 切换到 B，不参与实际代理连接。
+    proxy_identity: ArcSwapOption<String>,
     // Session默认请求头构造期预解析，普通请求只合并请求级增量头。
     default_headers: ArcSwap<HeaderMap>,
     verify: bool,
@@ -769,6 +774,18 @@ async fn cached_client_async(state: Arc<SessionState>, index: usize) -> PyResult
     tokio::task::spawn_blocking(move || cached_client(&state, &state.variants[index]))
         .await
         .map_err(|error| PyRuntimeError::new_err(format!("Client构建任务失败: {error}")))?
+}
+
+fn random_variant(count: usize) -> usize {
+    rand::rng().random_range(0..count)
+}
+
+fn request_variant(state: &SessionState) -> usize {
+    if state.rotation {
+        state.counter.fetch_add(1, Ordering::AcqRel) % state.variants.len()
+    } else {
+        state.selected_variant.load(Ordering::Acquire)
+    }
 }
 
 fn parse_timeout(name: &str, value: f64) -> PyResult<Duration> {
@@ -1419,6 +1436,7 @@ impl NativeSession {
         default_headers: Vec<(String, String)>,
     ) -> PyResult<Self> {
         let normalized = normalize_profile(&impersonate);
+        let proxy_identity = proxy.clone();
         let proxy = proxy
             .map(|value| Proxy::all(&value).map_err(to_py_error))
             .transpose()?;
@@ -1441,7 +1459,12 @@ impl NativeSession {
         };
         let matching: Vec<_> = records
             .iter()
-            .filter(|record| normalize_profile(&record.profile) == normalized)
+            // TLS extension 41（PSK）依赖同一服务端此前签发的 ticket，不能作为新代理会话的
+            // 首个 ClientHello 静态复现；仅从可独立对撞的首握手记录中选择粘性随机变体。
+            .filter(|record| {
+                normalize_profile(&record.profile) == normalized
+                    && !record.tls.extensions.contains(&41)
+            })
             .cloned()
             .collect();
         if matching.is_empty() {
@@ -1451,6 +1474,7 @@ impl NativeSession {
             )));
         }
         shared_runtime()?;
+        let selected_variant = random_variant(matching.len());
         let state = Arc::new(SessionState {
             profile: normalized,
             variants: matching
@@ -1464,11 +1488,13 @@ impl NativeSession {
                 .collect(),
             rotation: fingerprint_rotation,
             proxy: ArcSwapOption::from(proxy.map(Arc::new)),
+            proxy_identity: ArcSwapOption::<String>::from(proxy_identity.map(Arc::new)),
             default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
             cookie_jar: Arc::new(Jar::default()),
             counter: AtomicUsize::new(0),
+            selected_variant: AtomicUsize::new(selected_variant),
             closed: AtomicBool::new(false),
         });
         Ok(Self { state })
@@ -1500,11 +1526,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
@@ -1553,11 +1575,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let state = self.state.clone();
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
@@ -1606,11 +1624,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
@@ -1658,11 +1672,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
@@ -1711,11 +1721,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
@@ -1766,11 +1772,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
-        let index = if self.state.rotation {
-            self.state.counter.fetch_add(1, Ordering::AcqRel) % self.state.variants.len()
-        } else {
-            0
-        };
+        let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
@@ -1801,10 +1803,29 @@ impl NativeSession {
 
     fn set_proxy(&self, proxy: Option<String>) -> PyResult<()> {
         ensure_open(&self.state)?;
+        let changed = self
+            .state
+            .proxy_identity
+            .load_full()
+            .as_deref()
+            .map(String::as_str)
+            != proxy.as_deref();
+        let proxy_identity = proxy.clone();
         let proxy = proxy
             .map(|value| Proxy::all(&value).map_err(to_py_error))
             .transpose()?;
+        if !changed {
+            return Ok(());
+        }
+        self.state
+            .proxy_identity
+            .store(proxy_identity.map(Arc::new));
         self.state.proxy.store(proxy.map(Arc::new));
+        if !self.state.rotation {
+            self.state
+                .selected_variant
+                .store(random_variant(self.state.variants.len()), Ordering::Release);
+        }
         // 默认代理切换后不能复用旧 client 的连接池，否则存量代理隧道可能继续承载后续请求。
         // 清空只影响下一次按默认代理发包的懒初始化；正在执行的请求仍持有自己的 Client 快照。
         for variant in &self.state.variants {

@@ -459,15 +459,28 @@ def main():
                     fingerprints_path=firefox文件,
                 ) as 自定义firefox:
                     assert 自定义chrome.fingerprint_count == len(
-                        [记录 for 记录 in 全部记录 if 记录["profile"] == 测试版本]
+                        [
+                            记录
+                            for 记录 in 全部记录
+                            if 记录["profile"] == 测试版本 and 41 not in 记录["tls"]["extensions"]
+                        ]
                     )
                     assert 自定义firefox.fingerprint_count == len(
-                        [记录 for 记录 in 全部记录 if 记录["profile"] == "firefox151"]
+                        [
+                            记录
+                            for 记录 in 全部记录
+                            if 记录["profile"] == "firefox151" and 41 not in 记录["tls"]["extensions"]
+                        ]
                     )
-                    chrome_ids = [
-                        自定义chrome.get(target_url + f"/headers?variant={index}").fingerprint_id
-                        for index in range(min(3, 自定义chrome.fingerprint_count))
-                    ]
+                    with Session(
+                        impersonate=测试版本,
+                        fingerprints_path=chrome文件,
+                        fingerprint_rotation=True,
+                    ) as 轮换chrome:
+                        chrome_ids = [
+                            轮换chrome.get(target_url + f"/headers?variant={index}").fingerprint_id
+                            for index in range(min(3, 轮换chrome.fingerprint_count))
+                        ]
                     assert len(set(chrome_ids)) == len(chrome_ids)
                     assert 自定义firefox.get(target_url + "/headers").status_code == 200
                     assert (

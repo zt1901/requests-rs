@@ -52,7 +52,12 @@ def 断言捕获匹配初始记录(capture: dict, record: dict) -> None:
         "ja3",
         "ja4",
     ):
-        assert actual_tls.get(field) == expected_tls.get(field), (field, record["id"])
+        assert actual_tls.get(field) == expected_tls.get(field), {
+            "field": field,
+            "record_id": record["id"],
+            "expected": expected_tls.get(field),
+            "actual": actual_tls.get(field),
+        }
     expected_http = record["http"]
     actual_http = capture["http"]
     for field in ("protocol", "akamai", "settings", "settings_order", "pseudo_header_order"):
@@ -97,7 +102,7 @@ def main():
             first = session.get(测试地址)
             second = session.get(测试地址)
             assert first.fingerprint_id == second.fingerprint_id
-            print("默认固定:", first.fingerprint_id)
+            print("默认代理会话粘性:", first.fingerprint_id)
 
         records = json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as temp_dir:

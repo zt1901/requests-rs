@@ -292,7 +292,9 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 指纹轮换与隔离
 
-`fingerprint_rotation=False` 默认固定使用 Profile 首个变体，适合 Facebook 等连续会话时效敏感业务，并能复用同一变体的 Client、连接池和 TLS Session Cache。
+`fingerprint_rotation=False` 时，一个 `AsyncSession`/`Session` Python 发包对象会在当前 `impersonate` Profile 的可独立复现变体中随机选择一个。该对象使用同一代理会话时始终保持该指纹，以复用同一变体的 Client、连接池和 TLS Session Cache，适合 Facebook 等连续 cursor 分页。
+
+当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。依赖服务端既有 TLS ticket 的 PSK 恢复握手记录不会作为新代理会话的首个随机指纹。
 
 `fingerprint_rotation=True` 按原子计数器循环该 Profile 的全部变体。每个变体独立拥有 Client、连接池和 TLS Session Cache，不同指纹绝不共享 H2/TLS 连接；同一 Session 共享 Cookie Jar。多个 Session 不共享 Cookie、代理、连接池或 TLS Session Cache。
 
