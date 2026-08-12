@@ -15,22 +15,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows x64：原生MSVC构建（本地已验证）
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          # Windows x64 wheel 由本机发布；Actions 仅构建 Windows ARM64。
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
           # Linux x64：原生GCC构建
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          # Linux ARM64：x64机器上交叉编译（btls-sys自带aarch64工具链文件）
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
-            cross: true
-          # macOS x64：macos-13是Intel机器，原生构建
-          - os: macos-13
-            target: x86_64-apple-darwin
-          # macOS ARM64：macos-14是Apple Silicon机器，原生构建
-          - os: macos-14
-            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -42,21 +32,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 安装Linux ARM64交叉编译工具链
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
       - name: 安装maturin
         run: python -m pip install "maturin>=1.9,<2"
 
       - name: 构建wheel
-        env:
-          # 交叉编译时指定目标编译器（cmake-rs和cc-crate都会读取）
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: |
           rustup target add ${{ matrix.target }}
           # 注意：CI不使用同步指纹.py（它依赖本机采集的fingerprint_records.json），
@@ -64,7 +43,6 @@ jobs:
           maturin build --release --target ${{ matrix.target }} --out dist
 
       - name: 冒烟测试（原生平台）
-        if: "!matrix.cross"
         shell: bash
         run: |
           python -m pip install --force-reinstall dist/requests_rust-*.whl
