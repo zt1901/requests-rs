@@ -27,6 +27,7 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 默认代理地址 = ""
 # home：主页 Set-Cookie 原样带到 GraphQL；fake：同名称、同长度但不用真实 Cookie 值。
 默认Cookie模式 = "fake"
+默认指纹轮换 = False
 # ══════════════════════════════════════════════════
 
 
@@ -38,6 +39,7 @@ def 解析参数() -> argparse.Namespace:
     parser.add_argument("--impersonate", default=默认指纹版本)
     parser.add_argument("--fingerprints-path", default=str(默认指纹文件))
     parser.add_argument("--cookie-mode", choices=("home", "fake"), default=默认Cookie模式)
+    parser.add_argument("--fingerprint-rotation", action="store_true", default=默认指纹轮换)
     return parser.parse_args()
 
 
@@ -54,12 +56,18 @@ async def main() -> None:
         fingerprints_path=args.fingerprints_path,
         impersonate=args.impersonate,
         cookie_mode=args.cookie_mode,
+        fingerprint_rotation=args.fingerprint_rotation,
     )
     try:
         print("请求参数:")
         print(
             json.dumps(
-                {"groupUrls": group_urls, "resultsLimit": args.results_limit, "cookieMode": args.cookie_mode},
+                {
+                    "groupUrls": group_urls,
+                    "resultsLimit": args.results_limit,
+                    "cookieMode": args.cookie_mode,
+                    "fingerprintRotation": args.fingerprint_rotation,
+                },
                 ensure_ascii=True,
                 indent=2,
             )

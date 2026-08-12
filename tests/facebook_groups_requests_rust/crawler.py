@@ -79,6 +79,7 @@ class RequestsRustCrawler:
         fallback_proxy: str | None = None,
         fingerprints_path: str | Path | None = None,
         impersonate: str | None = None,
+        fingerprint_rotation: bool = False,
     ) -> None:
         self.proxy = proxy or 默认代理()
         self.fallback_proxy = fallback_proxy or self.proxy
@@ -86,6 +87,7 @@ class RequestsRustCrawler:
         self.session = AsyncSession(
             impersonate=self.impersonate,
             fingerprints_path=fingerprints_path,
+            fingerprint_rotation=fingerprint_rotation,
         )
         self.parse_thread_pool = ThreadPoolExecutor(max_workers=self.解析线程数)
         self.request_semaphore = asyncio.Semaphore(self.请求并发)
