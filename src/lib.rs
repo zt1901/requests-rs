@@ -66,6 +66,65 @@ type RawNativeResponse = (
     String,
     Vec<NativeHistoryEntry>,
 );
+
+#[pyclass]
+struct NativeHeaders {
+    raw: Vec<(String, String)>,
+    values: HashMap<String, Vec<String>>,
+    names: Vec<String>,
+}
+
+#[pymethods]
+impl NativeHeaders {
+    #[getter]
+    fn raw(&self) -> Vec<(String, String)> {
+        self.raw.clone()
+    }
+
+    fn get_list(&self, name: String) -> Vec<String> {
+        self.values
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get(&self, name: String, default: Option<String>) -> Option<String> {
+        self.values
+            .get(&name.to_ascii_lowercase())
+            .map(|values| values.join(", "))
+            .or(default)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+fn native_headers(headers: Vec<(String, String)>) -> NativeHeaders {
+    let mut values = HashMap::<String, Vec<String>>::new();
+    let mut names = Vec::new();
+    for (name, value) in &headers {
+        let key = name.to_ascii_lowercase();
+        if !values.contains_key(&key) {
+            names.push(name.clone());
+        }
+        values.entry(key).or_default().push(value.clone());
+    }
+    NativeHeaders {
+        raw: headers,
+        values,
+        names,
+    }
+}
+
+#[pyfunction]
+fn build_response_headers(headers: Vec<(String, String)>) -> NativeHeaders {
+    native_headers(headers)
+}
 type NativeBodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send>>;
 
 static 共享运行时: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
@@ -1893,7 +1952,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     }
     module.add_class::<NativeSession>()?;
     module.add_class::<NativeStreamResponse>()?;
+    module.add_class::<NativeHeaders>()?;
     module.add_function(wrap_pyfunction!(available_profiles, module)?)?;
+    module.add_function(wrap_pyfunction!(build_response_headers, module)?)?;
     module.add("readme", 版权说明)?;
     let api_module = PyModule::from_code(
         module.py(),

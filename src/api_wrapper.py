@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
 
-from ._native import NativeSession, available_profiles
+from ._native import NativeSession, available_profiles, build_response_headers
 
 
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
@@ -18,25 +18,23 @@ _UNSET = object()
 
 class Headers(Mapping[str, str]):
     def __init__(self, values: Sequence[tuple[str, str]] = ()) -> None:
-        self.raw = list(values)
-        self._values: dict[str, list[str]] = {}
-        self._names: dict[str, str] = {}
-        for name, value in self.raw:
-            key = name.lower()
-            self._names.setdefault(key, name)
-            self._values.setdefault(key, []).append(value)
+        self._native = build_response_headers(list(values))
+        self.raw = self._native.raw
 
     def __getitem__(self, name: str) -> str:
-        return ", ".join(self._values[name.lower()])
+        value = self._native.get(name, None)
+        if value is None:
+            raise KeyError(name)
+        return value
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._names.values())
+        return iter(self._native.names())
 
     def __len__(self) -> int:
-        return len(self._values)
+        return self._native.len()
 
     def get_list(self, name: str) -> list[str]:
-        return list(self._values.get(name.lower(), ()))
+        return self._native.get_list(name)
 
     def items(self, multi: bool = False):
         if multi:
