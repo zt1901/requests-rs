@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import statistics
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -342,6 +343,7 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
         cursor = page_data["cursor"]
         posts: list[dict[str, Any]] = []
         request_number = 0
+        分页耗时列表: list[float] = []
         while len(posts) < results_limit:
                 request_number += 1
                 count = min(self.POSTS_PER_PAGE, results_limit - len(posts))
@@ -389,16 +391,32 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
                         group_url,
                         page_data["group_id"],
                     )
+                    翻页耗时 = time.perf_counter() - 翻页开始时间
                     print(
                         f"分页成功: 第{request_number}页，帖子={len(page_posts)}，"
                         f"下一页={'是' if has_next_page and next_cursor else '否'}，HTTP={response.status_code}，"
-                        f"耗时={time.perf_counter() - 翻页开始时间:.3f}秒",
+                        f"耗时={翻页耗时:.3f}秒",
                         flush=True,
                     )
                     if page_posts and (len(page_posts) >= count or has_next_page):
+                        分页耗时列表.append(翻页耗时)
                         break
                 posts.extend(page_posts[: results_limit - len(posts)])
                 if len(posts) >= results_limit or not next_cursor or not has_next_page:
+                    if 分页耗时列表:
+                        sorted_times = sorted(分页耗时列表)
+                        p95_index = min(len(sorted_times) - 1, int(len(sorted_times) * 0.95))
+                        print(
+                            "分页时效汇总: "
+                            f"页数={len(分页耗时列表)}，"
+                            f"总耗时={sum(分页耗时列表):.3f}秒，"
+                            f"平均={statistics.mean(分页耗时列表):.3f}秒，"
+                            f"中位数={statistics.median(分页耗时列表):.3f}秒，"
+                            f"P95={sorted_times[p95_index]:.3f}秒，"
+                            f"最快={min(分页耗时列表):.3f}秒，"
+                            f"最慢={max(分页耗时列表):.3f}秒",
+                            flush=True,
+                        )
                     return posts
                 if next_cursor == cursor:
                     raise RuntimeError(f"{group_url} 分页 cursor 未变化，停止避免无限循环")
