@@ -213,6 +213,12 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
 
+    // BoringSSL 的 Visual Studio 工程会把 x86 专用汇编源混入 Windows ARM64 原生构建。
+    // ARM64 runner 虽非交叉编译，仍必须禁用汇编以构建可用的 ARM64 TLS 库。
+    if config.target_os == "windows" && config.target_arch == "aarch64" {
+        boringssl_cmake.define("OPENSSL_NO_ASM", "YES");
+    }
+
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
     }
