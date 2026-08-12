@@ -2,6 +2,8 @@
 
 这是从 `new_crawler/crawler/src/crawler_app/facebook_groups` 迁入的发包替换测试副本，用于验证 Facebook 群组首页与 GraphQL 分页在 `requests_rust` 传输层下的实际表现。
 
+默认验收规模为 30 条帖子。当前 GraphQL 每页最多返回 3 条，因此一次默认运行至少验证 10 次 cursor 分页；后续传输层改动不得只以两页分页作为通过标准。
+
 保留的能力：
 
 - 群组首页协议字段提取：`lsd`、`jazoest`、`__spin_*`、`__hsi`、cursor。
