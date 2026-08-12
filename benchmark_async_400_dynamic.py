@@ -92,28 +92,32 @@ async def main():
     proxy_port = server.sockets[0].getsockname()[1]
     process = psutil.Process(os.getpid())
     try:
-        async with AsyncSession(impersonate=测试版本) as session:
-            await session.get(
+        for fingerprint_rotation in 指纹轮换列表:
+            async with AsyncSession(
+                impersonate=测试版本,
+                fingerprint_rotation=fingerprint_rotation,
+            ) as session:
+                await session.get(
                 "http://dynamic.test/warmup",
                 headers=[("X-Request-Id", "warmup")],
                 cookies={"request_cookie": "warmup"},
                 proxy=f"http://session-warmup:{代理密码}@127.0.0.1:{proxy_port}",
             )
-            初始内存 = process.memory_info().rss
-            结果 = []
-            mode = "默认指纹轮换"
-            for round_index in range(重复轮数):
-                elapsed = await 执行一轮(session, proxy_port)
-                结果.append(elapsed)
-                gc.collect()
-                print(
-                    f"{mode}第{round_index + 1}轮: 耗时={elapsed:.4f}秒，"
-                    f"吞吐={并发数 / elapsed:.2f}请求/秒，"
-                    f"线程={process.num_threads()}，"
-                    f"内存增量={(process.memory_info().rss - 初始内存) / 1024 / 1024:.2f}MB"
-                )
-            median = statistics.median(结果)
-            print(f"{mode}400并发中位吞吐: {并发数 / median:.2f}请求/秒")
+                初始内存 = process.memory_info().rss
+                结果 = []
+                mode = "指纹轮换" if fingerprint_rotation else "固定指纹"
+                for round_index in range(重复轮数):
+                    elapsed = await 执行一轮(session, proxy_port)
+                    结果.append(elapsed)
+                    gc.collect()
+                    print(
+                        f"{mode}第{round_index + 1}轮: 耗时={elapsed:.4f}秒，"
+                        f"吞吐={并发数 / elapsed:.2f}请求/秒，"
+                        f"线程={process.num_threads()}，"
+                        f"内存增量={(process.memory_info().rss - 初始内存) / 1024 / 1024:.2f}MB"
+                    )
+                median = statistics.median(结果)
+                print(f"{mode}400并发中位吞吐: {并发数 / median:.2f}请求/秒")
     finally:
         server.close()
         await server.wait_closed()

@@ -69,8 +69,8 @@ def 运行本地服务(端口发送端):
     asyncio.run(启动服务())
 
 
-async def 测量requests_rust(并发数):
-    async with AsyncSession(impersonate=测试版本) as session:
+async def 测量requests_rust(并发数, 轮换=False):
+    async with AsyncSession(impersonate=测试版本, fingerprint_rotation=轮换) as session:
         async def 请求一次(index):
             response = await session.get(
                 测试地址,

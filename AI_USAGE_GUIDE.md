@@ -39,6 +39,7 @@ print(available_profiles())
 Session(
     *,
     impersonate: str,
+    fingerprint_rotation: bool = False,
     headers=None,
     proxy: str | None = None,
     verify: bool = True,
@@ -291,7 +292,9 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 指纹轮换与隔离
 
-每个 Session 默认按原子计数器循环其 `impersonate` profile 的全部变体。每个变体独立拥有 Client、连接池和 TLS Session Cache，不同指纹绝不共享 H2/TLS 连接；同一 Session 共享 Cookie Jar。多个 Session 不共享 Cookie、代理、连接池或 TLS Session Cache。
+`fingerprint_rotation=False` 默认固定使用 Profile 首个变体，适合 Facebook 等连续会话时效敏感业务，并能复用同一变体的 Client、连接池和 TLS Session Cache。
+
+`fingerprint_rotation=True` 按原子计数器循环该 Profile 的全部变体。每个变体独立拥有 Client、连接池和 TLS Session Cache，不同指纹绝不共享 H2/TLS 连接；同一 Session 共享 Cookie Jar。多个 Session 不共享 Cookie、代理、连接池或 TLS Session Cache。
 
 ## GIL模型
 

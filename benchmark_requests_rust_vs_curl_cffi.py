@@ -42,7 +42,7 @@ def 测量请求耗时(factory):
 def main():
     factories = {
         "requests_rust": lambda: Session(impersonate=测试版本),
-        "requests_rust默认轮换": lambda: Session(impersonate=测试版本),
+        "requests_rust轮换": lambda: Session(impersonate=测试版本, fingerprint_rotation=True),
         "curl_cffi": lambda: curl_requests.Session(impersonate="chrome"),
     }
     for name, factory in factories.items():

@@ -1386,10 +1386,11 @@ struct NativeSession {
 #[pymethods]
 impl NativeSession {
     #[new]
-    #[pyo3(signature = (impersonate, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new()))]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new()))]
     fn new(
         py: Python<'_>,
         impersonate: String,
+        fingerprint_rotation: bool,
         proxy: Option<String>,
         verify: bool,
         connect_timeout: Option<f64>,
@@ -1440,7 +1441,7 @@ impl NativeSession {
                     client_init: Mutex::new(()),
                 })
                 .collect(),
-            rotation: true,
+            rotation: fingerprint_rotation,
             proxy: ArcSwapOption::from(proxy.map(Arc::new)),
             default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
