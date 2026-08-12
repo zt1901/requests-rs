@@ -95,8 +95,8 @@ def main():
         with Session(impersonate=测试版本, verify=False) as session:
             first = session.get(测试地址)
             second = session.get(测试地址)
-            assert first.fingerprint_id == second.fingerprint_id
-            print("固定指纹:", first.fingerprint_id)
+            assert first.fingerprint_id != second.fingerprint_id
+            print("默认轮换:", first.fingerprint_id, second.fingerprint_id)
 
         records = json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as temp_dir:
