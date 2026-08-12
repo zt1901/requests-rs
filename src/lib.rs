@@ -48,18 +48,9 @@ const 版权说明: &str = include_str!("../NOTICE.txt");
 const API包装源码: &std::ffi::CStr = c_str!(include_str!("api_wrapper.py"));
 type NativeHistoryEntry = (u16, String, String, Vec<(String, String)>);
 type NativeCookie = (String, String, Option<String>, Option<String>, bool, bool);
-type NativeResponse = (
-    u16,
-    Vec<(String, String)>,
-    Py<PyBytes>,
-    String,
-    String,
-    String,
-    Vec<NativeHistoryEntry>,
-);
 type RawNativeResponse = (
     u16,
-    Vec<(String, String)>,
+    NativeHeaders,
     Bytes,
     String,
     String,
@@ -72,6 +63,30 @@ struct NativeHeaders {
     raw: Vec<(String, String)>,
     values: HashMap<String, Vec<String>>,
     names: Vec<String>,
+}
+
+#[pyclass]
+struct NativeResponse {
+    #[pyo3(get)]
+    status_code: u16,
+    #[pyo3(get)]
+    headers: Py<NativeHeaders>,
+    #[pyo3(get)]
+    content: Py<PyBytes>,
+    #[pyo3(get)]
+    url: String,
+    #[pyo3(get)]
+    fingerprint_id: String,
+    #[pyo3(get)]
+    impersonate: String,
+    history: Vec<NativeHistoryEntry>,
+}
+
+#[pymethods]
+impl NativeResponse {
+    fn history(&self) -> Vec<NativeHistoryEntry> {
+        self.history.clone()
+    }
 }
 
 #[pymethods]
@@ -119,6 +134,20 @@ fn native_headers(headers: Vec<(String, String)>) -> NativeHeaders {
         values,
         names,
     }
+}
+
+fn native_headers_from_map(headers: &HeaderMap) -> NativeHeaders {
+    native_headers(
+        headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[pyfunction]
@@ -1029,16 +1058,7 @@ async fn execute_request(
         .get::<redirect::History>()
         .map(history_entries)
         .unwrap_or_default();
-    let response_headers = response
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
+    let response_headers = native_headers_from_map(response.headers());
     let content = response.bytes().await.map_err(to_py_error)?;
     Ok((
         status,
@@ -1176,16 +1196,7 @@ async fn execute_multipart_request(
         .get::<redirect::History>()
         .map(history_entries)
         .unwrap_or_default();
-    let response_headers = response
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
+    let response_headers = native_headers_from_map(response.headers());
     let content = response.bytes().await.map_err(to_py_error)?;
     Ok((
         status,
@@ -1198,16 +1209,23 @@ async fn execute_multipart_request(
     ))
 }
 
-fn into_native_response(py: Python<'_>, response: RawNativeResponse) -> NativeResponse {
+fn into_native_response(
+    py: Python<'_>,
+    response: RawNativeResponse,
+) -> PyResult<Py<NativeResponse>> {
     let (status, headers, content, fingerprint_id, profile, url, history) = response;
-    (
-        status,
-        headers,
-        PyBytes::new(py, &content).unbind(),
-        fingerprint_id,
-        profile,
-        url,
-        history,
+    let native_headers = Py::new(py, headers)?;
+    Py::new(
+        py,
+        NativeResponse {
+            status_code: status,
+            headers: native_headers,
+            content: PyBytes::new(py, &content).unbind(),
+            url,
+            fingerprint_id,
+            impersonate: profile,
+            history,
+        },
     )
 }
 
@@ -1478,7 +1496,7 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
-    ) -> PyResult<NativeResponse> {
+    ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
@@ -1512,7 +1530,7 @@ impl NativeSession {
                 profile,
             ))
         })?;
-        Ok(into_native_response(py, result))
+        into_native_response(py, result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1548,7 +1566,7 @@ impl NativeSession {
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = cached_client_async(state, index).await?;
-            execute_request(
+            let response = execute_request(
                 client,
                 method,
                 url,
@@ -1562,7 +1580,8 @@ impl NativeSession {
                 fingerprint_id,
                 profile,
             )
-            .await
+            .await?;
+            Python::attach(|py| into_native_response(py, response))
         })
     }
 
@@ -1688,7 +1707,7 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
-    ) -> PyResult<NativeResponse> {
+    ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
@@ -1723,7 +1742,7 @@ impl NativeSession {
                 profile,
             ))
         })?;
-        Ok(into_native_response(py, result))
+        into_native_response(py, result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1760,7 +1779,7 @@ impl NativeSession {
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = cached_client_async(state, index).await?;
-            execute_multipart_request(
+            let response = execute_multipart_request(
                 client,
                 method,
                 url,
@@ -1775,7 +1794,8 @@ impl NativeSession {
                 fingerprint_id,
                 profile,
             )
-            .await
+            .await?;
+            Python::attach(|py| into_native_response(py, response))
         })
     }
 
@@ -1956,6 +1976,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
     module.add_class::<NativeStreamResponse>()?;
     module.add_class::<NativeHeaders>()?;
+    module.add_class::<NativeResponse>()?;
     module.add_function(wrap_pyfunction!(available_profiles, module)?)?;
     module.add_function(wrap_pyfunction!(build_response_headers, module)?)?;
     module.add("readme", 版权说明)?;

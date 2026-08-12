@@ -19,7 +19,20 @@ _UNSET = object()
 class Headers(Mapping[str, str]):
     def __init__(self, values: Sequence[tuple[str, str]] = ()) -> None:
         self._native = build_response_headers(list(values))
-        self.raw = self._native.raw
+        self._raw = None
+
+    @classmethod
+    def _from_native(cls, native: Any) -> "Headers":
+        instance = cls.__new__(cls)
+        instance._native = native
+        instance._raw = None
+        return instance
+
+    @property
+    def raw(self) -> list[tuple[str, str]]:
+        if self._raw is None:
+            self._raw = self._native.raw
+        return self._raw
 
     def __getitem__(self, name: str) -> str:
         value = self._native.get(name, None)
@@ -174,6 +187,45 @@ class Response:
         self._stream = stream
         self._consumer_active = False
         self.history = list(history)
+
+    @classmethod
+    def _from_native(cls, native: Any) -> "Response":
+        response = cls.__new__(cls)
+        response.status_code = native.status_code
+        response._native_response = native
+        response._headers = None
+        response.url = native.url
+        response.fingerprint_id = native.fingerprint_id
+        response.impersonate = native.impersonate
+        response._content = native.content
+        response._stream = None
+        response._consumer_active = False
+        response._history = None
+        return response
+
+    @property
+    def headers(self) -> Headers:
+        if self._headers is None:
+            self._headers = Headers._from_native(self._native_response.headers)
+        return self._headers
+
+    @headers.setter
+    def headers(self, value: Headers) -> None:
+        self._headers = value
+
+    @property
+    def history(self) -> list["Response"]:
+        if self._history is None:
+            self._history = _build_history(
+                self._native_response.history(),
+                self.fingerprint_id,
+                self.impersonate,
+            )
+        return self._history
+
+    @history.setter
+    def history(self, value: Sequence["Response"]) -> None:
+        self._history = list(value)
 
     @property
     def content(self) -> bytes:
@@ -463,16 +515,7 @@ class Session:
                 allow_redirects,
                 max_redirects,
             )
-            status_code, response_headers, content, fingerprint_id, profile, final_url, native_history = result
-            return Response(
-                status_code=status_code,
-                headers=response_headers,
-                content=content,
-                url=final_url,
-                fingerprint_id=fingerprint_id,
-                impersonate=profile,
-                history=_build_history(native_history, fingerprint_id, profile),
-            )
+            return Response._from_native(result)
         if stream:
             native = self._native.request_stream(
                 method,
@@ -511,16 +554,7 @@ class Session:
             allow_redirects,
             max_redirects,
         )
-        status_code, response_headers, content, fingerprint_id, profile, final_url, native_history = result
-        return Response(
-            status_code=status_code,
-            headers=response_headers,
-            content=content,
-            url=final_url,
-            fingerprint_id=fingerprint_id,
-            impersonate=profile,
-            history=_build_history(native_history, fingerprint_id, profile),
-        )
+        return Response._from_native(result)
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return self.request("GET", url, **kwargs)
@@ -712,17 +746,8 @@ def _build_history(
     ]
 
 
-def _response_from_native(result: Sequence[Any]) -> Response:
-    status_code, response_headers, content, fingerprint_id, profile, final_url, native_history = result
-    return Response(
-        status_code=status_code,
-        headers=response_headers,
-        content=content,
-        url=final_url,
-        fingerprint_id=fingerprint_id,
-        impersonate=profile,
-        history=_build_history(native_history, fingerprint_id, profile),
-    )
+def _response_from_native(result: Any) -> Response:
+    return Response._from_native(result)
 
 
 def _response_from_stream(native: Any) -> Response:
