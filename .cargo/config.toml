@@ -1,9 +1,2 @@
-[env]
-# btls-sys使用bindgen生成BoringSSL绑定，本机LLVM随Visual Studio Build Tools安装。
-LIBCLANG_PATH = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\Llvm\\x64\\bin"
-
-[build]
-target-dir = "D:\\BuildCache\\requests-rust-target"
-
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

@@ -36,6 +36,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 安装Linux BoringSSL构建依赖
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake perl pkg-config
+
       - name: 安装Linux ARM64交叉编译工具链
         if: matrix.cross
         run: |

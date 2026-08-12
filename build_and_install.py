@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import zipfile
+import os
 from pathlib import Path
 
 
@@ -8,11 +9,18 @@ from pathlib import Path
 项目目录 = Path(__file__).resolve().parent
 输出目录 = 项目目录 / "dist"
 源码原生模块 = 项目目录 / "python" / "requests_rust" / "_native.pyd"
+本机构建缓存 = Path(r"D:\BuildCache\requests-rust-target")
+本机LLVM目录 = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin")
 
 
 def run(*command):
     print("运行:", " ".join(map(str, command)))
-    subprocess.run(command, cwd=项目目录, check=True)
+    environment = os.environ.copy()
+    # 本机缓存和 LLVM 不写入仓库级 Cargo 配置，确保 Linux/Windows ARM64 CI 可移植构建。
+    environment["CARGO_TARGET_DIR"] = str(本机构建缓存)
+    if 本机LLVM目录.is_dir():
+        environment["LIBCLANG_PATH"] = str(本机LLVM目录)
+    subprocess.run(command, cwd=项目目录, check=True, env=environment)
 
 
 def 同步可编辑原生模块(wheel: Path):
