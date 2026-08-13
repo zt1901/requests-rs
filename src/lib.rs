@@ -4,13 +4,14 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -24,7 +25,11 @@ use pyo3::{
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex as AsyncMutex, Notify},
+};
 use url::Url;
 use wreq::{
     Client, Emulation, Method, Proxy, Uri, Version,
@@ -49,6 +54,7 @@ const 版权说明: &str = include_str!("../NOTICE.txt");
 const API包装源码: &std::ffi::CStr = c_str!(include_str!("api_wrapper.py"));
 type NativeHistoryEntry = (u16, String, String, Vec<(String, String)>);
 type NativeCookie = (String, String, Option<String>, Option<String>, bool, bool);
+type NativeTransferCounters = Arc<TransferCounters>;
 type RawNativeResponse = (
     u16,
     NativeHeaders,
@@ -57,7 +63,47 @@ type RawNativeResponse = (
     String,
     String,
     Vec<NativeHistoryEntry>,
+    Option<NativeTransferCounters>,
 );
+
+struct TransferCounters {
+    upload: AtomicU64,
+    download: AtomicU64,
+}
+
+struct TransferMeter {
+    proxy: Proxy,
+    counters: NativeTransferCounters,
+    _completed: tokio::task::JoinHandle<()>,
+}
+
+#[pyclass]
+struct NativeTransferStats {
+    counters: NativeTransferCounters,
+}
+
+#[pymethods]
+impl NativeTransferStats {
+    #[getter]
+    fn upload_size(&self) -> u64 {
+        self.counters.upload.load(Ordering::Acquire)
+    }
+
+    #[getter]
+    fn download_size(&self) -> u64 {
+        self.counters.download.load(Ordering::Acquire)
+    }
+
+    #[getter]
+    fn response_size(&self) -> u64 {
+        self.upload_size() + self.download_size()
+    }
+
+    #[getter]
+    fn scope(&self) -> &'static str {
+        "tcp_payload_through_metered_tunnel"
+    }
+}
 
 #[pyclass]
 struct NativeHeaders {
@@ -80,6 +126,8 @@ struct NativeResponse {
     fingerprint_id: String,
     #[pyo3(get)]
     impersonate: String,
+    #[pyo3(get)]
+    transfer_stats: Option<Py<NativeTransferStats>>,
     history: Vec<NativeHistoryEntry>,
 }
 
@@ -820,6 +868,172 @@ fn selected_proxy(
     Ok(state.proxy.load_full().map(|proxy| (*proxy).clone()))
 }
 
+fn selected_proxy_url(
+    state: &SessionState,
+    proxy_override: bool,
+    proxy: Option<String>,
+) -> Option<String> {
+    if proxy_override {
+        proxy
+    } else {
+        state.proxy_identity.load_full().map(|value| (*value).clone())
+    }
+}
+
+fn parse_connect_target(value: &str) -> Result<(String, u16)> {
+    let (host, port) = value.rsplit_once(':').context("CONNECT目标缺少端口")?;
+    Ok((
+        host.trim_matches(['[', ']']).to_string(),
+        port.parse().context("CONNECT目标端口无效")?,
+    ))
+}
+
+async fn copy_with_counter<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counters: NativeTransferCounters,
+    upload: bool,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; 16_384];
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        if writer.write_all(&buffer[..count]).await.is_err() {
+            return;
+        }
+        let counter = if upload {
+            &counters.upload
+        } else {
+            &counters.download
+        };
+        counter.fetch_add(count as u64, Ordering::Relaxed);
+    }
+}
+
+async fn run_transfer_meter(
+    listener: TcpListener,
+    upstream_proxy: Option<String>,
+    counters: NativeTransferCounters,
+) {
+    let Ok((client, _)) = listener.accept().await else {
+        return;
+    };
+    let mut reader = BufReader::new(client);
+    let mut request_head = Vec::new();
+    if reader.read_until(b'\n', &mut request_head).await.is_err() {
+        return;
+    }
+    let request_line = String::from_utf8_lossy(&request_head);
+    let mut parts = request_line.split_whitespace();
+    if parts.next() != Some("CONNECT") {
+        return;
+    }
+    let Some(target) = parts.next() else {
+        return;
+    };
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line).await.is_err() || line == b"\r\n" {
+            break;
+        }
+    }
+    let Ok((host, port)) = parse_connect_target(target) else {
+        return;
+    };
+    let mut upstream = if let Some(proxy_url) = upstream_proxy {
+        let Ok(parsed) = Url::parse(&proxy_url) else {
+            return;
+        };
+        if parsed.scheme() != "http" {
+            return;
+        }
+        let Some(proxy_host) = parsed.host_str() else {
+            return;
+        };
+        let Ok(mut stream) = TcpStream::connect((proxy_host, parsed.port().unwrap_or(80))).await else {
+            return;
+        };
+        let mut connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            let password = parsed.password().unwrap_or_default();
+            let auth = BASE64.encode(format!("{}:{password}", parsed.username()));
+            connect.push_str(&format!("Proxy-Authorization: Basic {auth}\r\n"));
+        }
+        connect.push_str("\r\n");
+        if stream.write_all(connect.as_bytes()).await.is_err() {
+            return;
+        }
+        let mut upstream_reader = BufReader::new(stream);
+        let mut status = Vec::new();
+        if upstream_reader.read_until(b'\n', &mut status).await.is_err()
+            || !String::from_utf8_lossy(&status).contains(" 200 ")
+        {
+            return;
+        }
+        let mut connect_response_bytes = status.len();
+        loop {
+            let mut line = Vec::new();
+            if upstream_reader.read_until(b'\n', &mut line).await.is_err() || line == b"\r\n" {
+                break;
+            }
+            connect_response_bytes += line.len();
+        }
+        counters.download.fetch_add(connect_response_bytes as u64, Ordering::Relaxed);
+        upstream_reader.into_inner()
+    } else {
+        let Ok(stream) = TcpStream::connect((host.as_str(), port)).await else {
+            return;
+        };
+        stream
+    };
+    let mut client = reader.into_inner();
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let (client_read, client_write) = client.split();
+    let (upstream_read, upstream_write) = upstream.split();
+    tokio::join!(
+        copy_with_counter(client_read, upstream_write, counters.clone(), true),
+        copy_with_counter(upstream_read, client_write, counters, false),
+    );
+}
+
+async fn start_transfer_meter(upstream_proxy: Option<String>) -> PyResult<TransferMeter> {
+    if let Some(proxy) = upstream_proxy.as_deref() {
+        let parsed = Url::parse(proxy)
+            .map_err(|error| PyRuntimeError::new_err(format!("transfer_stats代理URL无效: {error}")))?;
+        if parsed.scheme() != "http" {
+            return Err(PyRuntimeError::new_err(
+                "transfer_stats仅支持直连或http://上游代理；HTTPS/SOCKS代理无法保持相同的TCP计量语义",
+            ));
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(to_py_error)?;
+    let port = listener.local_addr().map_err(to_py_error)?.port();
+    let counters = Arc::new(TransferCounters {
+        upload: AtomicU64::new(0),
+        download: AtomicU64::new(0),
+    });
+    let completed = tokio::spawn(run_transfer_meter(listener, upstream_proxy, counters.clone()));
+    let proxy = Proxy::all(format!("http://127.0.0.1:{port}")).map_err(to_py_error)?;
+    Ok(TransferMeter {
+        proxy,
+        counters,
+        _completed: completed,
+    })
+}
+
 fn select_proxy_mapping(
     url: &str,
     proxies: Vec<(String, Option<String>)>,
@@ -1048,7 +1262,19 @@ async fn execute_request(
     max_redirects: usize,
     fingerprint_id: String,
     profile: String,
+    transfer_stats: bool,
+    upstream_proxy: Option<String>,
 ) -> PyResult<RawNativeResponse> {
+    if transfer_stats && !url.starts_with("https://") {
+        return Err(PyRuntimeError::new_err(
+            "transfer_stats仅支持HTTPS请求，统计对象表示TLS隧道的实际TCP字节",
+        ));
+    }
+    let meter = if transfer_stats {
+        Some(start_transfer_meter(upstream_proxy).await?)
+    } else {
+        None
+    };
     let mut request = client
         .request(method, &url)
         .timeout(timeout)
@@ -1061,7 +1287,9 @@ async fn execute_request(
     if let Some(timeout) = read_timeout {
         request = request.read_timeout(timeout);
     }
-    if let Some(proxy) = proxy {
+    if let Some(meter) = &meter {
+        request = request.proxy(meter.proxy.clone());
+    } else if let Some(proxy) = proxy {
         request = request.proxy(proxy);
     }
     if let Some(body) = body {
@@ -1077,6 +1305,11 @@ async fn execute_request(
         .unwrap_or_default();
     let response_headers = native_headers_from_map(response.headers());
     let content = response.bytes().await.map_err(to_py_error)?;
+    let transfer_counters = if let Some(meter) = meter {
+        Some(meter.counters)
+    } else {
+        None
+    };
     Ok((
         status,
         response_headers,
@@ -1085,6 +1318,7 @@ async fn execute_request(
         profile,
         final_url,
         history,
+        transfer_counters,
     ))
 }
 
@@ -1223,6 +1457,7 @@ async fn execute_multipart_request(
         profile,
         final_url,
         history,
+        None,
     ))
 }
 
@@ -1230,7 +1465,7 @@ fn into_native_response(
     py: Python<'_>,
     response: RawNativeResponse,
 ) -> PyResult<Py<NativeResponse>> {
-    let (status, headers, content, fingerprint_id, profile, url, history) = response;
+    let (status, headers, content, fingerprint_id, profile, url, history, transfer_counters) = response;
     let native_headers = Py::new(py, headers)?;
     Py::new(
         py,
@@ -1242,6 +1477,9 @@ fn into_native_response(
             fingerprint_id,
             impersonate: profile,
             history,
+            transfer_stats: transfer_counters
+                .map(|counters| Py::new(py, NativeTransferStats { counters }))
+                .transpose()?,
         },
     )
 }
@@ -1507,7 +1745,7 @@ impl NativeSession {
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false))]
     fn request(
         &self,
         py: Python<'_>,
@@ -1522,6 +1760,7 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        transfer_stats: bool,
     ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -1531,6 +1770,7 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
             let variant = &state.variants[index];
@@ -1550,13 +1790,15 @@ impl NativeSession {
                 max_redirects,
                 fingerprint_id,
                 profile,
+                transfer_stats,
+                proxy_url,
             ))
         })?;
         into_native_response(py, result)
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -1571,6 +1813,7 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        transfer_stats: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -1579,6 +1822,7 @@ impl NativeSession {
         let state = self.state.clone();
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
@@ -1597,6 +1841,8 @@ impl NativeSession {
                 max_redirects,
                 fingerprint_id,
                 profile,
+                transfer_stats,
+                proxy_url,
             )
             .await?;
             Python::attach(|py| into_native_response(py, response))

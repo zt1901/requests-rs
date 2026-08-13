@@ -334,6 +334,9 @@ def main():
             proxied_again = session.get(target_url + "/headers")
             assert proxied_again.headers["x-test-proxy"] == "B"
 
+            # 传输统计只适用于HTTPS/TLS；专用HTTPS代理基准会校验准确字节计数。
+            assert direct.transfer_stats is None
+
             session.cookies.set("manual", "value", url=target_url)
             assert session.cookies["manual"] == "value"
             assert any(cookie.name == "manual" for cookie in session.cookies.get_all())

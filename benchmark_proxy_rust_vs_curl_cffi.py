@@ -92,9 +92,38 @@ class IPIPGO本地代理(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     命中用户: Counter[str] = Counter()
     记录锁 = threading.Lock()
+    客户端到服务端字节 = 0
+    服务端到客户端字节 = 0
+
+    @classmethod
+    def 重置流量(cls) -> None:
+        with cls.记录锁:
+            cls.客户端到服务端字节 = 0
+            cls.服务端到客户端字节 = 0
+
+    @classmethod
+    def 流量快照(cls) -> tuple[int, int]:
+        with cls.记录锁:
+            return cls.客户端到服务端字节, cls.服务端到客户端字节
 
     def log_message(self, *_: object) -> None:
         pass
+
+    @staticmethod
+    def 转发全部(target: socket.socket, data: bytes) -> None:
+        """非阻塞隧道写满时等待可写事件，避免大响应因 WinError 10035 被截断。"""
+        offset = 0
+        while offset < len(data):
+            try:
+                sent = target.send(data[offset:])
+            except BlockingIOError:
+                _, writable, exceptional = select.select((), (target,), (target,), 30)
+                if exceptional or not writable:
+                    raise ConnectionError("代理隧道写入超时")
+                continue
+            if sent == 0:
+                raise ConnectionError("代理隧道已关闭")
+            offset += sent
 
     def do_CONNECT(self) -> None:
         authorization = self.headers.get("Proxy-Authorization", "")
@@ -140,9 +169,14 @@ class IPIPGO本地代理(BaseHTTPRequestHandler):
                         continue
                     if not data:
                         return
+                    with type(self).记录锁:
+                        if source is self.connection:
+                            type(self).客户端到服务端字节 += len(data)
+                        else:
+                            type(self).服务端到客户端字节 += len(data)
                     try:
-                        target.sendall(data)
-                    except ConnectionError:
+                        type(self).转发全部(target, data)
+                    except (ConnectionError, OSError):
                         return
         finally:
             upstream.close()

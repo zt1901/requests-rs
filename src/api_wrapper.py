@@ -185,6 +185,7 @@ class Response:
         self.impersonate = impersonate
         self._content = content
         self._stream = stream
+        self.transfer_stats = None
         self._consumer_active = False
         self.history = list(history)
 
@@ -197,6 +198,7 @@ class Response:
         response.url = native.url
         response.fingerprint_id = native.fingerprint_id
         response.impersonate = native.impersonate
+        response.transfer_stats = native.transfer_stats
         response._content = native.content
         response._stream = None
         response._consumer_active = False
@@ -458,9 +460,14 @@ class Session:
         proxies: ProxyInput | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
+        transfer_stats: bool = False,
     ) -> Response:
         if files is not None and json is not None:
             raise ValueError("files不能和json同时使用")
+        if transfer_stats and stream:
+            raise ValueError("transfer_stats暂不支持stream=True")
+        if transfer_stats and files is not None:
+            raise ValueError("transfer_stats暂不支持multipart请求")
         prepared = self._prepare_request(
             method,
             url,
@@ -553,6 +560,7 @@ class Session:
             request_cookies,
             allow_redirects,
             max_redirects,
+            transfer_stats,
         )
         return Response._from_native(result)
 
@@ -601,10 +609,15 @@ class AsyncSession:
         max_redirects = kwargs.pop("max_redirects", 10)
         files = kwargs.pop("files", None)
         stream = kwargs.pop("stream", False)
+        transfer_stats = kwargs.pop("transfer_stats", False)
         data = kwargs.pop("data", None)
         json = kwargs.pop("json", None)
         if files is not None and json is not None:
             raise ValueError("files不能和json同时使用")
+        if transfer_stats and stream:
+            raise ValueError("transfer_stats暂不支持stream=True")
+        if transfer_stats and files is not None:
+            raise ValueError("transfer_stats暂不支持multipart请求")
         prepared = self._session._prepare_request(
             method,
             url,
@@ -664,6 +677,7 @@ class AsyncSession:
             *prepared,
             allow_redirects,
             max_redirects,
+            transfer_stats,
         )
         return _response_from_native(result)
 

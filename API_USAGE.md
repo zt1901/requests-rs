@@ -209,6 +209,32 @@ response.impersonate
 response.raise_for_status()
 ```
 
+## TLS 传输层统计
+
+默认不统计传输流量，普通请求不会创建计数器、计量中继或额外连接：
+
+```python
+response = await session.get("https://example.com/api", transfer_stats=True)
+stats = response.transfer_stats
+
+print(stats.upload_size)
+print(stats.download_size)
+print(stats.response_size)
+print(stats.scope)
+```
+
+`transfer_stats=True` 返回的不是 `len(response.content)`、解压后的 Body 长度或 `Content-Length` 推算值。它统计专用计量路径上实际成功读写的 TCP payload 字节：TLS handshake、TLS record、HTTP Header、压缩后的响应 Body、HTTP/2 控制帧，以及使用 HTTP 代理时与上游代理的 CONNECT 请求/响应均会计入。
+
+`upload_size` 和 `download_size` 分别是该请求外部链路的真实上行和下行字节；`response_size` 是两者之和；`scope` 固定为 `tcp_payload_through_metered_tunnel`。
+
+此功能默认关闭。开启时为保证 HTTP/2 多路复用连接中的字节可以严格归属到当前请求，库会使用独占计量连接，因此不会复用该请求的既有 CONNECT、TLS 或 HTTP/2 连接。它适合审计、代理计费核对和传输诊断，不适合高吞吐业务热路径。
+
+当前限制：
+
+- 仅支持 HTTPS 请求。
+- 仅支持普通完整响应，不支持 `stream=True` 或 multipart 上传。
+- 仅支持直连或 `http://` 上游代理；HTTPS/SOCKS 上游代理无法在不改变代理 TLS 语义的前提下提供同一层级的准确 TCP 统计。
+
 同步流式读取：
 
 ```python
