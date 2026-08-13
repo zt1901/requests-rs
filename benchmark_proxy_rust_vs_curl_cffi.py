@@ -14,13 +14,21 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import psutil
+import requests
+import wreq
+from urllib3.exceptions import InsecureRequestWarning
 from curl_cffi import requests as curl_requests
 from requests_rust import AsyncSession
+
+
+# 基准后端使用本地自签名证书且请求明确关闭校验，关闭重复告警以免影响同步库测量。
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
 # ══════════════════════════════════════════════════
@@ -30,6 +38,8 @@ from requests_rust import AsyncSession
 Rust后端目录 = 捕获器目录 / "rust_fingerprint_server"
 测试指纹版本 = "chrome142"
 并发Worker数 = 10
+# curl_cffi 允许保留更多 Client，实际同时请求数仍由并发Worker数决定。
+curl客户端上限 = 1_000
 请求规模列表 = [10, 10_000, 1_000_000]
 延迟采样上限 = 20_000
 启动超时秒 = 20
@@ -105,8 +115,9 @@ class IPIPGO本地代理(BaseHTTPRequestHandler):
             return
         try:
             upstream = socket.create_connection((host, int(port_text)), timeout=5)
-        except OSError as error:
-            self.send_error(502, str(error))
+        except OSError:
+            # HTTP 状态行只能使用 Latin-1，Windows 本地错误文本可能包含中文。
+            self.send_error(502, "Upstream connection failed")
             return
         with type(self).记录锁:
             type(self).命中用户[user] += 1
@@ -163,6 +174,7 @@ async def 测量资源(stop: asyncio.Event, result: dict[str, float]) -> None:
 async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -> dict[str, object]:
     process = psutil.Process(os.getpid())
     initial_rss = process.memory_info().rss
+    initial_cpu = process.cpu_times()
     metrics: dict[str, float] = {
         "peak_rss": initial_rss,
         "peak_threads": process.num_threads(),
@@ -176,6 +188,7 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
     failures = 0
     latencies: list[float] = []
 
+    session: object | None = None
     if name == "requests_rust":
         session = AsyncSession(
             impersonate=测试指纹版本,
@@ -191,10 +204,10 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
         async def request_once(index: int) -> bool:
             response = await session.get(target_url + f"?id={index}")
             return response.status_code == 200 and response.content == b"{}"
-    else:
+    elif name == "curl_cffi":
         session = curl_requests.AsyncSession(
             impersonate="chrome",
-            max_clients=并发Worker数,
+            max_clients=curl客户端上限,
             proxy=proxy_url,
             verify=False,
             headers={
@@ -207,41 +220,88 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
         async def request_once(index: int) -> bool:
             response = await session.get(target_url + f"?id={index}")
             return response.status_code == 200 and response.content == b"{}"
+    def build_sync_session() -> requests.Session:
+        result = requests.Session()
+        result.headers.update({
+            "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cache-Control": "no-cache",
+            "X-Benchmark-Default": "cached",
+        })
+        result.proxies.update({"https": proxy_url})
+        result.verify = False
+        return result
+
+    def build_rnet_client() -> wreq.Client:
+        return wreq.Client(
+            emulation=wreq.Emulation.Chrome142,
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Cache-Control": "no-cache",
+                "X-Benchmark-Default": "cached",
+            },
+            proxies=[wreq.Proxy.all(proxy_url)],
+            tls_verify=False,
+        )
+
+    if name == "rnet":
+        session = build_rnet_client()
+
+        async def request_once(index: int) -> bool:
+            response = await session.get(target_url + f"?id={index}")
+            return response.status.as_int() == 200 and await response.text() == "{}"
 
     async def worker() -> None:
         nonlocal next_index, successes, failures
-        while True:
-            async with counter_lock:
-                if next_index >= total:
-                    return
-                index = next_index
-                next_index += 1
-            started = time.perf_counter()
-            try:
-                ok = await request_once(index)
-            except Exception:
-                ok = False
-            elapsed = time.perf_counter() - started
-            if len(latencies) < 延迟采样上限 or random.randrange(index + 1) < 延迟采样上限:
-                if len(latencies) < 延迟采样上限:
-                    latencies.append(elapsed)
+        # requests 的网络请求最终在工作线程中执行，不能让多个 worker 共享同步 Session。
+        sync_session = build_sync_session() if name == "requests" else None
+        try:
+            while True:
+                async with counter_lock:
+                    if next_index >= total:
+                        return
+                    index = next_index
+                    next_index += 1
+                started = time.perf_counter()
+                try:
+                    if sync_session is not None:
+                        response = await asyncio.to_thread(sync_session.get, target_url + f"?id={index}")
+                        ok = response.status_code == 200 and response.content == b"{}"
+                    else:
+                        ok = await request_once(index)
+                except Exception:
+                    ok = False
+                elapsed = time.perf_counter() - started
+                if len(latencies) < 延迟采样上限 or random.randrange(index + 1) < 延迟采样上限:
+                    if len(latencies) < 延迟采样上限:
+                        latencies.append(elapsed)
+                    else:
+                        latencies[random.randrange(延迟采样上限)] = elapsed
+                if ok:
+                    successes += 1
                 else:
-                    latencies[random.randrange(延迟采样上限)] = elapsed
-            if ok:
-                successes += 1
-            else:
-                failures += 1
+                    failures += 1
+        finally:
+            if sync_session is not None:
+                sync_session.close()
 
     started = time.perf_counter()
     try:
         await asyncio.gather(*(worker() for _ in range(并发Worker数)))
     finally:
-        await session.close()
+        if session is not None:
+            if name == "rnet":
+                session.close()
+            else:
+                await session.close()
         elapsed = time.perf_counter() - started
         stop.set()
         await sampler
     latencies.sort()
     rss_delta = process.memory_info().rss - initial_rss
+    final_cpu = process.cpu_times()
+    cpu_seconds = (final_cpu.user - initial_cpu.user) + (final_cpu.system - initial_cpu.system)
     return {
         "library": name,
         "requests": total,
@@ -257,17 +317,21 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
         "end_rss_delta_mb": rss_delta / 1024 / 1024,
         "peak_threads": int(metrics["peak_threads"]),
         "peak_cpu_percent": metrics["peak_cpu"],
+        # 这是当前 Python 进程的 CPU 时间，不等同于硬件电能；用于同机同场景的能效代理比较。
+        "cpu_seconds": cpu_seconds,
+        "cpu_ms_per_request": cpu_seconds / total * 1000,
     }
 
 
 def 打印表格(rows: list[dict[str, object]]) -> None:
-    print("| 库 | 请求量 | Worker | 成功率 | 吞吐 req/s | P50 ms | P95 ms | 峰值 RSS 增量 MB | 线程峰值 | CPU 峰值 |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("| 库 | 请求量 | Worker | 成功率 | 吞吐 req/s | P50 ms | P95 ms | 峰值 RSS 增量 MB | 线程峰值 | CPU 峰值 | CPU ms/请求 |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in rows:
         print(
             f"| {row['library']} | {row['requests']:,} | {row['workers']} | {row['success_rate']:.4f}% | "
             f"{row['throughput_rps']:.2f} | {row['p50_ms']:.3f} | {row['p95_ms']:.3f} | "
-            f"{row['peak_rss_delta_mb']:.2f} | {row['peak_threads']} | {row['peak_cpu_percent']:.1f}% |"
+            f"{row['peak_rss_delta_mb']:.2f} | {row['peak_threads']} | {row['peak_cpu_percent']:.1f}% | "
+            f"{row['cpu_ms_per_request']:.4f} |"
         )
 
 
@@ -290,7 +354,7 @@ async def main() -> None:
         等待端口(backend_port, backend)
         rows = []
         for total in 请求规模列表:
-            for name in ("requests_rust", "curl_cffi"):
+            for name in ("requests_rust", "curl_cffi", "rnet", "requests"):
                 result = await 运行一轮(name, total, target_url, proxy_url)
                 rows.append(result)
                 print(json.dumps(result, ensure_ascii=False))
