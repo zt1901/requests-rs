@@ -55,6 +55,7 @@ python build_and_install.py
 
 允许内容：
 
+- 简短的 `README.md`，仅说明安装方式、支持平台和源码仓库边界。
 - GitHub Release。
 - 以下四种已构建的 `.whl` 文件。
 
@@ -64,7 +65,7 @@ python build_and_install.py
 - GitHub Actions workflow、构建日志或任何能还原源码的资料。
 - 将本地项目目录设置为该仓库的 `origin`。
 
-当前发布仓库应保持空分支或无分支；wheel 仅作为 GitHub Release asset 上传。
+发布仓库的 `main` 分支只保留上述简短 `README.md`；wheel 仅作为 GitHub Release asset 上传。
 
 ## 3. 发布流程
 
