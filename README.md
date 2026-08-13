@@ -77,7 +77,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 - 当前发布 wheel 仅支持 Windows x64；其他平台需要对应构建产物。
 - 不同 profile 不共享 TLS/HTTP/2 连接池，这是指纹隔离的必要限制。
 
-详细参数、并发用法和边界说明见 [AI_USAGE_GUIDE.md](AI_USAGE_GUIDE.md)。浏览器 Copy as cURL 请求模板与指纹库的固定边界见 [RESEARCH_BASELINE.md](RESEARCH_BASELINE.md)。
+完整安装、同步/异步 API、请求参数、Cookie、代理、流和 multipart 示例见 [API_USAGE.md](API_USAGE.md)。面向维护者的并发用法和边界说明见 [AI_USAGE_GUIDE.md](AI_USAGE_GUIDE.md)。浏览器 Copy as cURL 请求模板与指纹库的固定边界见 [RESEARCH_BASELINE.md](RESEARCH_BASELINE.md)。
 
 ## 查看内置版本
 
