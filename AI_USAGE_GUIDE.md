@@ -4,7 +4,7 @@
 
 `requests_rust`是Python 3.10+的浏览器指纹HTTP、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust负责DNS、IPv4/IPv6、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、WebSocket、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径直接使用进程级Tokio Runtime，不经过 `asyncio.to_thread`。
 
-当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Linux x64、Linux ARM64和Windows ARM64有独立构建目标，必须安装与平台和CPU匹配的wheel；其构建成功不替代完整协议回归。
+当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64、macOS Intel和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建和安装冒烟；必须安装与平台、CPU匹配的wheel，安装冒烟不替代完整协议回归。
 
 ## 导入
 
@@ -369,8 +369,8 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 已知边界
 
-- 原生wheel必须与操作系统和CPU架构匹配；当前完整协议回归以Windows x64为准。Linux/Windows ARM64已有构建目标但未完成同等级全协议验证。
-- 当前manylinux目标依赖glibc，不代表Alpine musl支持；macOS当前不在构建矩阵中。
+- 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64、macOS Intel和Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
+- 当前manylinux目标依赖glibc，不代表Alpine musl支持。
 - 当前不实现HTTP/3发送。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
 - TCP字段来自浏览器和requests_rust共享的Windows内核网络栈，不代表能在其他系统伪造Windows TCP SYN。

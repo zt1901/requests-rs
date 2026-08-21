@@ -22,8 +22,10 @@ wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
 | Windows ARM64 | `win_arm64` |
 | Linux x64 | `manylinux_2_34_x86_64` |
 | Linux ARM64 | `manylinux_2_34_aarch64` |
+| macOS Intel | `macosx_10_12_x86_64` |
+| macOS Apple Silicon | `macosx_11_0_arm64` |
 
-wheel 必须与操作系统和 CPU 架构匹配。当前 Windows x64 已完成本文所列完整协议回归；Linux 和 Windows ARM64 构建目标不应仅凭 wheel 产出视为完成同等级协议验证。macOS 和 Alpine musl 当前不在发布矩阵中。
+wheel 必须与操作系统和 CPU 架构匹配。Windows ARM64、Linux x64、Linux ARM64、macOS Intel和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建、pip安装、原生模块导入、profile读取和Session构造冒烟。当前Windows x64已完成本文所列完整协议回归；其他平台的安装冒烟不等同于同等级全协议验证。Alpine musl当前不在发布矩阵中。
 
 ## 导入与内置指纹
 

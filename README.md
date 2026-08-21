@@ -28,13 +28,13 @@
 
 ## 安装
 
-当前发布产物为 Windows x64、CPython 3.10+ 的稳定 ABI wheel：
+当前本机产物为 Windows x64、CPython 3.10+ 的稳定 ABI wheel：
 
 ```text
 requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ```
 
-Windows x64 本地开发可直接右键运行 `build_and_install.py`。脚本会同步已采集的指纹数据、构建 wheel 并安装到项目环境。Linux x64、Linux ARM64 和 Windows ARM64 使用各自预编译 wheel；仓库提供构建矩阵，但当前完整协议回归以 Windows x64 为准。macOS 尚未进入构建矩阵。
+Windows x64 本地开发可直接右键运行 `build_and_install.py`。GitHub Actions 已原生构建并安装冒烟验证 Windows ARM64、Linux x64、Linux ARM64、macOS Intel 和 macOS Apple Silicon wheel。云端冒烟确认原生模块可导入、内置profile可读取并可构造Session；HTTP、代理、SOCKS5、WebSocket、IPv6和Facebook完整协议回归仍以Windows x64为准。
 
 ## 最小用法
 
@@ -81,7 +81,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 ## 限制
 
 - 当前不发送 HTTP/3。
-- 原生 wheel 必须与操作系统和 CPU 架构匹配；当前完整协议回归以 Windows x64 为准。
+- 原生 wheel 必须与操作系统和 CPU 架构匹配；六个平台均已构建，五个云端平台通过原生安装冒烟，当前完整协议回归以 Windows x64 为准。
 - Linux 构建目标为 glibc manylinux，不等同于 Alpine musl 支持。
 - 不同 profile 不共享 TLS/HTTP/2 连接池，这是指纹隔离的必要限制。
 - 不提供Rust原生`batch()`或库内业务Worker队列；该路线不能减少不同代理身份的握手成本，并会重复现有单请求Future与Rust统一连接上限的生命周期语义。批量业务使用Python有限Worker逐条调用同一个`AsyncSession`。
