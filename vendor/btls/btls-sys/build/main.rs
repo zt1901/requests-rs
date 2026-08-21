@@ -813,7 +813,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         }
     }
 
-    if config.features.prefix_symbols {
+    // macOS、iOS和Windows不会改写静态库符号，bindgen也不能单独引用带前缀的名称。
+    if config.features.prefix_symbols
+        && !matches!(config.target_os.as_str(), "macos" | "ios" | "windows")
+    {
         builder = builder.parse_callbacks(Box::new(PrefixCallback));
     }
 

@@ -21,18 +21,15 @@ jobs:
           # Linux x64：原生GCC构建
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          # Linux ARM64：x64机器上交叉编译（btls-sys自带aarch64工具链文件）。
-          - os: ubuntu-22.04
+          # Linux ARM64：原生ARM runner构建，避免宿主objcopy处理ARM归档。
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
           # macOS Intel：使用Intel原生runner构建和安装验证。
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            libclang: /usr/local/opt/llvm/lib
           # macOS Apple Silicon：使用ARM64原生runner构建和安装验证。
           - os: macos-15
             target: aarch64-apple-darwin
-            libclang: /opt/homebrew/opt/llvm/lib
     steps:
       - uses: actions/checkout@v4
 
@@ -46,29 +43,33 @@ jobs:
 
       - name: 安装Linux BoringSSL构建依赖
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake perl pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev cmake perl pkg-config
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: 安装macOS BoringSSL构建依赖
         if: runner.os == 'macOS'
-        run: brew install llvm cmake perl pkg-config
-
-      - name: 安装Linux ARM64交叉编译工具链
-        if: matrix.cross
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          brew install llvm cmake perl pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: 定位Windows libclang
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files\LLVM\bin",
+            "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin"
+          )
+          $path = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
+          if (-not $path) { throw "未找到libclang.dll" }
+          "LIBCLANG_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 安装maturin
         run: python -m pip install "maturin>=1.9,<2"
 
       - name: 构建wheel
-        env:
-          # 交叉编译时指定目标编译器（cmake-rs和cc-crate都会读取）。
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          LIBCLANG_PATH: ${{ matrix.libclang }}
         run: |
           rustup target add ${{ matrix.target }}
           # 注意：CI不使用同步指纹.py（它依赖本机采集的fingerprint_records.json），
@@ -76,7 +77,6 @@ jobs:
           maturin build --release --target ${{ matrix.target }} --out dist
 
       - name: 冒烟测试（原生平台）
-        if: "!matrix.cross"
         shell: bash
         run: |
           python -m pip install --force-reinstall dist/requests_rust-*.whl
