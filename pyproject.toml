@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "requests_rust"
-version = "0.2.3"
+version = "0.3.0"
 description = "基于wreq和内置采集指纹的浏览器网络客户端"
 requires-python = ">=3.10"
 license = "Proprietary"

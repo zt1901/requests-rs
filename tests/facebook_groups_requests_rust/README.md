@@ -18,7 +18,7 @@
 |---|---|
 | `curl_cffi.requests.AsyncSession` | `requests_rust.AsyncSession` |
 | `curl_cffi` 的 `proxies={...}` | `requests_rust` 的请求级 `proxy=` |
-| `curl_cffi` 的 `impersonate` | `requests_rust` 的 `impersonate` 与可选 `fingerprints_path`；测试基类保留按 profile 覆盖 UA 的原逻辑 |
+| `curl_cffi` 的 `impersonate` | `requests_rust` 的 profile 名称或单 profile 指纹文件路径；兼容旧式 `fingerprints_path`，测试基类保留按 profile 覆盖 UA 的原逻辑 |
 
 原 `groups.py` 的 Relay 变量、页面 Header、GraphQL Header、表单字段、解析路径、重试次数、分页顺序和每 50 个群组的批处理逻辑均保留。右键运行 `run_facebook_groups_live.py`；顶部参数区用于填写群组 URL、代理和指纹文件路径。
 

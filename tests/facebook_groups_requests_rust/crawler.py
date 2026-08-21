@@ -80,10 +80,14 @@ class RequestsRustCrawler:
         fingerprints_path: str | Path | None = None,
         impersonate: str | None = None,
         fingerprint_rotation: bool = False,
+        transfer_stats: bool = False,
+        accept_encoding: str | None = None,
     ) -> None:
         self.proxy = proxy or 默认代理()
         self.fallback_proxy = fallback_proxy or self.proxy
         self.impersonate = impersonate or self.默认指纹版本
+        self.transfer_stats = transfer_stats
+        self.accept_encoding = accept_encoding
         self.session = AsyncSession(
             impersonate=self.impersonate,
             fingerprints_path=fingerprints_path,
@@ -93,6 +97,8 @@ class RequestsRustCrawler:
         self.request_semaphore = asyncio.Semaphore(self.请求并发)
         self.request_attempts = 0
         self.request_retries = 0
+        self.transfer_upload_bytes = 0
+        self.transfer_download_bytes = 0
 
     async def process(
         self,
@@ -106,6 +112,8 @@ class RequestsRustCrawler:
     ) -> Response:
         """每次独立请求使用一个粘性代理；失败后切换主/备用代理源。"""
         headers = dict(headers or {})
+        if self.accept_encoding:
+            headers["accept-encoding"] = self.accept_encoding
         # 原项目的 CurlCrawler 在 process() 内覆盖传入 UA，此处保留该行为。
         if user_agent := self.指纹请求头.get(self.impersonate):
             headers["user-agent"] = user_agent
@@ -126,10 +134,14 @@ class RequestsRustCrawler:
                         headers=headers,
                         cookies=cookies,
                         proxy=proxy_state["proxy"],
+                        transfer_stats=self.transfer_stats,
                         **kwargs,
                     )
                 # 对齐原 CurlCrawler 的 discard_cookies=True：本测试链路不保留响应 Set-Cookie。
                 self.session.cookies.clear()
+                if response.transfer_stats is not None:
+                    self.transfer_upload_bytes += response.transfer_stats.upload_size
+                    self.transfer_download_bytes += response.transfer_stats.download_size
                 if response.status_code >= 500 or response.status_code == 429:
                     raise 可重试请求错误(f"HTTP {response.status_code}: {response.text[:300]!r}")
                 if response.status_code >= 400:

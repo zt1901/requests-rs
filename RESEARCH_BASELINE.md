@@ -4,7 +4,7 @@
 
 本项目采用两层模型，边界固定如下：
 
-1. `fingerprints.json` / `fingerprints_path` 只提供浏览器传输画像和跨请求稳定声明。
+1. 内置 `fingerprints.json`、`fingerprints_path` 或直接作为 `impersonate` 传入的单 profile 指纹文件，只提供浏览器传输画像和跨请求稳定声明。
 2. 用户在浏览器中人工完成真实操作后，通过 DevTools **Copy as cURL** 得到的请求，转换为 `requests_rust` 调用时，请求模板字段允许按网站和该动作原样固定。
 3. 库不猜测、不自动补齐、不覆盖业务请求模板中的上下文、认证和业务字段。
 4. 不能固定的 TLS/HTTP 连接运行态始终由 Rust、wreq、BTLS/BoringSSL 与当前 URL 生成。
@@ -99,3 +99,17 @@ with Session(
 2. **传输状态运行时生成**：SNI、TLS 随机值、会话恢复、HTTP/2 stream 与动态压缩表不能从 cURL 或 JSON 固定。
 3. **不自动猜业务**：库不根据 URL 猜 `Referer`、`Origin`、`Sec-Fetch-*`、签名、Cookie 或 CSRF。
 4. **不把会话态伪装成指纹**：认证、Cookie、CSRF、实验分桶和签名应留在业务模板/业务流程，不能污染可复用 profile。
+
+## 已证伪路线：Rust原生batch
+
+本项目明确不新增`session.batch()`、`submit_many()`、Rust常驻业务Worker队列或其他把一批业务请求整体搬进Rust调度的接口。
+
+证伪依据：
+
+1. 动态住宅代理场景的主要成本是每个不同代理身份对应的DNS、TCP、代理认证、CONNECT和TLS握手。batch不能合并不同session ID的代理连接，也不能减少这些网络往返。
+2. 当前每条请求已经是直接进入Rust/Tokio的原生Future，不经过`asyncio.to_thread`；Session级`max_connections`已经由Rust `Semaphore`统一执行。batch只能减少少量Python任务对象，不能改变主要网络瓶颈。
+3. batch会引入第二套并发上限、排队、取消、超时、结果顺序、部分失败、重试、Cookie更新和Session关闭语义，与现有单请求Future和统一Rust permit模型重复并冲突。
+4. 爬虫需要逐条确认成功、逐条失败重试、逐条切换代理session ID。把业务队列和重试策略放入网络库会混淆业务生命周期，并增加整批滞留和内存占用。
+5. WebSocket、流式响应和multipart具有不同生命周期，无法放入一个一致且不误导的batch返回模型；人为限制batch只支持部分请求又会形成第二套API边界。
+
+固定正确路线：Python使用有限数量的长期Worker逐条调用同一个`AsyncSession`；Rust负责单请求网络Future、连接池、代理身份隔离、TLS/HTTP2复用和全Session `max_connections`。需要更高吞吐时优先复用sticky代理身份、HTTP/2连接和WebSocket长连接，而不是增加batch抽象。

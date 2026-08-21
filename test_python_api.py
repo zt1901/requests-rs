@@ -491,6 +491,42 @@ def main():
                         == "firefox151"
                     )
 
+            # impersonate直接传文件路径时，从文件中唯一profile自动选择全部可用变体。
+            with Session(impersonate=chrome文件) as 路径指纹会话:
+                assert 路径指纹会话.fingerprint_count == len(
+                    [
+                        记录
+                        for 记录 in 全部记录
+                        if 记录["profile"] == 测试版本 and 41 not in 记录["tls"]["extensions"]
+                    ]
+                )
+                路径响应 = 路径指纹会话.get(target_url + "/headers")
+                assert 路径响应.impersonate == 测试版本
+
+            async def 验证异步路径指纹() -> None:
+                async with AsyncSession(impersonate=str(chrome文件)) as 路径指纹会话:
+                    响应 = await 路径指纹会话.get(target_url + "/headers")
+                    assert 响应.impersonate == 测试版本
+
+            asyncio.run(验证异步路径指纹())
+
+            try:
+                Session(impersonate=项目目录 / "fingerprints.json")
+            except RuntimeError as error:
+                assert "必须只包含一个profile" in str(error)
+            else:
+                raise AssertionError("多profile指纹文件作为impersonate路径时没有被拒绝")
+
+            try:
+                Session(
+                    impersonate=chrome文件,
+                    fingerprints_path=chrome文件,
+                )
+            except RuntimeError as error:
+                assert "不能同时传fingerprints_path" in str(error)
+            else:
+                raise AssertionError("重复指定指纹路径没有被拒绝")
+
             # 文件中不存在的版本直接报错，并列出该文件里的可用版本
             try:
                 Session(impersonate=测试版本, fingerprints_path=firefox文件)

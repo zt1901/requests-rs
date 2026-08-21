@@ -28,6 +28,8 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 # home：主页 Set-Cookie 原样带到 GraphQL；fake：同名称、同长度但不用真实 Cookie 值。
 默认Cookie模式 = "fake"
 默认指纹轮换 = False
+# 空字符串保持浏览器默认的 gzip, deflate, br, zstd 协商；可传 br、zstd 或 gzip 进行流量对比。
+默认响应压缩协商 = ""
 # ══════════════════════════════════════════════════
 
 
@@ -40,6 +42,9 @@ def 解析参数() -> argparse.Namespace:
     parser.add_argument("--fingerprints-path", default=str(默认指纹文件))
     parser.add_argument("--cookie-mode", choices=("home", "fake"), default=默认Cookie模式)
     parser.add_argument("--fingerprint-rotation", action="store_true", default=默认指纹轮换)
+    parser.add_argument("--transfer-stats", action="store_true", help="启用每请求TLS/TCP传输层计量，显著影响时效")
+    parser.add_argument("--accept-encoding", default=默认响应压缩协商, help="覆盖响应压缩协商，例如 br、zstd 或 gzip")
+    parser.add_argument("--quiet", action="store_true", help="仅输出抓取与传输汇总，不打印帖子内容")
     return parser.parse_args()
 
 
@@ -57,6 +62,8 @@ async def main() -> None:
         impersonate=args.impersonate,
         cookie_mode=args.cookie_mode,
         fingerprint_rotation=args.fingerprint_rotation,
+        transfer_stats=args.transfer_stats,
+        accept_encoding=args.accept_encoding or None,
     )
     try:
         print("请求参数:")
@@ -67,6 +74,8 @@ async def main() -> None:
                     "resultsLimit": args.results_limit,
                     "cookieMode": args.cookie_mode,
                     "fingerprintRotation": args.fingerprint_rotation,
+                    "transferStats": args.transfer_stats,
+                    "acceptEncoding": args.accept_encoding or "browser-default",
                 },
                 ensure_ascii=True,
                 indent=2,
@@ -74,9 +83,17 @@ async def main() -> None:
         )
         print("代理主机:", urlsplit(proxy).hostname)
         results = await crawler.crawl(group_urls, args.results_limit) if args.results_limit else []
-        print("=== Facebook Groups requests_rust 最终结果 ===")
-        print(json.dumps(results, ensure_ascii=True, indent=2))
+        if not args.quiet:
+            print("=== Facebook Groups requests_rust 最终结果 ===")
+            print(json.dumps(results, ensure_ascii=True, indent=2))
+        print(f"抓取帖子数: {len(results)}")
         print(f"请求次数: {crawler.request_attempts}，重试次数: {crawler.request_retries}")
+        if args.transfer_stats:
+            print(
+                f"真实传输字节: 上行={crawler.transfer_upload_bytes}，"
+                f"下行={crawler.transfer_download_bytes}，"
+                f"合计={crawler.transfer_upload_bytes + crawler.transfer_download_bytes}"
+            )
     finally:
         await crawler.aclose()
 

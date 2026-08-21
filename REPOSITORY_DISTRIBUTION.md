@@ -26,7 +26,7 @@ https://github.com/zt1901/requests_rust-source.git
 - `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock` 与本机构建脚本。
 - 所有测试、Facebook 真实回归、性能基准和研究文档。
 - `.github/workflows/build-wheels.yml` 自动构建流水线。
-- 四个平台 wheel 的构建产物和源码仓库内的构建 Release。
+- 各平台 wheel 的构建产物和源码仓库内的构建 Release；构建成功与完整协议验证必须分别记录。
 
 自动构建目标：
 
@@ -36,6 +36,8 @@ https://github.com/zt1901/requests_rust-source.git
 | Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | GitHub Actions |
 | Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | GitHub Actions |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | GitHub Actions |
+
+当前完整HTTP、代理、SOCKS5、WebSocket、IPv6和混合连接上限回归以Windows x64为准。Windows ARM64、Linux x64和Linux ARM64的Actions产物表示对应wheel可构建，不得在没有运行同等级测试前写成“功能已完整验证”。当前没有macOS或Alpine musllinux发布目标。
 
 Windows x64 本机构建入口：
 
@@ -57,7 +59,7 @@ python build_and_install.py
 
 - 简短的 `README.md`，仅说明安装方式、支持平台和源码仓库边界。
 - GitHub Release。
-- 以下四种已构建的 `.whl` 文件。
+- 以下四种目标平台的已验证 `.whl` 文件；未实际构建或未通过对应平台验收的产物不得写成已发布支持。
 
 禁止内容：
 
@@ -71,20 +73,20 @@ python build_and_install.py
 
 发布新版本时按以下顺序执行：
 
-1. 在 `requests_rust-source` 完成源码、测试与多平台构建验证。
-2. 收集四个 wheel，确认文件名和 SHA-256 digest。
+1. 在 `requests_rust-source` 完成源码测试、当前原生平台协议回归与多平台构建；各平台的运行验证状态必须单独记录。
+2. 收集本次实际完成构建与验收的平台 wheel，确认文件名和 SHA-256 digest。
 3. 在源码仓库保留构建记录和 wheel Release，用于可重复构建与审计。
-4. 在 `zt1901/requests_rust` 创建同版本 draft Release，并只上传四个 wheel。
+4. 在 `zt1901/requests_rust` 创建同版本 draft Release，并只上传本次已验收的 wheel。
 5. 核对分发 Release 中没有源码文件、压缩源码包或 workflow artifact。
 6. 由用户决定是否将 draft Release 发布为正式 Release。
 
-对于 `v0.2.3`，wheel 名称为：
+对于 `v0.3.0`，wheel 名称为：
 
 ```text
-requests_rust-0.2.3-cp310-abi3-win_amd64.whl
-requests_rust-0.2.3-cp310-abi3-win_arm64.whl
-requests_rust-0.2.3-cp310-abi3-manylinux_2_34_x86_64.whl
-requests_rust-0.2.3-cp310-abi3-manylinux_2_34_aarch64.whl
+requests_rust-0.3.0-cp310-abi3-win_amd64.whl
+requests_rust-0.3.0-cp310-abi3-win_arm64.whl
+requests_rust-0.3.0-cp310-abi3-manylinux_2_34_x86_64.whl
+requests_rust-0.3.0-cp310-abi3-manylinux_2_34_aarch64.whl
 ```
 
 ## 4. 交接检查

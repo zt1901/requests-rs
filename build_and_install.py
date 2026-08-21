@@ -2,6 +2,7 @@ import subprocess
 import sys
 import zipfile
 import os
+import shutil
 from pathlib import Path
 
 
@@ -33,7 +34,10 @@ def 同步可编辑原生模块(wheel: Path):
 
 def main():
     run(sys.executable, str(项目目录 / "scripts" / "同步指纹.py"))
-    run("uv", "run", "maturin", "build", "--release", "--out", str(输出目录))
+    maturin = shutil.which("maturin")
+    if maturin is None:
+        raise RuntimeError("没有找到maturin可执行文件")
+    run(maturin, "build", "--release", "--out", str(输出目录))
     wheels = sorted(输出目录.glob("requests_rust-*.whl"), key=lambda path: path.stat().st_mtime)
     if not wheels:
         raise RuntimeError("构建完成但没有找到wheel")

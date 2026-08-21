@@ -25,6 +25,14 @@ jobs:
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             cross: true
+          # macOS Intel：使用Intel原生runner构建和安装验证。
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            libclang: /usr/local/opt/llvm/lib
+          # macOS Apple Silicon：使用ARM64原生runner构建和安装验证。
+          - os: macos-15
+            target: aarch64-apple-darwin
+            libclang: /opt/homebrew/opt/llvm/lib
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +47,10 @@ jobs:
       - name: 安装Linux BoringSSL构建依赖
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake perl pkg-config
+
+      - name: 安装macOS BoringSSL构建依赖
+        if: runner.os == 'macOS'
+        run: brew install llvm cmake perl pkg-config
 
       - name: 安装Linux ARM64交叉编译工具链
         if: matrix.cross
@@ -56,6 +68,7 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          LIBCLANG_PATH: ${{ matrix.libclang }}
         run: |
           rustup target add ${{ matrix.target }}
           # 注意：CI不使用同步指纹.py（它依赖本机采集的fingerprint_records.json），
@@ -67,7 +80,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --force-reinstall dist/requests_rust-*.whl
-          python -c "from requests_rust import available_profiles; p = available_profiles(); assert len(p) > 0, p; print('smoke ok:', p)"
+          python -c "from requests_rust import AsyncSession, Session, available_profiles; p = available_profiles(); assert {'chrome146', 'chrome150', 'firefox151'} <= set(p), p; Session(impersonate='chrome146').close(); print('smoke ok:', p)"
 
       - name: 上传wheel产物
         uses: actions/upload-artifact@v4

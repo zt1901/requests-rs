@@ -1,3 +1,4 @@
+import asyncio
 import json as json_module
 import math
 import os
@@ -173,7 +174,7 @@ class Response:
         headers: Sequence[tuple[str, str]],
         url: str,
         fingerprint_id: str,
-        impersonate: str,
+        impersonate: str | os.PathLike[str],
         content: bytes | None = None,
         stream: Any = None,
         history: Sequence["Response"] = (),
@@ -182,6 +183,7 @@ class Response:
         self.headers = Headers(headers)
         self.url = url
         self.fingerprint_id = fingerprint_id
+        impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self._content = content
         self._stream = stream
@@ -290,8 +292,9 @@ class Response:
         if self._consumer_active:
             raise RuntimeError("同一响应同时只允许一个活动消费者")
         self._consumer_active = True
+        stream = self._stream
         try:
-            while chunk := await self._stream.read_async(chunk_size):
+            while chunk := await stream.read_async(chunk_size):
                 yield chunk
         finally:
             self._consumer_active = False
@@ -316,11 +319,156 @@ class Response:
         self.close()
 
 
+@dataclass(frozen=True, slots=True)
+class WebSocketMessage:
+    type: str
+    data: str | bytes | None = None
+    code: int | None = None
+    reason: str | None = None
+
+    @classmethod
+    def _from_native(cls, value: Any) -> "WebSocketMessage | None":
+        if value is None:
+            return None
+        message_type, text, binary, code, reason = value
+        if message_type == "text":
+            data = text
+        elif message_type in {"binary", "ping", "pong"}:
+            data = bytes(binary)
+        else:
+            data = None
+        return cls(message_type, data, code, reason)
+
+
+class WebSocket:
+    def __init__(self, native: Any) -> None:
+        self._native = native
+        self.url = native.url
+        self.protocol = native.protocol
+        self.fingerprint_id = native.fingerprint_id
+        self.impersonate = native.impersonate
+
+    @property
+    def closed(self) -> bool:
+        return self._native.closed
+
+    def send(self, data: str | bytes | bytearray | memoryview) -> None:
+        if isinstance(data, str):
+            self._native.send_text(data)
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            self._native.send_bytes(bytes(data))
+        else:
+            raise TypeError("WebSocket消息必须是str或bytes-like")
+
+    def send_text(self, data: str) -> None:
+        self._native.send_text(data)
+
+    def send_bytes(self, data: bytes | bytearray | memoryview) -> None:
+        self._native.send_bytes(bytes(data))
+
+    def ping(self, data: bytes | bytearray | memoryview = b"") -> None:
+        self._native.ping(bytes(data))
+
+    def pong(self, data: bytes | bytearray | memoryview = b"") -> None:
+        self._native.pong(bytes(data))
+
+    def recv(self) -> WebSocketMessage | None:
+        return WebSocketMessage._from_native(self._native.recv())
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        self._native.close(code, reason)
+
+    def __enter__(self) -> "WebSocket":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def __iter__(self) -> "WebSocket":
+        return self
+
+    def __next__(self) -> WebSocketMessage:
+        message = self.recv()
+        if message is None:
+            raise StopIteration
+        return message
+
+
+class AsyncWebSocket:
+    def __init__(self, native: Any) -> None:
+        self._native = native
+        self._close_task = None
+        self.url = native.url
+        self.protocol = native.protocol
+        self.fingerprint_id = native.fingerprint_id
+        self.impersonate = native.impersonate
+
+    @property
+    def closed(self) -> bool:
+        return self._native.closed
+
+    async def send(self, data: str | bytes | bytearray | memoryview) -> None:
+        if isinstance(data, str):
+            await self._native.send_text_async(data)
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            await self._native.send_bytes_async(bytes(data))
+        else:
+            raise TypeError("WebSocket消息必须是str或bytes-like")
+
+    async def send_text(self, data: str) -> None:
+        await self._native.send_text_async(data)
+
+    async def send_bytes(self, data: bytes | bytearray | memoryview) -> None:
+        await self._native.send_bytes_async(bytes(data))
+
+    async def ping(self, data: bytes | bytearray | memoryview = b"") -> None:
+        await self._native.ping_async(bytes(data))
+
+    async def pong(self, data: bytes | bytearray | memoryview = b"") -> None:
+        await self._native.pong_async(bytes(data))
+
+    async def recv(self) -> WebSocketMessage | None:
+        return WebSocketMessage._from_native(await self._native.recv_async())
+
+    def close(self, code: int = 1000, reason: str = "") -> Any:
+        if self._close_task is None:
+            self._close_task = asyncio.ensure_future(self._native.close_async(code, reason))
+        close_task = self._close_task
+
+        async def 等待关闭() -> None:
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                close_task.add_done_callback(self._consume_close_result)
+                raise
+
+        return 等待关闭()
+
+    @staticmethod
+    def _consume_close_result(task: asyncio.Future) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def __aenter__(self) -> "AsyncWebSocket":
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()
+
+    def __aiter__(self) -> "AsyncWebSocket":
+        return self
+
+    async def __anext__(self) -> WebSocketMessage:
+        message = await self.recv()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
 class Session:
     def __init__(
         self,
         *,
-        impersonate: str,
+        impersonate: str | os.PathLike[str],
         fingerprint_rotation: bool = False,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
@@ -330,14 +478,20 @@ class Session:
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         fingerprints_path: str | os.PathLike[str] | None = None,
+        max_connections: int = 50,
+        happy_eyeballs_timeout: float | None = 0.3,
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
         _validate_timeout("read_timeout", read_timeout, optional=True)
+        _validate_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout, optional=True)
+        if isinstance(max_connections, bool) or not isinstance(max_connections, int) or max_connections <= 0:
+            raise ValueError("max_connections必须是正整数")
         if proxy is not None and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
             raise TypeError("proxies必须是Mapping或None")
+        impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self.headers = _header_items(headers)
         self._native_headers = tuple(self.headers)
@@ -348,6 +502,8 @@ class Session:
         self.proxy = proxy
         self.proxies = dict(proxies) if proxies is not None else None
         self.fingerprints_path = fingerprints_path
+        self.max_connections = max_connections
+        self.happy_eyeballs_timeout = happy_eyeballs_timeout
         self._native = NativeSession(
             impersonate,
             fingerprint_rotation,
@@ -356,6 +512,8 @@ class Session:
             connect_timeout,
             None if fingerprints_path is None else os.fspath(fingerprints_path),
             self.headers,
+            max_connections,
+            happy_eyeballs_timeout,
         )
         self.cookies = Cookies(self._native)
 
@@ -441,6 +599,84 @@ class Session:
             request_proxy,
             request_cookies,
         )
+
+    def _prepare_websocket(
+        self,
+        url: str,
+        *,
+        headers: HeaderInput | None,
+        cookies: CookieTypes | None,
+        protocols: Sequence[str] | None,
+        version: str,
+        timeout: float | None,
+        proxy: str | None | object,
+        proxies: ProxyInput | None,
+    ):
+        request_timeout = self.timeout if timeout is None else timeout
+        _validate_timeout("timeout", request_timeout)
+        normalized_version = version.lower()
+        if normalized_version not in {"http1", "http1.1", "http/1.1", "http2", "h2", "http/2"}:
+            raise ValueError("version必须是http1或http2")
+        if not url.startswith(("ws://", "wss://")):
+            raise ValueError("WebSocket URL必须使用ws://或wss://")
+
+        current_headers = tuple(self.headers)
+        if current_headers != self._native_headers:
+            self._native.set_default_headers(self.headers)
+            self._native_headers = current_headers
+        merged_headers = _header_items(headers)
+        request_cookies = None if cookies is None else _cookie_items(cookies)
+        if proxy is not _UNSET and proxies is not None:
+            raise TypeError("proxy和proxies不能同时传入")
+        if proxies is not None and not isinstance(proxies, Mapping):
+            raise TypeError("proxies必须是Mapping或None")
+        proxy_url = "https://" + url[6:] if url.startswith("wss://") else "http://" + url[5:]
+        if proxy is not _UNSET:
+            proxy_override = True
+            request_proxy = proxy
+        elif proxies is not None:
+            proxy_override = True
+            request_proxy = self._native.select_proxy(proxy_url, list(proxies.items()))
+        elif self.proxies is not None:
+            proxy_override = True
+            request_proxy = self._native.select_proxy(proxy_url, list(self.proxies.items()))
+        else:
+            proxy_override = False
+            request_proxy = None
+        return (
+            url,
+            merged_headers,
+            list(protocols or ()),
+            normalized_version,
+            request_timeout,
+            proxy_override,
+            request_proxy,
+            request_cookies,
+        )
+
+    def websocket(
+        self,
+        url: str,
+        *,
+        headers: HeaderInput | None = None,
+        cookies: CookieTypes | None = None,
+        protocols: Sequence[str] | None = None,
+        version: str = "http1",
+        timeout: float | None = None,
+        proxy: str | None | object = _UNSET,
+        proxies: ProxyInput | None = None,
+    ) -> WebSocket:
+        prepared = self._prepare_websocket(
+            url,
+            headers=headers,
+            cookies=cookies,
+            protocols=protocols,
+            version=version,
+            timeout=timeout,
+            proxy=proxy,
+            proxies=proxies,
+        )
+        return WebSocket(self._native.websocket(*prepared))
 
     def request(
         self,
@@ -596,8 +832,9 @@ class Session:
 
 
 class AsyncSession:
-    def __init__(self, **kwargs: Any) -> None:
-        self._session = Session(**kwargs)
+    def __init__(self, *, max_connections: int = 50, **kwargs: Any) -> None:
+        self._session = Session(max_connections=max_connections, **kwargs)
+        self.max_connections = max_connections
         self.cookies = self._session.cookies
 
     @property
@@ -680,6 +917,31 @@ class AsyncSession:
             transfer_stats,
         )
         return _response_from_native(result)
+
+    async def websocket(
+        self,
+        url: str,
+        *,
+        headers: HeaderInput | None = None,
+        cookies: CookieTypes | None = None,
+        protocols: Sequence[str] | None = None,
+        version: str = "http1",
+        timeout: float | None = None,
+        proxy: str | None | object = _UNSET,
+        proxies: ProxyInput | None = None,
+    ) -> AsyncWebSocket:
+        prepared = self._session._prepare_websocket(
+            url,
+            headers=headers,
+            cookies=cookies,
+            protocols=protocols,
+            version=version,
+            timeout=timeout,
+            proxy=proxy,
+            proxies=proxies,
+        )
+        native = await self._session._native.websocket_async(*prepared)
+        return AsyncWebSocket(native)
 
     async def get(self, url: str, **kwargs: Any) -> Response:
         return await self.request("GET", url, **kwargs)

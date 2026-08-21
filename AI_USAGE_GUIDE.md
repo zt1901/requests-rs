@@ -1,20 +1,23 @@
-# requests_rust 0.2.3 AI使用手册
+# requests_rust 0.3.0 AI使用手册
 
 ## 定位
 
-`requests_rust`是Windows x64上的Python浏览器指纹HTTP客户端。Python负责逐请求参数描述和结果消费；Rust负责DNS、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径直接使用进程级Tokio Runtime，不经过 `asyncio.to_thread`。
+`requests_rust`是Python 3.10+的浏览器指纹HTTP、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust负责DNS、IPv4/IPv6、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、WebSocket、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径直接使用进程级Tokio Runtime，不经过 `asyncio.to_thread`。
 
-安装文件：`requests_rust-0.2.3-cp310-abi3-win_amd64.whl`。支持64位CPython 3.10及以上普通GIL版本。wheel静态链接BoringSSL和MSVC运行库，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。
+当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Linux x64、Linux ARM64和Windows ARM64有独立构建目标，必须安装与平台和CPU匹配的wheel；其构建成功不替代完整协议回归。
 
 ## 导入
 
 ```python
 from requests_rust import (
     AsyncSession,
+    AsyncWebSocket,
     Cookies,
     Headers,
     Response,
     Session,
+    WebSocket,
+    WebSocketMessage,
     available_profiles,
     delete,
     get,
@@ -38,19 +41,26 @@ print(available_profiles())
 ```python
 Session(
     *,
-    impersonate: str,
+    impersonate: str | os.PathLike[str],
     fingerprint_rotation: bool = False,
     headers=None,
     proxy: str | None = None,
+    proxies: Mapping[str, str | None] | None = None,
     verify: bool = True,
     timeout: float = 30,
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
     fingerprints_path: str | None = None,
+    max_connections: int = 50,
+    happy_eyeballs_timeout: float | None = 0.3,
 )
 ```
 
 `fingerprints_path`传入指纹JSON文件路径时，该实例在构造时独立读取并解析文件（提前单实例加载），指纹只属于这个实例，不进入进程级全局缓存；多个实例可同时各读各的文件，互不干扰。文件格式与内置 `fingerprints.json` 一致（`id`、`profile`、`tls`、`http` 字段的指纹记录列表）。不传时回退到编译进wheel的内置指纹。文件不存在或解析失败在构造时直接抛错；实例选择的版本在该文件中不存在时，错误信息会列出该文件里的可用版本。
+
+`impersonate`也可直接传上述指纹JSON路径。该快捷形式要求文件中只有一个profile，但允许该profile包含多个变体；Session自动识别profile，不需要再传`fingerprints_path`。若文件中混有多个profile，或同时传入两种路径参数，构造时会直接报错，避免选错浏览器指纹。
+
+`max_connections`是Session内HTTP、HTTPS、HTTP代理、SOCKS5、流和WebSocket共同使用的Rust/Tokio原生上限。`happy_eyeballs_timeout`默认0.3秒；双栈域名首选地址族未及时连接时，Rust连接器并行尝试另一个地址族，设为`None`可关闭该回退。
 
 profile 默认 Header 只在调用方没有传同名 Header 时兜底。浏览器 Copy as cURL 或业务代码传入的所有 Header，包括 `User-Agent` 与 `sec-ch-ua*`，均原样优先，库不接管或替换。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化；调用方应按实际请求传入。
 
@@ -123,9 +133,28 @@ asyncio.run(main())
 
 取消Python awaitable会丢弃对应Rust Future。已经发出的网络数据不能撤回，但不会占用Python工作线程。
 
+## WebSocket
+
+同步入口为`Session.websocket()`，异步入口为`await AsyncSession.websocket()`。支持`ws://`、`wss://`、HTTP/1.1 Upgrade、RFC 8441 Extended CONNECT、文本、二进制、Ping、Pong、Close、子协议、Cookie、请求Header、HTTP代理Basic预认证和SOCKS5用户名密码认证。
+
+```python
+async with AsyncSession(impersonate="chrome146", max_connections=50) as session:
+    websocket = await session.websocket(
+        "wss://example.com/socket",
+        proxy="http://user:password@proxy.example:8080",
+    )
+    await websocket.send("hello")
+    message = await websocket.recv()
+    await websocket.close()
+```
+
+每次`websocket()`调用创建独立逻辑WebSocket。WebSocket的Rust permit由actor持有到真实连接终止；普通发送发生背压时，独立Close通道可以抢占发送。握手、发送和Close frame写入均受该连接`timeout`约束。
+
 ## 独立任务与重试
 
 真实爬虫应复用一个 `AsyncSession`，由固定数量 Worker 持续取得单条任务并独立发包。每一条请求都可带自己的 Header、Cookie、代理和超时；成功任务立即确认，失败任务只重试自身，不会因同批其他任务成功或失败而被阻塞。
+
+禁止实现或建议Rust原生`batch()`、`submit_many()`和库内常驻业务Worker队列。该路线已经证伪：不同代理session ID仍必须建立独立代理链路，batch不能减少主要网络成本；当前请求已经是Rust Future并受统一Rust `Semaphore`约束；额外batch只会重复并发、取消、错误、重试、Cookie和关闭语义。业务批量调度必须保持为Python有限Worker逐条请求，网络库不接管业务队列。
 
 ```python
 async def worker(session, queue):
@@ -234,6 +263,8 @@ session.get(url, cookies={"token": "request-only"})
 
 Session默认代理在设置时解析一次。单请求代理只影响该请求。Cookie Jar在一个Session的所有指纹变体间共享。`cookies=`按curl_cffi语义与Session Jar合并：本次同名值覆盖Session值，未同名Session Cookie保留，响应 `Set-Cookie`仍写回Jar；同时存在手写 `Cookie` Header时以 `cookies=`合并结果为准。
 
+代理URL支持`http://`、`socks5://`和`socks5h://`。HTTP/HTTPS CONNECT首包直接携带Basic认证；SOCKS5在同一TCP连接内协商并发送用户名密码。`socks5://`本地解析目标域名，`socks5h://`把域名交给代理。代理字符串中的协议仍表示代理协议，WebSocket目标使用`ws://`或`wss://`，HTTP代理不能为了“更快”改写成`ws://`。
+
 ## 400并发动态请求
 
 同一个业务Session可以执行多个原生请求 Future，每次切换 Header、请求 Cookie 覆盖值和代理：
@@ -258,8 +289,17 @@ responses = await asyncio.gather(*(
 - 动态代理使用每请求 `proxy=`，不要并发调用修改全局状态的 `set_proxy()`。
 - 代理供应商通过用户名中的session ID换IP时，只替换代理URL中的session ID。
 - 进入Rust前，Header、本请求Cookie覆盖值和代理都已成为该请求的独立快照。
+- 连接池键包含目标、协议版本和完整代理身份；同一代理地址仅session ID不同时也不会跨身份复用HTTP、CONNECT或SOCKS5连接。
 
-本地代理回显实测，400条请求的Header、Cookie和代理用户名全部逐条匹配：固定指纹中位约 `646请求/秒`，21条指纹轮换中位约 `640请求/秒`，线程约23至32，RSS增量约1至26MB。每条请求使用不同代理认证session ID，因此吞吐主要受独立代理连接影响。
+本地代理回显实测已确认400条请求的Header、Cookie和代理用户名逐条匹配。每条请求使用不同代理认证session ID，因此吞吐主要受独立代理连接和机器调度影响；不再把单轮本地吞吐记录作为固定性能承诺。
+
+WebSocket并发遵循相同代理隔离规则，但连接生命周期不同：每次 `websocket()` 调用都创建一条独立逻辑WebSocket，不从普通HTTP空闲池中取出一条既有WebSocket。已用同一个 `AsyncSession` 同时保持50条连接进行本地协议验证；HTTP代理和SOCKS5代理两组测试均确认50个不同session ID对应50次独立代理认证、50个不同客户端TCP连接，并且所有WebSocket可同时收发和关闭。若代理身份与目标完全相同，RFC 8441允许多个独立WebSocket stream复用一条物理HTTP/2连接，这不等于复用同一个WebSocket对象。
+
+`Session(max_connections=50)` 和 `AsyncSession(max_connections=50)` 使用Rust/Tokio原生 `Semaphore` 约束活跃网络操作，Python层不维护许可队列或释放回调。HTTP、HTTPS、HTTP代理、SOCKS5、流式响应和WebSocket共同竞争这50个槽位，不是每种协议各自50个。WebSocket permit由Rust actor持有到真实连接终止；普通非流式请求在Body完成后自动释放；流式响应的原生对象持有permit到EOF或底层关闭。取消Rust Future会自动丢弃尚未交给长生命周期对象的 `OwnedSemaphorePermit`，Session关闭会在Rust中关闭Semaphore并唤醒等待者。本地混合测试已确认25条WebSocket、15个HTTP代理请求和10个SOCKS5请求可同时占满50个槽位。
+
+IPv4和IPv6由同一个Rust连接器支持。`happy_eyeballs_timeout`默认0.3秒：双栈域名的首选地址族在该时间内未连接成功时，并行尝试另一个地址族；设为`None`可关闭并行回退。IPv6字面量URL必须写成`http://[::1]:端口/`。`socks5://`在本机解析后可以连接IPv4或IPv6目标，`socks5h://`将域名交给代理解析。
+
+WebSocket握手、普通帧发送和Close frame写入都受本次连接的 `timeout` 约束。Rust actor使用可抢占发送路径：连接发生写背压时，Close命令可以中断当前普通帧发送；关闭写入超时后actor直接退出并通过RAII归还permit，避免一条半开连接永久占住整个Session容量。
 
 长期任务推荐固定Worker模式：
 
@@ -288,7 +328,7 @@ async def worker():
 await asyncio.gather(*(worker() for _ in range(concurrency)))
 ```
 
-项目性能、资源和稳定性脚本均采用这种普通请求Worker模式。自启动本地keep-alive服务实测：400条动态普通请求在并发10至100时约 `5.8k至9.7k请求/秒`；连续2万条、100 Worker、21条指纹轮换时约 `10.4k至12.2k请求/秒`，线程稳定49，RSS增量最终约31.6MB。真实代理场景仍主要受代理连接延迟限制。
+项目性能、资源和稳定性脚本均采用这种普通请求Worker模式。本地keep-alive基准只用于版本内回归比较，不能外推到公网目标或不同代理供应商；公开文档不再保留容易脱离硬件、并发上限和测试版本语境的绝对吞吐承诺。
 
 ## 指纹轮换与隔离
 
@@ -312,7 +352,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 错误边界
 
-- `timeout`、`connect_timeout`、`read_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
+- `timeout`、`connect_timeout`、`read_timeout`和非空`happy_eyeballs_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
 - 无效方法、Header、代理、URL、重定向、连接、TLS和Body错误转换为Python异常。
 - `raise_for_status()`在状态码不属于200至399时抛出 `RuntimeError`。
 - `Response.ok`定义为 `200 <= status_code < 400`。
@@ -323,10 +363,14 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 - Firefox 151真实浏览器与requests_rust：5个变体均41/41，100%。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
+- WebSocket覆盖同步/异步、WS/WSS、HTTP代理、WSS CONNECT预认证、SOCKS5、服务端Close、控制帧边界、50条不同代理身份和25 WS + 15 HTTP + 10 SOCKS5混合上限。
+- RFC 8441本地端到端测试验证CONNECT、`:protocol=websocket`和双向帧；Webshare真实外网代理验证HTTPS出口与WSS文本回显。
+- IPv6在`[::1]`完成同步和异步HTTP直连；双栈域名由wreq默认RFC 6555 Happy Eyeballs连接器处理。
 
 ## 已知边界
 
-- 当前wheel仅支持Windows x64；其他系统需各自构建wheel。
+- 原生wheel必须与操作系统和CPU架构匹配；当前完整协议回归以Windows x64为准。Linux/Windows ARM64已有构建目标但未完成同等级全协议验证。
+- 当前manylinux目标依赖glibc，不代表Alpine musl支持；macOS当前不在构建矩阵中。
 - 当前不实现HTTP/3发送。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
 - TCP字段来自浏览器和requests_rust共享的Windows内核网络栈，不代表能在其他系统伪造Windows TCP SYN。

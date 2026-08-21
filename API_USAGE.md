@@ -1,6 +1,6 @@
 # requests_rust 使用与 API 手册
 
-`requests_rust` 是 Python 3.10+ 的 HTTP 客户端。网络请求由 Rust 执行，支持浏览器 TLS/HTTP2 指纹、HTTP/1.1/HTTP/2、Cookie Jar、代理、重定向、流式响应和 multipart 上传。
+`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
 
 高频 API 命名接近 `curl_cffi.requests`，但未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
@@ -9,12 +9,12 @@
 从私有 `requests_rust` 发布仓库的 Release 下载与系统、CPU 架构匹配的 wheel，再安装：
 
 ```bash
-pip install requests_rust-0.2.3-cp310-abi3-win_amd64.whl
+pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ```
 
 wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
 
-支持的 wheel：
+预定义构建目标：
 
 | 平台 | wheel 标签 |
 |---|---|
@@ -22,6 +22,8 @@ wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
 | Windows ARM64 | `win_arm64` |
 | Linux x64 | `manylinux_2_34_x86_64` |
 | Linux ARM64 | `manylinux_2_34_aarch64` |
+
+wheel 必须与操作系统和 CPU 架构匹配。当前 Windows x64 已完成本文所列完整协议回归；Linux 和 Windows ARM64 构建目标不应仅凭 wheel 产出视为完成同等级协议验证。macOS 和 Alpine musl 当前不在发布矩阵中。
 
 ## 导入与内置指纹
 
@@ -70,7 +72,7 @@ with Session(
 
 | 参数 | 含义 |
 |---|---|
-| `impersonate` | 必填，内置或自定义指纹文件中的 profile 名称。 |
+| `impersonate` | 必填，内置/自定义指纹中的 profile 名称，或直接传指纹 JSON 文件路径。 |
 | `fingerprint_rotation` | 默认为 `False`。关闭时，一个代理会话内固定选择一个可独立复现变体；开启时按请求轮换变体。 |
 | `headers` | Session 默认 Header，支持 `dict` 或二元组序列。序列可保留重复 Header 和顺序。 |
 | `proxy` | Session 默认代理 URL。 |
@@ -79,11 +81,27 @@ with Session(
 | `timeout` | 请求总超时秒数，默认为 `30`。 |
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
+| `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
 | `fingerprints_path` | 可选自定义指纹 JSON 路径，仅在当前 Session 构造时独立加载。 |
+| `max_connections` | Session内HTTP、代理、流和WebSocket共同使用的Rust原生活跃连接上限，默认`50`。 |
+
+`impersonate` 直接传路径时，文件必须只包含一个 `profile`，但可以包含该 profile 的多个指纹变体。Session 会自动识别 profile，并继续遵循固定或轮换变体策略。此时不能再同时传 `fingerprints_path`。
+
+```python
+async with AsyncSession(
+    impersonate=r"C:\fingerprints\chrome146.json",
+    max_connections=50,
+) as session:
+    response = await session.get("https://example.com")
+```
 
 ## 原生异步请求
 
 `AsyncSession` 直接等待 Rust 网络 Future，不经过 `asyncio.to_thread`。高并发业务应优先复用一个或多个长期存活的 `AsyncSession`，不要为每个请求重新创建 Session。
+
+`max_connections` 控制同一个 `Session` 或 `AsyncSession` 同时占用的统一网络槽位，默认值为 `50`。该限制由 Rust/Tokio 原生 `Semaphore` 执行，Python 不维护信号量或连接释放回调。HTTP、HTTPS、HTTP 代理、SOCKS5、流式响应和 WebSocket 共用这一个上限，不会分别各获得 50 个槽位。普通请求在响应 Body 完整返回后由 Rust 释放许可；流式响应持有原生许可直到 EOF 或底层关闭；WebSocket 的许可由 Rust actor 持有到真实连接终止。
+
+IPv6字面量使用标准方括号URL，例如 `https://[2001:db8::1]/`。域名同时解析出AAAA和A记录时，Rust连接器先尝试DNS结果中的首选地址族；超过 `happy_eyeballs_timeout` 仍未连接成功，就并行尝试另一个地址族，成功的一路继续，另一路取消。HTTP、HTTPS和WebSocket共用该连接器；`socks5h://` 仍把域名原样交给代理解析。
 
 ```python
 import asyncio
@@ -93,6 +111,7 @@ from requests_rust import AsyncSession
 async def main():
     async with AsyncSession(
         impersonate="firefox151",
+        max_connections=50,
         proxy="http://user:password@proxy.example:8080",
     ) as session:
         first, second = await asyncio.gather(
@@ -104,6 +123,8 @@ async def main():
 
 asyncio.run(main())
 ```
+
+同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
 
 异步方法：
 
@@ -168,6 +189,53 @@ response = session.get(
 )
 ```
 
+代理 URL 支持 `http://`、`socks5://` 和 `socks5h://`。`socks5://` 在本地解析目标域名，`socks5h://` 由代理解析目标域名；URL 中的用户名密码用于 SOCKS5 用户名密码认证。SOCKS5 按协议先协商认证方法，再在同一条连接内立即完成认证和 CONNECT，不使用 HTTP 的 407 挑战流程。
+
+## WebSocket
+
+`Session.websocket()` 和 `AsyncSession.websocket()` 支持 `ws://`、`wss://`、文本、二进制、Ping、Pong、Close、子协议、Cookie、请求 Header、HTTP 代理预认证和 SOCKS5 用户名密码认证。默认使用兼容性最广的 HTTP/1.1 Upgrade；传入 `version="http2"` 可请求 RFC 8441 Extended CONNECT，目标服务器必须明确通过 HTTP/2 SETTINGS 宣告支持该能力。HTTP/2 路径已通过本地端到端测试，实际验证了 Extended CONNECT 请求、`:protocol=websocket` 和双向 WebSocket 帧传输。
+
+同步示例：
+
+```python
+from requests_rust import Session
+
+with Session(impersonate="chrome146", proxy="http://user:password@proxy.example:8080") as session:
+    with session.websocket(
+        "wss://example.com/socket",
+        headers={"Origin": "https://example.com"},
+        protocols=["chat"],
+    ) as websocket:
+        websocket.send("hello")
+        message = websocket.recv()
+        if message is not None and message.type == "text":
+            print(message.data)
+```
+
+异步示例：
+
+```python
+from requests_rust import AsyncSession
+
+async with AsyncSession(impersonate="chrome146") as session:
+    async with await session.websocket("wss://example.com/socket") as websocket:
+        await websocket.send_bytes(b"payload")
+        async for message in websocket:
+            print(message.type, message.data)
+            if message.type == "close":
+                break
+```
+
+`WebSocketMessage.type` 为 `text`、`binary`、`ping`、`pong` 或 `close`。文本消息的 `data` 是 `str`，二进制和控制消息的 `data` 是 `bytes`，关闭消息还提供 `code` 与 `reason`。同一连接允许发送和接收并行进行，但同时只允许一个活动接收者；接收事件队列固定为 256 条，消费者长期跟不上时连接会终止，避免内存无限增长。
+
+代理沿用 Session 和请求级覆盖语义。`ws://` 经 HTTP 代理时，Upgrade 请求首包直接携带 Basic 代理认证；`wss://` 经 HTTP 代理时，外层 CONNECT 首包直接携带认证；`ws://` 和 `wss://` 经 SOCKS5 时，在同一条 TCP 连接内完成用户名密码认证和 CONNECT。WebSocket 不支持 `transfer_stats=True`，该参数仅属于普通 HTTP 请求 API。
+
+每次调用 `websocket()` 都会建立一条新的独立 WebSocket，不会复用另一条已经升级的 WebSocket。并发调用 50 次就会得到 50 个可分别收发和关闭的 WebSocket 对象。HTTP/2 WebSocket 在代理身份和目标完全相同时可以由底层协议复用物理 HTTP/2 连接，但每次调用仍是独立 Extended CONNECT stream；代理 URL 中的用户名、密码或 session ID 不同时，完整代理身份参与连接池分区，不会跨代理身份复用物理连接。
+
+WebSocket 长连接会持续占用 `AsyncSession.max_connections` 中的一个槽位。若 `max_connections=50` 且已经保持 25 条 WebSocket，普通 HTTP、HTTPS 或 SOCKS5 请求最多还能同时占用 25 个槽位；这 25 个槽位可以按任意比例混合，不要求预先固定每种协议的数量。
+
+WebSocket 握手、发送和 Close frame 写入均使用传给 `websocket()` 的 `timeout`。Rust actor 在普通帧发送发生背压时仍会优先接收 Close 命令；Close 可以中断当前发送，并在关闭写入超时后强制结束 actor、释放底层连接和原生连接许可。
+
 ## Cookie 与代理会话
 
 `session.cookies` 是 Session 级 Cookie Jar，会自动接收响应中的 `Set-Cookie` 并按域、路径和 Secure 属性匹配后续请求。
@@ -186,6 +254,8 @@ session.set_proxy("http://user:password@proxy-b.example:8080")
 ```
 
 `set_proxy()` 只应在代理身份真实变化时调用。它会清除旧代理的 Client、CONNECT、TCP、TLS 和 HTTP/2 链路，确保新代理不复用旧代理连接。高并发单请求换代理应使用请求级 `proxy=`，不要在多个协程中并发调用 `set_proxy()`。
+
+请求级代理按完整代理身份隔离连接池。即使 50 个 IPIPGO URL 的代理主机和端口相同，只要用户名中的 session ID 不同，HTTP Basic 认证值或 SOCKS5 用户名密码就不同，底层也会使用不同连接池分区并建立不同代理连接。业务侧仍应保持同一个 `AsyncSession`，不要为每个代理 session ID 新建 HTTP Session。
 
 对需保持 IP 的 cursor 分页，推荐：一个代理会话对应一个 `AsyncSession`，`fingerprint_rotation=False`，正常分页不切代理；仅请求失败重试时更换 sticky session。
 
@@ -285,12 +355,11 @@ files = {"document": r"C:\data\report.bin"}
 
 ```python
 session = Session(
-    impersonate="firefox151",
-    fingerprints_path=r"D:\fingerprints\firefox151.json",
+    impersonate=r"D:\fingerprints\firefox151.json",
 )
 ```
 
-自定义文件在 Session 构造时读取并解析，仅影响该实例；不同 Session 可以同时使用不同文件。文件记录应只包含 TLS/HTTP2 指纹数据。SNI、TLS Random、KeyShare、ticket、PSK binder、Host、Content-Length、业务 Header、Cookie、认证态和签名参数都是运行态数据，不应固定进指纹文件。
+路径形式要求文件只包含一个 profile，可包含该 profile 的多个变体；Session 自动识别 profile。需要从多 profile 文件中显式选择时，继续使用 `impersonate="profile名称", fingerprints_path=路径`。自定义文件只影响该实例。文件记录应只包含 TLS/HTTP2 指纹数据；SNI、TLS Random、KeyShare、ticket、PSK binder、Host、Content-Length、业务 Header、Cookie、认证态和签名参数都是运行态数据。
 
 ## 重要边界
 

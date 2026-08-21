@@ -28,7 +28,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
 };
 use url::Url;
 use wreq::{
@@ -45,6 +45,10 @@ use wreq::{
         compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec},
         session::LruTlsSessionCache,
         trust::CertStore,
+    },
+    ws::{
+        WebSocket,
+        message::{CloseCode, CloseFrame, Message, Utf8Bytes},
     },
 };
 
@@ -752,9 +756,20 @@ struct SessionState {
     default_headers: ArcSwap<HeaderMap>,
     verify: bool,
     connect_timeout: Option<Duration>,
+    happy_eyeballs_timeout: Option<Duration>,
     cookie_jar: Arc<Jar>,
     counter: AtomicUsize,
     closed: AtomicBool,
+    connection_slots: Arc<Semaphore>,
+}
+
+async fn acquire_connection_slot(state: &Arc<SessionState>) -> PyResult<OwnedSemaphorePermit> {
+    state
+        .connection_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| PyRuntimeError::new_err("Session已经关闭"))
 }
 
 fn normalize_profile(profile: &str) -> String {
@@ -777,7 +792,8 @@ fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
         // 浏览器按当前请求目标的域名发送SNI，不能由采集记录某次请求是否带SNI决定。
         .tls_sni(true)
         .tls_session_cache(variant.session_cache.clone())
-        .cookie_provider(state.cookie_jar.clone());
+        .cookie_provider(state.cookie_jar.clone())
+        .tcp_happy_eyeballs_timeout(state.happy_eyeballs_timeout);
     if let Some(timeout) = state.connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
@@ -876,7 +892,10 @@ fn selected_proxy_url(
     if proxy_override {
         proxy
     } else {
-        state.proxy_identity.load_full().map(|value| (*value).clone())
+        state
+            .proxy_identity
+            .load_full()
+            .map(|value| (*value).clone())
     }
 }
 
@@ -955,7 +974,8 @@ async fn run_transfer_meter(
         let Some(proxy_host) = parsed.host_str() else {
             return;
         };
-        let Ok(mut stream) = TcpStream::connect((proxy_host, parsed.port().unwrap_or(80))).await else {
+        let Ok(mut stream) = TcpStream::connect((proxy_host, parsed.port().unwrap_or(80))).await
+        else {
             return;
         };
         let mut connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
@@ -970,7 +990,10 @@ async fn run_transfer_meter(
         }
         let mut upstream_reader = BufReader::new(stream);
         let mut status = Vec::new();
-        if upstream_reader.read_until(b'\n', &mut status).await.is_err()
+        if upstream_reader
+            .read_until(b'\n', &mut status)
+            .await
+            .is_err()
             || !String::from_utf8_lossy(&status).contains(" 200 ")
         {
             return;
@@ -983,7 +1006,9 @@ async fn run_transfer_meter(
             }
             connect_response_bytes += line.len();
         }
-        counters.download.fetch_add(connect_response_bytes as u64, Ordering::Relaxed);
+        counters
+            .download
+            .fetch_add(connect_response_bytes as u64, Ordering::Relaxed);
         upstream_reader.into_inner()
     } else {
         let Ok(stream) = TcpStream::connect((host.as_str(), port)).await else {
@@ -1009,8 +1034,9 @@ async fn run_transfer_meter(
 
 async fn start_transfer_meter(upstream_proxy: Option<String>) -> PyResult<TransferMeter> {
     if let Some(proxy) = upstream_proxy.as_deref() {
-        let parsed = Url::parse(proxy)
-            .map_err(|error| PyRuntimeError::new_err(format!("transfer_stats代理URL无效: {error}")))?;
+        let parsed = Url::parse(proxy).map_err(|error| {
+            PyRuntimeError::new_err(format!("transfer_stats代理URL无效: {error}"))
+        })?;
         if parsed.scheme() != "http" {
             return Err(PyRuntimeError::new_err(
                 "transfer_stats仅支持直连或http://上游代理；HTTPS/SOCKS代理无法保持相同的TCP计量语义",
@@ -1025,7 +1051,11 @@ async fn start_transfer_meter(upstream_proxy: Option<String>) -> PyResult<Transf
         upload: AtomicU64::new(0),
         download: AtomicU64::new(0),
     });
-    let completed = tokio::spawn(run_transfer_meter(listener, upstream_proxy, counters.clone()));
+    let completed = tokio::spawn(run_transfer_meter(
+        listener,
+        upstream_proxy,
+        counters.clone(),
+    ));
     let proxy = Proxy::all(format!("http://127.0.0.1:{port}")).map_err(to_py_error)?;
     Ok(TransferMeter {
         proxy,
@@ -1038,6 +1068,7 @@ fn select_proxy_mapping(
     url: &str,
     proxies: Vec<(String, Option<String>)>,
 ) -> PyResult<Option<String>> {
+    #[allow(clippy::unnecessary_to_owned)]
     let scheme = Uri::from_maybe_shared(url.to_string())
         .map_err(to_py_error)?
         .scheme_str()
@@ -1153,6 +1184,34 @@ fn parse_method(method: &str) -> PyResult<Method> {
     })
 }
 
+fn parse_websocket_version(version: &str) -> PyResult<Version> {
+    match version.to_ascii_lowercase().as_str() {
+        "http1" | "http1.1" | "http/1.1" => Ok(Version::HTTP_11),
+        "http2" | "h2" | "http/2" => Ok(Version::HTTP_2),
+        _ => Err(PyRuntimeError::new_err(
+            "WebSocket version必须是http1或http2",
+        )),
+    }
+}
+
+fn websocket_cookie_url(url: &str) -> PyResult<String> {
+    let mut parsed = Url::parse(url).map_err(to_py_error)?;
+    let scheme = match parsed.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        "http" | "https" => return Ok(url.to_string()),
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "WebSocket URL必须使用ws://或wss://",
+            ));
+        }
+    };
+    parsed
+        .set_scheme(scheme)
+        .map_err(|_| PyRuntimeError::new_err("WebSocket URL协议转换失败"))?;
+    Ok(parsed.into())
+}
+
 fn parse_headers(headers: Vec<(String, String)>) -> PyResult<HeaderMap> {
     let mut result = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
@@ -1250,6 +1309,7 @@ fn prepare_headers(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_request(
+    _permit: OwnedSemaphorePermit,
     client: Client,
     method: Method,
     url: String,
@@ -1324,6 +1384,7 @@ async fn execute_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_stream_request(
+    permit: OwnedSemaphorePermit,
     client: Client,
     method: Method,
     url: String,
@@ -1390,11 +1451,13 @@ async fn execute_stream_request(
         closed: Arc::new(AtomicBool::new(false)),
         close_notify: Arc::new(Notify::new()),
         read_active: Arc::new(AtomicBool::new(false)),
+        permit: Arc::new(Mutex::new(Some(permit))),
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_multipart_request(
+    _permit: OwnedSemaphorePermit,
     client: Client,
     method: Method,
     url: String,
@@ -1465,7 +1528,8 @@ fn into_native_response(
     py: Python<'_>,
     response: RawNativeResponse,
 ) -> PyResult<Py<NativeResponse>> {
-    let (status, headers, content, fingerprint_id, profile, url, history, transfer_counters) = response;
+    let (status, headers, content, fingerprint_id, profile, url, history, transfer_counters) =
+        response;
     let native_headers = Py::new(py, headers)?;
     Py::new(
         py,
@@ -1482,6 +1546,400 @@ fn into_native_response(
                 .transpose()?,
         },
     )
+}
+
+type RawWebSocketMessage = (String, Option<String>, Vec<u8>, Option<u16>, Option<String>);
+
+enum WebSocketCommand {
+    Send(Message, oneshot::Sender<PyResult<()>>),
+}
+
+type WebSocketCloseCommand = (u16, String, oneshot::Sender<PyResult<()>>);
+
+enum WebSocketEvent {
+    Message(RawWebSocketMessage),
+    Error(String),
+}
+
+fn raw_websocket_message(message: Message) -> RawWebSocketMessage {
+    match message {
+        Message::Text(value) => (
+            "text".to_string(),
+            Some(value.to_string()),
+            Vec::new(),
+            None,
+            None,
+        ),
+        Message::Binary(value) => ("binary".to_string(), None, value.to_vec(), None, None),
+        Message::Ping(value) => ("ping".to_string(), None, value.to_vec(), None, None),
+        Message::Pong(value) => ("pong".to_string(), None, value.to_vec(), None, None),
+        Message::Close(frame) => (
+            "close".to_string(),
+            None,
+            Vec::new(),
+            frame.as_ref().map(|frame| u16::from(frame.code.clone())),
+            frame.map(|frame| frame.reason.to_string()),
+        ),
+    }
+}
+
+async fn run_websocket(
+    _permit: OwnedSemaphorePermit,
+    mut socket: WebSocket,
+    mut commands: mpsc::Receiver<WebSocketCommand>,
+    mut close_commands: mpsc::Receiver<WebSocketCloseCommand>,
+    events: mpsc::Sender<WebSocketEvent>,
+    closed: Arc<AtomicBool>,
+    io_timeout: Duration,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            close = close_commands.recv() => {
+                let Some((code, reason, completed)) = close else {
+                    break;
+                };
+                let frame = CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: Utf8Bytes::from(reason),
+                };
+                let result = socket
+                    .send(Message::Close(Some(frame)));
+                let result = tokio::time::timeout(io_timeout, result)
+                    .await
+                    .map_err(|_| PyRuntimeError::new_err("WebSocket关闭超时"))
+                    .and_then(|result| result.map_err(to_py_error));
+                let _ = completed.send(result);
+                break;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    WebSocketCommand::Send(message, completed) => {
+                        let mut interrupted_close = None;
+                        let result = tokio::select! {
+                            biased;
+                            close = close_commands.recv() => {
+                                interrupted_close = close;
+                                Err(PyRuntimeError::new_err("WebSocket发送被关闭操作中断"))
+                            }
+                            result = tokio::time::timeout(io_timeout, socket.send(message)) => {
+                                result
+                                    .map_err(|_| PyRuntimeError::new_err("WebSocket发送超时"))
+                                    .and_then(|result| result.map_err(to_py_error))
+                            }
+                        };
+                        let failed = result.is_err() && interrupted_close.is_none();
+                        let _ = completed.send(result);
+                        if let Some((code, reason, close_completed)) = interrupted_close {
+                            let frame = CloseFrame {
+                                code: CloseCode::from(code),
+                                reason: Utf8Bytes::from(reason),
+                            };
+                            let result = tokio::time::timeout(
+                                io_timeout,
+                                socket.send(Message::Close(Some(frame))),
+                            )
+                            .await
+                            .map_err(|_| PyRuntimeError::new_err("WebSocket关闭超时"))
+                            .and_then(|result| result.map_err(to_py_error));
+                            let _ = close_completed.send(result);
+                            break;
+                        }
+                        if failed {
+                            break;
+                        }
+                    }
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(message)) => {
+                        let is_close = matches!(message, Message::Close(_));
+                        if events.try_send(WebSocketEvent::Message(raw_websocket_message(message))).is_err() {
+                            break;
+                        }
+                        if is_close {
+                            break;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let _ = events.try_send(WebSocketEvent::Error(error.to_string()));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    closed.store(true, Ordering::Release);
+}
+
+async fn send_websocket_command(
+    commands: mpsc::Sender<WebSocketCommand>,
+    message: Message,
+) -> PyResult<()> {
+    let (completed_tx, completed_rx) = oneshot::channel();
+    commands
+        .send(WebSocketCommand::Send(message, completed_tx))
+        .await
+        .map_err(|_| PyRuntimeError::new_err("WebSocket已经关闭"))?;
+    completed_rx
+        .await
+        .map_err(|_| PyRuntimeError::new_err("WebSocket发送任务已经终止"))?
+}
+
+async fn close_websocket_command(
+    close_commands: mpsc::Sender<WebSocketCloseCommand>,
+    closed: Arc<AtomicBool>,
+    code: u16,
+    reason: String,
+) -> PyResult<()> {
+    if closed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let (completed_tx, completed_rx) = oneshot::channel();
+    if close_commands
+        .send((code, reason, completed_tx))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    completed_rx
+        .await
+        .map_err(|_| PyRuntimeError::new_err("WebSocket关闭任务已经终止"))?
+}
+
+async fn recv_websocket_event(
+    events: Arc<AsyncMutex<mpsc::Receiver<WebSocketEvent>>>,
+    recv_active: Arc<AtomicBool>,
+) -> PyResult<Option<RawWebSocketMessage>> {
+    if recv_active.swap(true, Ordering::AcqRel) {
+        return Err(PyRuntimeError::new_err(
+            "同一WebSocket同时只允许一个活动接收者",
+        ));
+    }
+    let _guard = ReadGuard(recv_active);
+    match events.lock().await.recv().await {
+        Some(WebSocketEvent::Message(message)) => Ok(Some(message)),
+        Some(WebSocketEvent::Error(error)) => Err(PyRuntimeError::new_err(error)),
+        None => Ok(None),
+    }
+}
+
+#[pyclass]
+struct NativeWebSocket {
+    #[pyo3(get)]
+    url: String,
+    #[pyo3(get)]
+    protocol: Option<String>,
+    #[pyo3(get)]
+    fingerprint_id: String,
+    #[pyo3(get)]
+    impersonate: String,
+    commands: mpsc::Sender<WebSocketCommand>,
+    close_commands: mpsc::Sender<WebSocketCloseCommand>,
+    events: Arc<AsyncMutex<mpsc::Receiver<WebSocketEvent>>>,
+    closed: Arc<AtomicBool>,
+    recv_active: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl NativeWebSocket {
+    fn send_text(&self, py: Python<'_>, value: String) -> PyResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
+        }
+        let runtime = shared_runtime()?;
+        let commands = self.commands.clone();
+        py.detach(|| runtime.block_on(send_websocket_command(commands, Message::text(value))))
+    }
+
+    fn send_text_async<'py>(&self, py: Python<'py>, value: String) -> PyResult<Bound<'py, PyAny>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
+        }
+        let commands = self.commands.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            send_websocket_command(commands, Message::text(value)),
+        )
+    }
+
+    fn send_bytes(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
+        }
+        let runtime = shared_runtime()?;
+        let commands = self.commands.clone();
+        py.detach(|| runtime.block_on(send_websocket_command(commands, Message::binary(value))))
+    }
+
+    fn send_bytes_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
+        }
+        let commands = self.commands.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            send_websocket_command(commands, Message::binary(value)),
+        )
+    }
+
+    fn ping(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
+        if value.len() > 125 {
+            return Err(PyRuntimeError::new_err("WebSocket Ping载荷不能超过125字节"));
+        }
+        let runtime = shared_runtime()?;
+        let commands = self.commands.clone();
+        py.detach(|| runtime.block_on(send_websocket_command(commands, Message::ping(value))))
+    }
+
+    fn ping_async<'py>(&self, py: Python<'py>, value: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        if value.len() > 125 {
+            return Err(PyRuntimeError::new_err("WebSocket Ping载荷不能超过125字节"));
+        }
+        let commands = self.commands.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            send_websocket_command(commands, Message::ping(value)),
+        )
+    }
+
+    fn pong(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
+        if value.len() > 125 {
+            return Err(PyRuntimeError::new_err("WebSocket Pong载荷不能超过125字节"));
+        }
+        let runtime = shared_runtime()?;
+        let commands = self.commands.clone();
+        py.detach(|| runtime.block_on(send_websocket_command(commands, Message::pong(value))))
+    }
+
+    fn pong_async<'py>(&self, py: Python<'py>, value: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        if value.len() > 125 {
+            return Err(PyRuntimeError::new_err("WebSocket Pong载荷不能超过125字节"));
+        }
+        let commands = self.commands.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            send_websocket_command(commands, Message::pong(value)),
+        )
+    }
+
+    fn recv(&self, py: Python<'_>) -> PyResult<Option<RawWebSocketMessage>> {
+        let runtime = shared_runtime()?;
+        let events = self.events.clone();
+        let recv_active = self.recv_active.clone();
+        py.detach(|| runtime.block_on(recv_websocket_event(events, recv_active)))
+    }
+
+    fn recv_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let events = self.events.clone();
+        let recv_active = self.recv_active.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, recv_websocket_event(events, recv_active))
+    }
+
+    #[pyo3(signature = (code=1000, reason=String::new()))]
+    fn close(&self, py: Python<'_>, code: u16, reason: String) -> PyResult<()> {
+        let runtime = shared_runtime()?;
+        let close_commands = self.close_commands.clone();
+        let closed = self.closed.clone();
+        py.detach(|| {
+            runtime.block_on(close_websocket_command(
+                close_commands,
+                closed,
+                code,
+                reason,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (code=1000, reason=String::new()))]
+    fn close_async<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let close_commands = self.close_commands.clone();
+        let closed = self.closed.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            close_websocket_command(close_commands, closed, code, reason),
+        )
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_websocket(
+    permit: OwnedSemaphorePermit,
+    client: Client,
+    url: String,
+    headers: HeaderMap,
+    protocols: Vec<String>,
+    version: Version,
+    timeout: Duration,
+    proxy: Option<Proxy>,
+    fingerprint_id: String,
+    profile: String,
+) -> PyResult<NativeWebSocket> {
+    let mut request = client
+        .websocket(&url)
+        .headers(headers)
+        .protocols(protocols)
+        .version(version);
+    if let Some(proxy) = proxy {
+        request = request.proxy(proxy);
+    }
+    let response = tokio::time::timeout(timeout, request.send())
+        .await
+        .map_err(|_| PyRuntimeError::new_err("WebSocket握手超时"))?
+        .map_err(to_py_error)?;
+    let final_url = response.uri().to_string();
+    let socket = tokio::time::timeout(timeout, response.into_websocket())
+        .await
+        .map_err(|_| PyRuntimeError::new_err("WebSocket升级超时"))?
+        .map_err(to_py_error)?;
+    let protocol = socket
+        .protocol()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let (commands_tx, commands_rx) = mpsc::channel(64);
+    let (close_commands_tx, close_commands_rx) = mpsc::channel(1);
+    let (events_tx, events_rx) = mpsc::channel(256);
+    let closed = Arc::new(AtomicBool::new(false));
+    tokio::spawn(run_websocket(
+        permit,
+        socket,
+        commands_rx,
+        close_commands_rx,
+        events_tx,
+        closed.clone(),
+        timeout,
+    ));
+    Ok(NativeWebSocket {
+        url: final_url,
+        protocol,
+        fingerprint_id,
+        impersonate: profile,
+        commands: commands_tx,
+        close_commands: close_commands_tx,
+        events: Arc::new(AsyncMutex::new(events_rx)),
+        closed,
+        recv_active: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 struct StreamState {
@@ -1517,12 +1975,14 @@ async fn read_stream(
     closed: Arc<AtomicBool>,
     close_notify: Arc<Notify>,
     read_active: Arc<AtomicBool>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     size: i64,
 ) -> PyResult<Vec<u8>> {
     if size == 0 {
         return Ok(Vec::new());
     }
     if closed.load(Ordering::Acquire) {
+        permit.lock().ok().and_then(|mut permit| permit.take());
         return Ok(Vec::new());
     }
     if read_active.swap(true, Ordering::AcqRel) {
@@ -1534,6 +1994,7 @@ async fn read_stream(
     let requested = if size < 0 { usize::MAX } else { size as usize };
     let mut state = state.lock().await;
     if let Some(error) = &state.terminal_error {
+        permit.lock().ok().and_then(|mut permit| permit.take());
         return Err(PyRuntimeError::new_err(error.clone()));
     }
     while state.buffered.len().saturating_sub(state.offset) < requested {
@@ -1541,6 +2002,7 @@ async fn read_stream(
             state.stream = None;
             state.buffered.clear();
             state.offset = 0;
+            permit.lock().ok().and_then(|mut permit| permit.take());
             return Ok(Vec::new());
         }
         let Some(stream) = state.stream.as_mut() else {
@@ -1559,6 +2021,7 @@ async fn read_stream(
                 state.buffered.clear();
                 state.offset = 0;
                 state.terminal_error = Some(message.clone());
+                permit.lock().ok().and_then(|mut permit| permit.take());
                 return Err(PyRuntimeError::new_err(message));
             }
             None => {
@@ -1566,8 +2029,10 @@ async fn read_stream(
                 if closed.load(Ordering::Acquire) {
                     state.buffered.clear();
                     state.offset = 0;
+                    permit.lock().ok().and_then(|mut permit| permit.take());
                     return Ok(Vec::new());
                 }
+                permit.lock().ok().and_then(|mut permit| permit.take());
                 break;
             }
         }
@@ -1605,6 +2070,7 @@ struct NativeStreamResponse {
     closed: Arc<AtomicBool>,
     close_notify: Arc<Notify>,
     read_active: Arc<AtomicBool>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
 }
 
 #[pymethods]
@@ -1616,7 +2082,17 @@ impl NativeStreamResponse {
         let closed = self.closed.clone();
         let close_notify = self.close_notify.clone();
         let read_active = self.read_active.clone();
-        py.detach(|| runtime.block_on(read_stream(state, closed, close_notify, read_active, size)))
+        let permit = self.permit.clone();
+        py.detach(|| {
+            runtime.block_on(read_stream(
+                state,
+                closed,
+                close_notify,
+                read_active,
+                permit,
+                size,
+            ))
+        })
     }
 
     #[pyo3(signature = (size=-1))]
@@ -1625,21 +2101,24 @@ impl NativeStreamResponse {
         let closed = self.closed.clone();
         let close_notify = self.close_notify.clone();
         let read_active = self.read_active.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            read_stream(state, closed, close_notify, read_active, size),
-        )
+        let permit = self.permit.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            read_stream(state, closed, close_notify, read_active, permit, size).await
+        })
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.close_notify.notify_one();
         if let Some(runtime) = 共享运行时.get() {
-            runtime.spawn(close_stream(
-                self.state.clone(),
-                self.closed.clone(),
-                self.close_notify.clone(),
-            ));
+            let permit = self.permit.clone();
+            let state = self.state.clone();
+            let closed = self.closed.clone();
+            let close_notify = self.close_notify.clone();
+            runtime.spawn(async move {
+                close_stream(state, closed, close_notify).await;
+                permit.lock().ok().and_then(|mut permit| permit.take());
+            });
         }
     }
 
@@ -1647,8 +2126,10 @@ impl NativeStreamResponse {
         let state = self.state.clone();
         let closed = self.closed.clone();
         let close_notify = self.close_notify.clone();
+        let permit = self.permit.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             close_stream(state, closed, close_notify).await;
+            permit.lock().ok().and_then(|mut permit| permit.take());
             Ok(())
         })
     }
@@ -1662,7 +2143,8 @@ struct NativeSession {
 #[pymethods]
 impl NativeSession {
     #[new]
-    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3)))]
     fn new(
         py: Python<'_>,
         impersonate: String,
@@ -1672,8 +2154,25 @@ impl NativeSession {
         connect_timeout: Option<f64>,
         fingerprints_path: Option<String>,
         default_headers: Vec<(String, String)>,
+        max_connections: usize,
+        happy_eyeballs_timeout: Option<f64>,
     ) -> PyResult<Self> {
-        let normalized = normalize_profile(&impersonate);
+        if max_connections == 0 {
+            return Err(PyRuntimeError::new_err("max_connections必须大于0"));
+        }
+        let happy_eyeballs_timeout =
+            parse_optional_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout)?;
+        let impersonate_path = std::path::Path::new(&impersonate).is_file();
+        if impersonate_path && fingerprints_path.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "impersonate使用指纹文件路径时不能同时传fingerprints_path",
+            ));
+        }
+        let fingerprints_path = if impersonate_path {
+            Some(impersonate.clone())
+        } else {
+            fingerprints_path
+        };
         let proxy_identity = proxy.clone();
         let proxy = proxy
             .map(|value| Proxy::all(&value).map_err(to_py_error))
@@ -1694,6 +2193,21 @@ impl NativeSession {
                 (records, "指纹文件")
             }
             None => (embedded_records()?.clone(), "内置指纹"),
+        };
+        let normalized = if impersonate_path {
+            let profiles: BTreeSet<_> = records
+                .iter()
+                .map(|record| normalize_profile(&record.profile))
+                .collect();
+            if profiles.len() != 1 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "impersonate指纹文件必须只包含一个profile，当前包含: {}",
+                    profiles.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            profiles.into_iter().next().unwrap_or_default()
+        } else {
+            normalize_profile(&impersonate)
         };
         let matching: Vec<_> = records
             .iter()
@@ -1730,10 +2244,12 @@ impl NativeSession {
             default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
+            happy_eyeballs_timeout,
             cookie_jar: Arc::new(Jar::default()),
             counter: AtomicUsize::new(0),
             selected_variant: AtomicUsize::new(selected_variant),
             closed: AtomicBool::new(false),
+            connection_slots: Arc::new(Semaphore::new(max_connections)),
         });
         Ok(Self { state })
     }
@@ -1773,11 +2289,13 @@ impl NativeSession {
         let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = cached_client(&state, variant)?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_request(
+                permit,
                 client,
                 method,
                 url,
@@ -1827,8 +2345,10 @@ impl NativeSession {
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let permit = acquire_connection_slot(&state).await?;
             let client = cached_client_async(state, index).await?;
             let response = execute_request(
+                permit,
                 client,
                 method,
                 url,
@@ -1846,6 +2366,91 @@ impl NativeSession {
             )
             .await?;
             Python::attach(|py| into_native_response(py, response))
+        })
+    }
+
+    #[pyo3(signature = (url, headers, protocols=Vec::new(), version=String::from("http1"), timeout=30.0, proxy_override=false, proxy=None, cookies=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn websocket(
+        &self,
+        py: Python<'_>,
+        url: String,
+        headers: Vec<(String, String)>,
+        protocols: Vec<String>,
+        version: String,
+        timeout: f64,
+        proxy_override: bool,
+        proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
+    ) -> PyResult<NativeWebSocket> {
+        ensure_open(&self.state)?;
+        let timeout = parse_timeout("timeout", timeout)?;
+        let version = parse_websocket_version(&version)?;
+        let index = request_variant(&self.state);
+        let state = self.state.clone();
+        let runtime = shared_runtime()?;
+        let cookie_url = websocket_cookie_url(&url)?;
+        let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
+        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        py.detach(move || {
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
+            let variant = &state.variants[index];
+            let client = cached_client(&state, variant)?;
+            runtime.block_on(execute_websocket(
+                permit,
+                client,
+                url,
+                headers,
+                protocols,
+                version,
+                timeout,
+                proxy,
+                variant.record.id.clone(),
+                state.profile.clone(),
+            ))
+        })
+    }
+
+    #[pyo3(signature = (url, headers, protocols=Vec::new(), version=String::from("http1"), timeout=30.0, proxy_override=false, proxy=None, cookies=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn websocket_async<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        headers: Vec<(String, String)>,
+        protocols: Vec<String>,
+        version: String,
+        timeout: f64,
+        proxy_override: bool,
+        proxy: Option<String>,
+        cookies: Option<Vec<(String, String)>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        ensure_open(&self.state)?;
+        let timeout = parse_timeout("timeout", timeout)?;
+        let version = parse_websocket_version(&version)?;
+        let index = request_variant(&self.state);
+        let state = self.state.clone();
+        let cookie_url = websocket_cookie_url(&url)?;
+        let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
+        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let fingerprint_id = state.variants[index].record.id.clone();
+        let profile = state.profile.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let permit = acquire_connection_slot(&state).await?;
+            let client = cached_client_async(state, index).await?;
+            execute_websocket(
+                permit,
+                client,
+                url,
+                headers,
+                protocols,
+                version,
+                timeout,
+                proxy,
+                fingerprint_id,
+                profile,
+            )
+            .await
         })
     }
 
@@ -1877,11 +2482,13 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         py.detach(move || {
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = cached_client(&state, variant)?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_stream_request(
+                permit,
                 client,
                 method,
                 url,
@@ -1926,8 +2533,10 @@ impl NativeSession {
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let permit = acquire_connection_slot(&state).await?;
             let client = cached_client_async(state, index).await?;
             execute_stream_request(
+                permit,
                 client,
                 method,
                 url,
@@ -1974,11 +2583,13 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = cached_client(&state, variant)?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_multipart_request(
+                permit,
                 client,
                 method,
                 url,
@@ -2026,8 +2637,10 @@ impl NativeSession {
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let permit = acquire_connection_slot(&state).await?;
             let client = cached_client_async(state, index).await?;
             let response = execute_multipart_request(
+                permit,
                 client,
                 method,
                 url,
@@ -2175,6 +2788,7 @@ impl NativeSession {
         if self.state.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.state.connection_slots.close();
         for variant in &self.state.variants {
             variant.client.store(None);
         }
@@ -2241,6 +2855,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         ));
     }
     module.add_class::<NativeSession>()?;
+    module.add_class::<NativeWebSocket>()?;
     module.add_class::<NativeStreamResponse>()?;
     module.add_class::<NativeHeaders>()?;
     module.add_class::<NativeResponse>()?;
@@ -2261,6 +2876,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "CookieTypes",
         "Session",
         "AsyncSession",
+        "WebSocket",
+        "AsyncWebSocket",
+        "WebSocketMessage",
         "request",
         "get",
         "post",
