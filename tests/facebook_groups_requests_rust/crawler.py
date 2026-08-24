@@ -80,6 +80,9 @@ class RequestsRustCrawler:
         fingerprints_path: str | Path | None = None,
         impersonate: str | None = None,
         fingerprint_rotation: bool = False,
+        fingerprint_pool: bool = True,
+        fingerprint_pool_size: int = 100,
+        max_cached_origins: int = 100,
         transfer_stats: bool = False,
         accept_encoding: str | None = None,
     ) -> None:
@@ -92,6 +95,9 @@ class RequestsRustCrawler:
             impersonate=self.impersonate,
             fingerprints_path=fingerprints_path,
             fingerprint_rotation=fingerprint_rotation,
+            fingerprint_pool=fingerprint_pool,
+            fingerprint_pool_size=fingerprint_pool_size,
+            max_cached_origins=max_cached_origins,
         )
         self.parse_thread_pool = ThreadPoolExecutor(max_workers=self.解析线程数)
         self.request_semaphore = asyncio.Semaphore(self.请求并发)

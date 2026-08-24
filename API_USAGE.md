@@ -84,8 +84,14 @@ with Session(
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
 | `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
+| `resolve` | 可选域名到IPv4/IPv6列表的Session级静态映射，保留原URL、Host、SNI和证书域名。 |
+| `dns_servers` | 可选本机DNS服务器列表，支持`IP`或`IP:端口`，使用UDP并在失败时回退TCP。 |
+| `dns_timeout` | 自定义DNS单次查询超时，默认`5`秒。 |
 | `fingerprints_path` | 可选自定义指纹 JSON 路径，仅在当前 Session 构造时独立加载。 |
 | `max_connections` | Session内HTTP、代理、流和WebSocket共同使用的Rust原生活跃连接上限，默认`50`。 |
+| `fingerprint_pool` | 是否保存轮换指纹对应的Rust Client和连接池，默认`True`。 |
+| `fingerprint_pool_size` | 最多允许多少个指纹进入保存集合，默认`100`；满后只在已有指纹中随机轮换，不淘汰、不新增。 |
+| `max_cached_origins` | 最多缓存多少个`Origin + 代理身份`路由，默认`100`；超限路由正常请求但使用临时Client，不保存连接。 |
 
 `impersonate` 直接传路径时，文件必须只包含一个 `profile`，但可以包含该 profile 的多个指纹变体。Session 会自动识别 profile，并继续遵循固定或轮换变体策略。此时不能再同时传 `fingerprints_path`。
 
@@ -104,6 +110,57 @@ async with AsyncSession(
 `max_connections` 控制同一个 `Session` 或 `AsyncSession` 同时占用的统一网络槽位，默认值为 `50`。该限制由 Rust/Tokio 原生 `Semaphore` 执行，Python 不维护信号量或连接释放回调。HTTP、HTTPS、HTTP 代理、SOCKS5、流式响应和 WebSocket 共用这一个上限，不会分别各获得 50 个槽位。普通请求在响应 Body 完整返回后由 Rust 释放许可；流式响应持有原生许可直到 EOF 或底层关闭；WebSocket 的许可由 Rust actor 持有到真实连接终止。
 
 IPv6字面量使用标准方括号URL，例如 `https://[2001:db8::1]/`。域名同时解析出AAAA和A记录时，Rust连接器先尝试DNS结果中的首选地址族；超过 `happy_eyeballs_timeout` 仍未连接成功，就并行尝试另一个地址族，成功的一路继续，另一路取消。HTTP、HTTPS和WebSocket共用该连接器；`socks5h://` 仍把域名原样交给代理解析。
+
+## 指定DNS
+
+日常指定DNS只使用`dns_servers`：
+
+```python
+async with AsyncSession(
+    impersonate="chrome146",
+    dns_servers=["1.1.1.1", "8.8.8.8"],
+) as session:
+    response = await session.get("https://example.com/")
+```
+
+列表表示当前Session允许使用的上游DNS集合。Rust Hickory resolver负责A/AAAA、TTL缓存、多服务器并发、UDP查询和UDP失败后的TCP回退。单个DNS也必须写成列表，例如`dns_servers=["1.1.1.1"]`。未传时使用系统`getaddrinfo`。
+
+单个`get()`也可以临时指定，只影响这一条请求，不污染Session默认DNS或其他并发请求：
+
+```python
+response = await session.get(
+    "https://example.com/",
+    dns_servers=["1.1.1.1", "8.8.8.8"],
+    dns_timeout=3,
+)
+```
+
+相同请求级DNS配置按指纹变体进入8项LRU Rust Client缓存，后续`get()`会复用Resolver TTL缓存、TCP/TLS/HTTP2连接池，不会每次重建Client。传`dns_servers=[]`表示这一次请求临时恢复系统DNS。`dns_timeout`必须和请求级`dns_servers`同时传入。
+
+`resolve`不是日常指定DNS服务器的接口，只用于已经知道目标IP、但HTTPS/WSS仍必须保留原域名TLS语义的高级场景。例如固定CDN节点、固定代理入口IP或绕过错误DNS答案：
+
+```python
+async with AsyncSession(
+    impersonate="chrome146",
+    resolve={"example.com": ["203.0.113.10", "2001:db8::10"]},
+) as session:
+    response = await session.get("https://example.com/")
+```
+
+这里TCP连接使用映射IP，但URL、HTTP Host、TLS SNI和证书验证仍使用`example.com`。直接`get("https://IP/")`即使手写Host也无法保持相同SNI和证书校验，所以只有这种场景才使用`resolve`；普通DNS需求不要用它。
+
+代理解析边界：
+
+| 场景 | 代理服务器域名 | 最终目标域名 |
+|---|---|---|
+| HTTP代理 + HTTP/HTTPS/WS/WSS | 本机`resolve`/`dns_servers` | HTTP代理解析 |
+| `socks5://` | 本机`resolve`/`dns_servers` | 本机`resolve`/`dns_servers` |
+| `socks5h://` | 本机`resolve`/`dns_servers` | SOCKS代理解析 |
+| 无代理 | 无 | 本机`resolve`/`dns_servers` |
+
+HTTP代理CONNECT目标强制本机解析尚未公开，因为必须同时分离CONNECT地址与原始TLS SNI、证书域名和HTTP Host；不能通过把URL改成IP或关闭证书验证伪实现。
+
+DNS性能应按业务实际任务模型测试。仓库的`benchmark_dns_performance.py`一次创建1000个独立`get()`任务并设置`max_connections=1000`，只限制任务总数，不再增加Worker并发层；结果用于比较系统DNS、Session指定DNS和单get指定DNS，不作为公网吞吐承诺。
 
 ```python
 import asyncio
@@ -127,6 +184,11 @@ asyncio.run(main())
 ```
 
 同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
+
+指纹轮换使用自然惰性建池。池未满时会随机选择一个尚未入池的有效指纹并保存其Client；达到`fingerprint_pool_size`后，只在已有指纹池中随机复用，不做LRU一进一出。当前chrome142原始记录21条，其中带TLS扩展41的恢复握手记录不能独立用于首次连接，实际可建池变体为14条，因此默认上限100时最终最多保留14个指纹池。普通`get/post`第一次命中某指纹时自然建立连接，不提供额外连接建立API，也不会产生隐藏请求流量。
+
+`max_cached_origins`按`scheme + host + port + 完整代理身份`的哈希计算。不同path、query和`params`不增加名额，例如`https://example.com/api?page=1`和`?page=2`都属于同一个Origin并可复用连接；换域名、端口、HTTP/HTTPS协议或代理session ID才算新路由。代理凭据不以明文存入路由集合。设为`0`表示不缓存任何Origin连接。
+
 
 异步方法：
 

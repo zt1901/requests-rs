@@ -24,9 +24,6 @@ jobs:
           # Linux ARM64：原生ARM runner构建，避免宿主objcopy处理ARM归档。
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # macOS Intel：使用Intel原生runner构建和安装验证。
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           # macOS Apple Silicon：使用ARM64原生runner构建和安装验证。
           - os: macos-15
             target: aarch64-apple-darwin

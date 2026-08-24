@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, Write},
+    net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
@@ -16,6 +19,12 @@ use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use futures_util::{Stream, StreamExt};
+use hickory_resolver::{
+    TokioResolver,
+    config::{ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolverConfig},
+    net::runtime::TokioRuntimeProvider,
+};
+use lru::LruCache;
 use pyo3::{
     exceptions::PyRuntimeError,
     ffi::c_str,
@@ -34,6 +43,7 @@ use url::Url;
 use wreq::{
     Client, Emulation, Method, Proxy, Uri, Version,
     cookie::{CookieStore, Cookies as RequestCookies, Jar},
+    dns::{Addrs as DnsAddrs, Name as DnsName, Resolve as DnsResolve, Resolving},
     header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap},
     http2::{
         Http2Options, Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder,
@@ -51,6 +61,28 @@ use wreq::{
         message::{CloseCode, CloseFrame, Message, Utf8Bytes},
     },
 };
+
+#[derive(Debug, Clone)]
+struct CustomDnsResolver {
+    resolver: TokioResolver,
+}
+
+impl DnsResolve for CustomDnsResolver {
+    fn resolve(&self, name: DnsName) -> Resolving {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let lookup = resolver.lookup_ip(name.as_str()).await?;
+            let addrs: DnsAddrs = Box::new(
+                lookup
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            Ok(addrs)
+        })
+    }
+}
 
 const 内置指纹: &str = include_str!("../fingerprints.json");
 const 版权说明: &str = include_str!("../NOTICE.txt");
@@ -740,12 +772,22 @@ struct Variant {
     // 热路径通过原子快照读取已构建Client；初始化锁只在首个请求竞争构建时使用。
     client: ArcSwapOption<Client>,
     client_init: Mutex<()>,
+    // 请求级DNS配置按指纹变体隔离并有界复用，避免热路径重复构建Client和Resolver。
+    dns_clients: Mutex<LruCache<String, Client>>,
 }
 
 struct SessionState {
     profile: String,
     variants: Vec<Variant>,
     rotation: bool,
+    fingerprint_pool: bool,
+    fingerprint_pool_size: usize,
+    // 扩池只发生在首次命中阶段；池满后通过ArcSwap快照无锁随机选择。
+    fingerprint_pool_members: ArcSwap<Vec<usize>>,
+    fingerprint_pool_init: Mutex<()>,
+    max_cached_origins: usize,
+    cached_origins: Mutex<HashSet<String>>,
+    client_pool_max_size: usize,
     // 固定模式下当前代理会话绑定的指纹变体；切换代理会话时重新随机选择。
     selected_variant: AtomicUsize,
     // 默认代理由set_proxy原子替换，请求仅加载快照，不阻塞其他并发请求。
@@ -757,8 +799,9 @@ struct SessionState {
     verify: bool,
     connect_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
+    dns_resolver: Option<CustomDnsResolver>,
+    dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
     cookie_jar: Arc<Jar>,
-    counter: AtomicUsize,
     closed: AtomicBool,
     connection_slots: Arc<Semaphore>,
 }
@@ -780,7 +823,12 @@ fn normalize_profile(profile: &str) -> String {
         .collect()
 }
 
-fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
+fn build_client_with_dns(
+    state: &SessionState,
+    variant: &Variant,
+    dns_resolver: Option<&CustomDnsResolver>,
+    dns_override: bool,
+) -> Result<Client> {
     let emulation = variant
         .record
         .emulation
@@ -793,7 +841,24 @@ fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
         .tls_sni(true)
         .tls_session_cache(variant.session_cache.clone())
         .cookie_provider(state.cookie_jar.clone())
-        .tcp_happy_eyeballs_timeout(state.happy_eyeballs_timeout);
+        .tcp_happy_eyeballs_timeout(state.happy_eyeballs_timeout)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(2)
+        .pool_max_size(state.client_pool_max_size);
+    let resolver = if dns_override {
+        dns_resolver
+    } else {
+        state.dns_resolver.as_ref()
+    };
+    if let Some(resolver) = resolver {
+        builder = builder.dns_resolver(resolver.clone());
+    } else {
+        // 未指定DNS服务器时保持原有系统getaddrinfo语义。
+        builder = builder.no_hickory_dns();
+    }
+    for (domain, addrs) in state.dns_overrides.iter() {
+        builder = builder.resolve_to_addrs(domain.clone(), addrs.clone());
+    }
     if let Some(timeout) = state.connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
@@ -812,8 +877,124 @@ fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
     builder.build().context("无法构建wreq Client")
 }
 
-fn cached_client(state: &SessionState, variant: &Variant) -> PyResult<Client> {
+fn build_client(state: &SessionState, variant: &Variant) -> Result<Client> {
+    build_client_with_dns(state, variant, None, false)
+}
+
+fn cache_route_allowed(
+    state: &SessionState,
+    url: &str,
+    proxy_identity: Option<&str>,
+) -> PyResult<bool> {
+    if state.max_cached_origins == 0 {
+        return Ok(false);
+    }
+    let uri = url.parse::<Uri>().map_err(to_py_error)?;
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let host = uri
+        .host()
+        .ok_or_else(|| PyRuntimeError::new_err("URL缺少主机"))?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_ascii_lowercase()
+    };
+    let port = uri
+        .port_u16()
+        .unwrap_or(if matches!(scheme, "https" | "wss") {
+            443
+        } else {
+            80
+        });
+    let proxy_key = if let Some(proxy_identity) = proxy_identity {
+        let mut hasher = DefaultHasher::new();
+        proxy_identity.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    } else {
+        "DIRECT".to_string()
+    };
+    let route = format!("{scheme}://{host}:{port}|{proxy_key}");
+    let mut cached = state
+        .cached_origins
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?;
+    if cached.contains(&route) {
+        return Ok(true);
+    }
+    if cached.len() >= state.max_cached_origins {
+        return Ok(false);
+    }
+    cached.insert(route);
+    Ok(true)
+}
+
+fn request_dns_client(
+    state: &SessionState,
+    variant: &Variant,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+) -> PyResult<Client> {
+    let mut normalized = dns_servers;
+    normalized.iter_mut().for_each(|value| {
+        *value = value.trim().to_ascii_lowercase();
+    });
+    let key = format!("{}|{dns_timeout:?}", normalized.join(","));
+    if !state.fingerprint_pool {
+        let resolver = build_custom_dns_resolver(normalized, dns_timeout)?;
+        return build_client_with_dns(state, variant, resolver.as_ref(), true).map_err(to_py_error);
+    }
+    {
+        let mut clients = variant
+            .dns_clients
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?;
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+    }
+    let resolver = build_custom_dns_resolver(normalized, dns_timeout)?;
+    let client =
+        build_client_with_dns(state, variant, resolver.as_ref(), true).map_err(to_py_error)?;
+    let mut clients = variant
+        .dns_clients
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?;
+    if let Some(existing) = clients.get(&key) {
+        return Ok(existing.clone());
+    }
+    clients.put(key, client.clone());
+    Ok(client)
+}
+
+fn touch_fingerprint_pool(state: &SessionState, index: usize) -> PyResult<()> {
+    if !state.fingerprint_pool {
+        return Ok(());
+    }
+    let members = state.fingerprint_pool_members.load_full();
+    if members.contains(&index) || members.len() >= state.fingerprint_pool_size {
+        return Ok(());
+    }
+    let _guard = state
+        .fingerprint_pool_init
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("指纹连接池初始化锁已损坏"))?;
+    let current = state.fingerprint_pool_members.load_full();
+    if current.contains(&index) || current.len() >= state.fingerprint_pool_size {
+        return Ok(());
+    }
+    let mut next = (*current).clone();
+    next.push(index);
+    state.fingerprint_pool_members.store(Arc::new(next));
+    Ok(())
+}
+
+fn cached_client(state: &SessionState, index: usize) -> PyResult<Client> {
+    let variant = &state.variants[index];
+    if !state.fingerprint_pool {
+        return build_client(state, variant).map_err(to_py_error);
+    }
     if let Some(client) = variant.client.load_full() {
+        touch_fingerprint_pool(state, index)?;
         return Ok((*client).clone());
     }
     let _init_guard = variant
@@ -821,6 +1002,7 @@ fn cached_client(state: &SessionState, variant: &Variant) -> PyResult<Client> {
         .lock()
         .map_err(|_| PyRuntimeError::new_err("Client初始化锁已损坏"))?;
     if let Some(client) = variant.client.load_full() {
+        touch_fingerprint_pool(state, index)?;
         return Ok((*client).clone());
     }
     let client = build_client(state, variant).map_err(to_py_error)?;
@@ -828,6 +1010,7 @@ fn cached_client(state: &SessionState, variant: &Variant) -> PyResult<Client> {
         return Ok(client);
     }
     variant.client.store(Some(Arc::new(client.clone())));
+    touch_fingerprint_pool(state, index)?;
     Ok(client)
 }
 
@@ -835,9 +1018,59 @@ async fn cached_client_async(state: Arc<SessionState>, index: usize) -> PyResult
     if let Some(client) = state.variants[index].client.load_full() {
         return Ok((*client).clone());
     }
-    tokio::task::spawn_blocking(move || cached_client(&state, &state.variants[index]))
+    tokio::task::spawn_blocking(move || cached_client(&state, index))
         .await
         .map_err(|error| PyRuntimeError::new_err(format!("Client构建任务失败: {error}")))?
+}
+
+fn selected_request_client(
+    state: &SessionState,
+    index: usize,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    cache_route: bool,
+) -> PyResult<Client> {
+    let variant = &state.variants[index];
+    if !cache_route {
+        let resolver = if dns_override {
+            build_custom_dns_resolver(dns_servers, dns_timeout)?
+        } else {
+            None
+        };
+        return build_client_with_dns(state, variant, resolver.as_ref(), dns_override)
+            .map_err(to_py_error);
+    }
+    if dns_override {
+        request_dns_client(state, variant, dns_servers, dns_timeout)
+    } else {
+        cached_client(state, index)
+    }
+}
+
+async fn selected_request_client_async(
+    state: Arc<SessionState>,
+    index: usize,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    cache_route: bool,
+) -> PyResult<Client> {
+    if !dns_override && cache_route {
+        return cached_client_async(state, index).await;
+    }
+    tokio::task::spawn_blocking(move || {
+        selected_request_client(
+            &state,
+            index,
+            dns_override,
+            dns_servers,
+            dns_timeout,
+            cache_route,
+        )
+    })
+    .await
+    .map_err(|error| PyRuntimeError::new_err(format!("请求级DNS Client构建任务失败: {error}")))?
 }
 
 fn random_variant(count: usize) -> usize {
@@ -845,11 +1078,34 @@ fn random_variant(count: usize) -> usize {
 }
 
 fn request_variant(state: &SessionState) -> usize {
-    if state.rotation {
-        state.counter.fetch_add(1, Ordering::AcqRel) % state.variants.len()
-    } else {
-        state.selected_variant.load(Ordering::Acquire)
+    if !state.rotation {
+        return state.selected_variant.load(Ordering::Acquire);
     }
+    if !state.fingerprint_pool {
+        return rand::rng().random_range(0..state.variants.len());
+    }
+    let target_size = state.fingerprint_pool_size.min(state.variants.len());
+    let members = state.fingerprint_pool_members.load_full();
+    if members.len() < target_size {
+        let Ok(_guard) = state.fingerprint_pool_init.lock() else {
+            return rand::rng().random_range(0..state.variants.len());
+        };
+        let current = state.fingerprint_pool_members.load_full();
+        if current.len() >= target_size {
+            return current[rand::rng().random_range(0..current.len())];
+        }
+        let available: Vec<_> = (0..state.variants.len())
+            .filter(|index| !current.contains(index))
+            .collect();
+        if !available.is_empty() {
+            let index = available[rand::rng().random_range(0..available.len())];
+            let mut next = (*current).clone();
+            next.push(index);
+            state.fingerprint_pool_members.store(Arc::new(next));
+            return index;
+        }
+    }
+    members[rand::rng().random_range(0..members.len())]
 }
 
 fn parse_timeout(name: &str, value: f64) -> PyResult<Duration> {
@@ -2140,11 +2396,76 @@ struct NativeSession {
     state: Arc<SessionState>,
 }
 
+fn parse_ip(value: &str, field: &str) -> PyResult<IpAddr> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| PyRuntimeError::new_err(format!("{field}包含无效IP地址: {value}")))
+}
+
+fn build_custom_dns_resolver(
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+) -> PyResult<Option<CustomDnsResolver>> {
+    if dns_servers.is_empty() {
+        return Ok(None);
+    }
+    let name_servers = dns_servers
+        .iter()
+        .map(|value| {
+            let value = value.trim();
+            let (ip, port) = if let Ok(addr) = value.parse::<SocketAddr>() {
+                (addr.ip(), addr.port())
+            } else {
+                (parse_ip(value, "dns_servers")?, 53)
+            };
+            let mut udp = ConnectionConfig::udp();
+            udp.port = port;
+            let mut tcp = ConnectionConfig::tcp();
+            tcp.port = port;
+            Ok(NameServerConfig::new(ip, true, vec![udp, tcp]))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
+    let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    let options = builder.options_mut();
+    options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+    options.try_tcp_on_error = true;
+    if let Some(timeout) = parse_optional_timeout("dns_timeout", dns_timeout)? {
+        options.timeout = timeout;
+    }
+    let resolver = builder
+        .build()
+        .map_err(|error| PyRuntimeError::new_err(format!("无法构建DNS解析器: {error}")))?;
+    Ok(Some(CustomDnsResolver { resolver }))
+}
+
+fn parse_dns_overrides(
+    values: Vec<(String, Vec<String>)>,
+) -> PyResult<Vec<(String, Vec<SocketAddr>)>> {
+    values
+        .into_iter()
+        .map(|(domain, values)| {
+            let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if domain.is_empty() || values.is_empty() {
+                return Err(PyRuntimeError::new_err("resolve中的域名和IP列表不能为空"));
+            }
+            let addrs = values
+                .iter()
+                .map(|value| parse_ip(value, "resolve").map(|ip| SocketAddr::new(ip, 0)))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok((domain, addrs))
+        })
+        .collect()
+}
+
 #[pymethods]
 impl NativeSession {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3)))]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3), resolve=Vec::new(), dns_servers=Vec::new(), dns_timeout=Some(5.0), fingerprint_pool=true, fingerprint_pool_size=100, max_cached_origins=100))]
     fn new(
         py: Python<'_>,
         impersonate: String,
@@ -2156,9 +2477,18 @@ impl NativeSession {
         default_headers: Vec<(String, String)>,
         max_connections: usize,
         happy_eyeballs_timeout: Option<f64>,
+        resolve: Vec<(String, Vec<String>)>,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
+        fingerprint_pool: bool,
+        fingerprint_pool_size: usize,
+        max_cached_origins: usize,
     ) -> PyResult<Self> {
         if max_connections == 0 {
             return Err(PyRuntimeError::new_err("max_connections必须大于0"));
+        }
+        if fingerprint_pool_size == 0 {
+            return Err(PyRuntimeError::new_err("fingerprint_pool_size必须大于0"));
         }
         let happy_eyeballs_timeout =
             parse_optional_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout)?;
@@ -2226,7 +2556,19 @@ impl NativeSession {
             )));
         }
         shared_runtime()?;
+        let dns_resolver = build_custom_dns_resolver(dns_servers, dns_timeout)?;
+        let dns_overrides = parse_dns_overrides(resolve)?;
         let selected_variant = random_variant(matching.len());
+        let effective_fingerprint_pools = if fingerprint_rotation && fingerprint_pool {
+            fingerprint_pool_size.min(matching.len())
+        } else {
+            1
+        };
+        let client_pool_max_size = max_cached_origins
+            .max(1)
+            .div_ceil(effective_fingerprint_pools)
+            .saturating_mul(2)
+            .max(2);
         let state = Arc::new(SessionState {
             profile: normalized,
             variants: matching
@@ -2236,17 +2578,26 @@ impl NativeSession {
                     session_cache: Arc::new(LruTlsSessionCache::new(8)),
                     client: ArcSwapOption::empty(),
                     client_init: Mutex::new(()),
+                    dns_clients: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
                 })
                 .collect(),
             rotation: fingerprint_rotation,
+            fingerprint_pool,
+            fingerprint_pool_size,
+            fingerprint_pool_members: ArcSwap::from_pointee(Vec::new()),
+            fingerprint_pool_init: Mutex::new(()),
+            max_cached_origins,
+            cached_origins: Mutex::new(HashSet::new()),
+            client_pool_max_size,
             proxy: ArcSwapOption::from(proxy.map(Arc::new)),
             proxy_identity: ArcSwapOption::<String>::from(proxy_identity.map(Arc::new)),
             default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
             happy_eyeballs_timeout,
+            dns_resolver,
+            dns_overrides: Arc::new(dns_overrides),
             cookie_jar: Arc::new(Jar::default()),
-            counter: AtomicUsize::new(0),
             selected_variant: AtomicUsize::new(selected_variant),
             closed: AtomicBool::new(false),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
@@ -2259,9 +2610,24 @@ impl NativeSession {
         self.state.variants.len()
     }
 
+    #[getter]
+    fn fingerprint_pool_count(&self) -> PyResult<usize> {
+        Ok(self.state.fingerprint_pool_members.load().len())
+    }
+
+    #[getter]
+    fn cached_origin_count(&self) -> PyResult<usize> {
+        Ok(self
+            .state
+            .cached_origins
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?
+            .len())
+    }
+
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request(
         &self,
         py: Python<'_>,
@@ -2277,6 +2643,9 @@ impl NativeSession {
         allow_redirects: bool,
         max_redirects: usize,
         transfer_stats: bool,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2287,11 +2656,19 @@ impl NativeSession {
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
-            let client = cached_client(&state, variant)?;
+            let client = selected_request_client(
+                &state,
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )?;
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_request(
@@ -2316,7 +2693,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -2332,6 +2709,9 @@ impl NativeSession {
         allow_redirects: bool,
         max_redirects: usize,
         transfer_stats: bool,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2341,12 +2721,21 @@ impl NativeSession {
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = selected_request_client_async(
+                state.clone(),
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )
+            .await?;
             let permit = acquire_connection_slot(&state).await?;
-            let client = cached_client_async(state, index).await?;
             let response = execute_request(
                 permit,
                 client,
@@ -2391,11 +2780,14 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let cookie_url = websocket_cookie_url(&url)?;
         let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         py.detach(move || {
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
-            let client = cached_client(&state, variant)?;
+            let client =
+                selected_request_client(&state, index, false, Vec::new(), None, cache_route)?;
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             runtime.block_on(execute_websocket(
                 permit,
                 client,
@@ -2432,12 +2824,22 @@ impl NativeSession {
         let state = self.state.clone();
         let cookie_url = websocket_cookie_url(&url)?;
         let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = selected_request_client_async(
+                state.clone(),
+                index,
+                false,
+                Vec::new(),
+                None,
+                cache_route,
+            )
+            .await?;
             let permit = acquire_connection_slot(&state).await?;
-            let client = cached_client_async(state, index).await?;
             execute_websocket(
                 permit,
                 client,
@@ -2456,7 +2858,7 @@ impl NativeSession {
 
     // 流式入口与普通入口使用相同选项，确保两种响应模式语义一致。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream(
         &self,
         py: Python<'_>,
@@ -2471,6 +2873,9 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<NativeStreamResponse> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2480,11 +2885,20 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         py.detach(move || {
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
-            let client = cached_client(&state, variant)?;
+            let client = selected_request_client(
+                &state,
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )?;
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_stream_request(
@@ -2506,7 +2920,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream_async<'py>(
         &self,
         py: Python<'py>,
@@ -2521,6 +2935,9 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2528,13 +2945,23 @@ impl NativeSession {
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&self.state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = selected_request_client_async(
+                state.clone(),
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )
+            .await?;
             let permit = acquire_connection_slot(&state).await?;
-            let client = cached_client_async(state, index).await?;
             execute_stream_request(
                 permit,
                 client,
@@ -2556,7 +2983,7 @@ impl NativeSession {
 
     // multipart文件由Tokio直接流式读取，Python只传路径和元数据。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart(
         &self,
         py: Python<'_>,
@@ -2572,6 +2999,9 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2581,11 +3011,20 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&state, proxy_override, proxy)?;
         let result = py.detach(move || {
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
-            let client = cached_client(&state, variant)?;
+            let client = selected_request_client(
+                &state,
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )?;
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
             runtime.block_on(execute_multipart_request(
@@ -2609,7 +3048,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart_async<'py>(
         &self,
         py: Python<'py>,
@@ -2625,6 +3064,9 @@ impl NativeSession {
         cookies: Option<Vec<(String, String)>>,
         allow_redirects: bool,
         max_redirects: usize,
+        dns_override: bool,
+        dns_servers: Vec<String>,
+        dns_timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -2632,13 +3074,23 @@ impl NativeSession {
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
+        let proxy_url = selected_proxy_url(&self.state, proxy_override, proxy.clone());
+        let cache_route = cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = selected_request_client_async(
+                state.clone(),
+                index,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+            )
+            .await?;
             let permit = acquire_connection_slot(&state).await?;
-            let client = cached_client_async(state, index).await?;
             let response = execute_multipart_request(
                 permit,
                 client,
@@ -2689,7 +3141,20 @@ impl NativeSession {
         // 清空只影响下一次按默认代理发包的懒初始化；正在执行的请求仍持有自己的 Client 快照。
         for variant in &self.state.variants {
             variant.client.store(None);
+            variant
+                .dns_clients
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?
+                .clear();
         }
+        self.state
+            .fingerprint_pool_members
+            .store(Arc::new(Vec::new()));
+        self.state
+            .cached_origins
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?
+            .clear();
         Ok(())
     }
 
@@ -2791,7 +3256,20 @@ impl NativeSession {
         self.state.connection_slots.close();
         for variant in &self.state.variants {
             variant.client.store(None);
+            variant
+                .dns_clients
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?
+                .clear();
         }
+        self.state
+            .fingerprint_pool_members
+            .store(Arc::new(Vec::new()));
+        self.state
+            .cached_origins
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?
+            .clear();
         Ok(())
     }
 }

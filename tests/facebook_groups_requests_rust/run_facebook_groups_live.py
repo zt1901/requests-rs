@@ -28,6 +28,9 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 # home：主页 Set-Cookie 原样带到 GraphQL；fake：同名称、同长度但不用真实 Cookie 值。
 默认Cookie模式 = "fake"
 默认指纹轮换 = False
+默认保留指纹连接池 = True
+默认指纹连接池数量 = 100
+默认缓存Origin数量 = 100
 # 空字符串保持浏览器默认的 gzip, deflate, br, zstd 协商；可传 br、zstd 或 gzip 进行流量对比。
 默认响应压缩协商 = ""
 # ══════════════════════════════════════════════════
@@ -42,6 +45,9 @@ def 解析参数() -> argparse.Namespace:
     parser.add_argument("--fingerprints-path", default=str(默认指纹文件))
     parser.add_argument("--cookie-mode", choices=("home", "fake"), default=默认Cookie模式)
     parser.add_argument("--fingerprint-rotation", action="store_true", default=默认指纹轮换)
+    parser.add_argument("--no-fingerprint-pool", action="store_true", help="轮换时不保存指纹Client和连接池")
+    parser.add_argument("--fingerprint-pool-size", type=int, default=默认指纹连接池数量)
+    parser.add_argument("--max-cached-origins", type=int, default=默认缓存Origin数量)
     parser.add_argument("--transfer-stats", action="store_true", help="启用每请求TLS/TCP传输层计量，显著影响时效")
     parser.add_argument("--accept-encoding", default=默认响应压缩协商, help="覆盖响应压缩协商，例如 br、zstd 或 gzip")
     parser.add_argument("--quiet", action="store_true", help="仅输出抓取与传输汇总，不打印帖子内容")
@@ -62,6 +68,9 @@ async def main() -> None:
         impersonate=args.impersonate,
         cookie_mode=args.cookie_mode,
         fingerprint_rotation=args.fingerprint_rotation,
+        fingerprint_pool=默认保留指纹连接池 and not args.no_fingerprint_pool,
+        fingerprint_pool_size=args.fingerprint_pool_size,
+        max_cached_origins=args.max_cached_origins,
         transfer_stats=args.transfer_stats,
         accept_encoding=args.accept_encoding or None,
     )
@@ -74,6 +83,9 @@ async def main() -> None:
                     "resultsLimit": args.results_limit,
                     "cookieMode": args.cookie_mode,
                     "fingerprintRotation": args.fingerprint_rotation,
+                    "fingerprintPool": 默认保留指纹连接池 and not args.no_fingerprint_pool,
+                    "fingerprintPoolSize": args.fingerprint_pool_size,
+                    "maxCachedOrigins": args.max_cached_origins,
                     "transferStats": args.transfer_stats,
                     "acceptEncoding": args.accept_encoding or "browser-default",
                 },

@@ -480,17 +480,50 @@ class Session:
         fingerprints_path: str | os.PathLike[str] | None = None,
         max_connections: int = 50,
         happy_eyeballs_timeout: float | None = 0.3,
+        resolve: Mapping[str, str | Sequence[str]] | None = None,
+        dns_servers: Sequence[str] | None = None,
+        dns_timeout: float | None = 5.0,
+        fingerprint_pool: bool = True,
+        fingerprint_pool_size: int = 100,
+        max_cached_origins: int = 100,
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
         _validate_timeout("read_timeout", read_timeout, optional=True)
         _validate_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout, optional=True)
+        _validate_timeout("dns_timeout", dns_timeout, optional=True)
         if isinstance(max_connections, bool) or not isinstance(max_connections, int) or max_connections <= 0:
             raise ValueError("max_connections必须是正整数")
+        if not isinstance(fingerprint_pool, bool):
+            raise TypeError("fingerprint_pool必须是bool")
+        if (
+            isinstance(fingerprint_pool_size, bool)
+            or not isinstance(fingerprint_pool_size, int)
+            or fingerprint_pool_size <= 0
+        ):
+            raise ValueError("fingerprint_pool_size必须是正整数")
+        if (
+            isinstance(max_cached_origins, bool)
+            or not isinstance(max_cached_origins, int)
+            or max_cached_origins < 0
+        ):
+            raise ValueError("max_cached_origins必须是非负整数")
         if proxy is not None and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
             raise TypeError("proxies必须是Mapping或None")
+        if resolve is not None and not isinstance(resolve, Mapping):
+            raise TypeError("resolve必须是Mapping或None")
+        native_resolve = []
+        for domain, addresses in (resolve or {}).items():
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            elif not isinstance(addresses, Sequence):
+                raise TypeError("resolve中的IP必须是字符串或字符串序列")
+            native_resolve.append((str(domain), [str(address) for address in addresses]))
+        if isinstance(dns_servers, str):
+            raise TypeError("dns_servers必须是字符串序列，不能是单个字符串")
+        native_dns_servers = [str(server) for server in (dns_servers or [])]
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self.headers = _header_items(headers)
@@ -504,6 +537,12 @@ class Session:
         self.fingerprints_path = fingerprints_path
         self.max_connections = max_connections
         self.happy_eyeballs_timeout = happy_eyeballs_timeout
+        self.resolve = dict(resolve or {})
+        self.dns_servers = tuple(native_dns_servers)
+        self.dns_timeout = dns_timeout
+        self.fingerprint_pool = fingerprint_pool
+        self.fingerprint_pool_size = fingerprint_pool_size
+        self.max_cached_origins = max_cached_origins
         self._native = NativeSession(
             impersonate,
             fingerprint_rotation,
@@ -514,12 +553,26 @@ class Session:
             self.headers,
             max_connections,
             happy_eyeballs_timeout,
+            native_resolve,
+            native_dns_servers,
+            dns_timeout,
+            fingerprint_pool,
+            fingerprint_pool_size,
+            max_cached_origins,
         )
         self.cookies = Cookies(self._native)
 
     @property
     def fingerprint_count(self) -> int:
         return self._native.fingerprint_count
+
+    @property
+    def fingerprint_pool_count(self) -> int:
+        return self._native.fingerprint_pool_count
+
+    @property
+    def cached_origin_count(self) -> int:
+        return self._native.cached_origin_count
 
     def set_proxy(self, proxy: str | None) -> None:
         self._native.set_proxy(proxy)
@@ -697,6 +750,8 @@ class Session:
         allow_redirects: bool = True,
         max_redirects: int = 10,
         transfer_stats: bool = False,
+        dns_servers: Sequence[str] | None = None,
+        dns_timeout: float | None = None,
     ) -> Response:
         if files is not None and json is not None:
             raise ValueError("files不能和json同时使用")
@@ -704,6 +759,15 @@ class Session:
             raise ValueError("transfer_stats暂不支持stream=True")
         if transfer_stats and files is not None:
             raise ValueError("transfer_stats暂不支持multipart请求")
+        if isinstance(dns_servers, str):
+            raise TypeError("dns_servers必须是字符串序列，不能是单个字符串")
+        if dns_timeout is not None and dns_servers is None:
+            raise ValueError("单请求dns_timeout必须和dns_servers同时传入")
+        if dns_timeout is not None:
+            _validate_timeout("dns_timeout", dns_timeout)
+        dns_override = dns_servers is not None
+        native_dns_servers = [str(server) for server in (dns_servers or [])]
+        request_dns_timeout = self.dns_timeout if dns_timeout is None else dns_timeout
         prepared = self._prepare_request(
             method,
             url,
@@ -757,6 +821,9 @@ class Session:
                 request_cookies,
                 allow_redirects,
                 max_redirects,
+                dns_override,
+                native_dns_servers,
+                request_dns_timeout,
             )
             return Response._from_native(result)
         if stream:
@@ -772,6 +839,9 @@ class Session:
                 request_cookies,
                 allow_redirects,
                 max_redirects,
+                dns_override,
+                native_dns_servers,
+                request_dns_timeout,
             )
             history = _build_history(native.history, native.fingerprint_id, native.impersonate)
             return Response(
@@ -797,6 +867,9 @@ class Session:
             allow_redirects,
             max_redirects,
             transfer_stats,
+            dns_override,
+            native_dns_servers,
+            request_dns_timeout,
         )
         return Response._from_native(result)
 
@@ -841,12 +914,22 @@ class AsyncSession:
     def fingerprint_count(self) -> int:
         return self._session.fingerprint_count
 
+    @property
+    def fingerprint_pool_count(self) -> int:
+        return self._session.fingerprint_pool_count
+
+    @property
+    def cached_origin_count(self) -> int:
+        return self._session.cached_origin_count
+
     async def request(self, method: str, url: str, **kwargs: Any) -> Response:
         allow_redirects = kwargs.pop("allow_redirects", True)
         max_redirects = kwargs.pop("max_redirects", 10)
         files = kwargs.pop("files", None)
         stream = kwargs.pop("stream", False)
         transfer_stats = kwargs.pop("transfer_stats", False)
+        dns_servers = kwargs.pop("dns_servers", None)
+        dns_timeout = kwargs.pop("dns_timeout", None)
         data = kwargs.pop("data", None)
         json = kwargs.pop("json", None)
         if files is not None and json is not None:
@@ -855,6 +938,15 @@ class AsyncSession:
             raise ValueError("transfer_stats暂不支持stream=True")
         if transfer_stats and files is not None:
             raise ValueError("transfer_stats暂不支持multipart请求")
+        if isinstance(dns_servers, str):
+            raise TypeError("dns_servers必须是字符串序列，不能是单个字符串")
+        if dns_timeout is not None and dns_servers is None:
+            raise ValueError("单请求dns_timeout必须和dns_servers同时传入")
+        if dns_timeout is not None:
+            _validate_timeout("dns_timeout", dns_timeout)
+        dns_override = dns_servers is not None
+        native_dns_servers = [str(server) for server in (dns_servers or [])]
+        request_dns_timeout = self._session.dns_timeout if dns_timeout is None else dns_timeout
         prepared = self._session._prepare_request(
             method,
             url,
@@ -901,6 +993,9 @@ class AsyncSession:
                 request_cookies,
                 allow_redirects,
                 max_redirects,
+                dns_override,
+                native_dns_servers,
+                request_dns_timeout,
             )
             return _response_from_native(result)
         if stream:
@@ -908,6 +1003,9 @@ class AsyncSession:
                 *prepared,
                 allow_redirects,
                 max_redirects,
+                dns_override,
+                native_dns_servers,
+                request_dns_timeout,
             )
             return _response_from_stream(native)
         result = await self._session._native.request_async(
@@ -915,6 +1013,9 @@ class AsyncSession:
             allow_redirects,
             max_redirects,
             transfer_stats,
+            dns_override,
+            native_dns_servers,
+            request_dns_timeout,
         )
         return _response_from_native(result)
 

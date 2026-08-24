@@ -53,6 +53,12 @@ Session(
     fingerprints_path: str | None = None,
     max_connections: int = 50,
     happy_eyeballs_timeout: float | None = 0.3,
+    resolve: Mapping[str, str | Sequence[str]] | None = None,
+    dns_servers: Sequence[str] | None = None,
+    dns_timeout: float | None = 5.0,
+    fingerprint_pool: bool = True,
+    fingerprint_pool_size: int = 100,
+    max_cached_origins: int = 100,
 )
 ```
 
@@ -61,6 +67,20 @@ Session(
 `impersonate`也可直接传上述指纹JSON路径。该快捷形式要求文件中只有一个profile，但允许该profile包含多个变体；Session自动识别profile，不需要再传`fingerprints_path`。若文件中混有多个profile，或同时传入两种路径参数，构造时会直接报错，避免选错浏览器指纹。
 
 `max_connections`是Session内HTTP、HTTPS、HTTP代理、SOCKS5、流和WebSocket共同使用的Rust/Tokio原生上限。`happy_eyeballs_timeout`默认0.3秒；双栈域名首选地址族未及时连接时，Rust连接器并行尝试另一个地址族，设为`None`可关闭该回退。
+
+`fingerprint_pool=True`启用自然惰性指纹Client缓存；`fingerprint_pool_size`默认100，池未满时随机引入尚未入池的有效指纹，满后只在已有集合内随机，不淘汰、不新增。关闭时每次请求使用临时Client。`max_cached_origins`默认100，按Origin和完整代理身份哈希限制可保存连接的路由数；query、params和path不增加名额，超限路由仍请求但不缓存。Session关闭和`set_proxy()`会释放/清空全部相关Client与路由状态。
+
+当前chrome142文件有21条原始记录，其中7条含TLS扩展41，属于已恢复握手记录，不能独立用于首次连接；Rust过滤后`fingerprint_count=14`。自然轮换前14次随机无重复引入全部14个有效池，第15次起随机复用这些池。
+
+Facebook真实60帖对比：轮换且不保池平均3.367秒/页、1次重试；轮换且保池平均2.670秒/页、0次重试，约快20.7%。前14个有效指纹完成自然建池后，后续页时延从约2.5至3.9秒下降到约1.6至2.3秒。固定单指纹30帖平均1.844秒/页，短链路仍是最快模式。
+
+历史同口径`benchmark_proxy_rust_vs_curl_cffi.py`在fat LTO最终成品重跑1万请求、10 Worker、本地HTTPS+CONNECT代理：requests_rust 265.03请求/秒、P50 5.82ms、P95 206.63ms、RSS峰值增量29.34MB、CPU 5.80ms/请求；curl_cffi 32.98请求/秒、P50 305.65ms、P95 506.52ms、RSS峰值增量4.06MB、CPU 31.30ms/请求。Rust相对吞吐约8.04倍，但RSS仍更高。旧记录为3412/909请求每秒，当前rnet也从3387降至399，说明本机基准后端/代理环境整体比旧测试慢约一个数量级，绝对数字不能跨环境横比。热路径优化前同轮Rust为258.33请求/秒、P50 6.08ms、P95 226.58ms、RSS 31.00MB；优化后吞吐提升约2.6%、P95下降约8.8%、RSS下降约5.4%。
+
+`resolve`提供Session级静态域名到IPv4/IPv6覆盖；连接IP改变但URL、Host、TLS SNI和证书域名保持不变。`dns_servers`接入Rust Hickory resolver，支持IP或IP:端口、A/AAAA、TTL缓存、UDP和TCP回退；`dns_timeout`控制单次查询。未指定时继续使用系统getaddrinfo。
+
+日常DNS配置只推荐`AsyncSession(dns_servers=[...])`。普通请求也支持`await session.get(url, dns_servers=[...], dns_timeout=...)`请求级覆盖；相同配置使用每指纹变体8项LRU Rust Client缓存，Session关闭或默认代理切换时清空。`resolve`只用于HTTPS/WSS固定连接IP但保持原域名SNI、证书和Host的高级场景，不要把它写成常规DNS服务器入口。
+
+DNS并发基准固定使用1000个独立`get()`任务一次性起跑并设置`max_connections=1000`，不增加Worker限流层。当前Windows本机冷启动1000条HTTP/1 TCP连接时，回显服务和Socket容量会拒绝大量连接：系统DNS/直接IP成功114、Session DNS成功132、单get DNS成功116，峰值RSS约50至71MB、线程51至54。三组成功量级接近，失败主要来自本机1000连接冷启动容量而非DNS覆盖。历史文档中的10k级本地吞吐当前无法复现；相同旧资源脚本当前约356请求/秒，旧绝对数字继续视为证伪，不可作为性能承诺。
 
 profile 默认 Header 只在调用方没有传同名 Header 时兜底。浏览器 Copy as cURL 或业务代码传入的所有 Header，包括 `User-Agent` 与 `sec-ch-ua*`，均原样优先，库不接管或替换。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化；调用方应按实际请求传入。
 
@@ -264,6 +284,8 @@ session.get(url, cookies={"token": "request-only"})
 Session默认代理在设置时解析一次。单请求代理只影响该请求。Cookie Jar在一个Session的所有指纹变体间共享。`cookies=`按curl_cffi语义与Session Jar合并：本次同名值覆盖Session值，未同名Session Cookie保留，响应 `Set-Cookie`仍写回Jar；同时存在手写 `Cookie` Header时以 `cookies=`合并结果为准。
 
 代理URL支持`http://`、`socks5://`和`socks5h://`。HTTP/HTTPS CONNECT首包直接携带Basic认证；SOCKS5在同一TCP连接内协商并发送用户名密码。`socks5://`本地解析目标域名，`socks5h://`把域名交给代理。代理字符串中的协议仍表示代理协议，WebSocket目标使用`ws://`或`wss://`，HTTP代理不能为了“更快”改写成`ws://`。
+
+代理服务器自身的域名始终可由`resolve`或`dns_servers`控制。`socks5://`最终目标也使用本机指定DNS；`socks5h://`和HTTP代理最终目标按协议由代理解析。HTTP CONNECT目标本机解析与原始SNI/证书/Host分离尚未公开，禁止通过IP URL或`verify=False`伪实现。
 
 ## 400并发动态请求
 

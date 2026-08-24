@@ -70,12 +70,15 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
 - HTTP/1.1、HTTP/2、重定向、总超时与 Body 读取超时
 - IPv4、IPv6 和 RFC 6555 Happy Eyeballs
+- Session级静态`resolve`映射和Rust Hickory自定义DNS服务器
 - 固定 profile 或按请求轮换 profile
 - Session Cookie Jar、每请求 Cookie 覆盖、重复 Header 保序
 - Session 默认代理和每请求代理覆盖
 - `ws://`、`wss://` 同步/异步 WebSocket，支持 HTTP CONNECT 预认证与 SOCKS5 认证
 - `http://`、`socks5://`、`socks5h://` 代理，按完整代理身份隔离连接池
 - Session 级 Rust 原生 `max_connections`，允许 HTTP、SOCKS5 和 WebSocket 混合占用
+- 自然随机指纹池：默认最多100个指纹，池满后只复用已有池，不进行淘汰抖动
+- `max_cached_origins`限制可保留连接的Origin与代理身份组合，query/params/path不额外计数
 - 同步/异步流式响应与 Rust Tokio multipart 文件流
 
 ## 限制
