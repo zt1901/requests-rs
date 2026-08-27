@@ -66,6 +66,13 @@ def 发送帧(stream, opcode: int, payload: bytes = b"") -> None:
     stream.flush()
 
 
+def 发送掩码服务端帧(stream, opcode: int, payload: bytes) -> None:
+    mask = b"\x01\x02\x03\x04"
+    encoded = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    stream.write(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + encoded)
+    stream.flush()
+
+
 def 双向转发(client: socket.socket, upstream: socket.socket) -> None:
     client.setblocking(False)
     upstream.setblocking(False)
@@ -154,6 +161,19 @@ class WebSocket处理器(socketserver.StreamRequestHandler):
         self.wfile.write((response + "\r\n").encode())
         self.wfile.flush()
         发送帧(self.wfile, 1, b"welcome")
+        if "/burst" in request_line:
+            for index in range(300):
+                发送帧(self.wfile, 1, f"burst-{index}".encode())
+            return
+        if "/large-message" in request_line:
+            发送帧(self.wfile, 2, b"L" * (2 * 1024 * 1024))
+            return
+        if "/invalid-utf8" in request_line:
+            发送帧(self.wfile, 1, b"\xff")
+            return
+        if "/masked-server" in request_line:
+            发送掩码服务端帧(self.wfile, 1, b"masked")
+            return
 
         while True:
             opcode, payload = 读取帧(self.rfile)
@@ -524,6 +544,7 @@ async def 测试连接槽位生命周期(ws_url: str) -> None:
         websocket = await session.websocket(ws_url)
         断言消息(await websocket.recv(), "text", "welcome")
         close_task = asyncio.create_task(websocket.close())
+        await asyncio.sleep(0)
         close_task.cancel()
         try:
             await close_task
@@ -552,6 +573,64 @@ async def 测试连接槽位生命周期(ws_url: str) -> None:
     else:
         raise AssertionError("Session关闭后等待连接槽位的请求没有失败")
     await websocket.close()
+
+
+async def 测试接收队列溢出(ws_url: str) -> None:
+    from requests_rust import AsyncSession
+
+    async with AsyncSession(impersonate=测试版本) as session:
+        websocket = await session.websocket(ws_url + "/burst")
+        断言消息(await websocket.recv(), "text", "welcome")
+        await asyncio.sleep(0.2)
+        received = 0
+        try:
+            while await websocket.recv() is not None:
+                received += 1
+        except RuntimeError as error:
+            assert "接收队列超过256条" in str(error)
+        else:
+            raise AssertionError("WebSocket接收队列溢出被静默处理")
+        assert received <= 256
+
+    async with AsyncSession(impersonate=测试版本, max_connections=1) as session:
+        websocket = await session.websocket(ws_url + "/burst")
+        断言消息(await websocket.recv(), "text", "welcome")
+        for _ in range(100):
+            if websocket.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert websocket.closed
+        response = await asyncio.wait_for(session.get(ws_url.replace("ws://", "http://")), 2)
+        assert response.content == b"mixed-http-ok"
+
+    async with AsyncSession(
+        impersonate=测试版本,
+        max_websocket_message_bytes=1024 * 1024,
+    ) as session:
+        websocket = await session.websocket(ws_url + "/large-message")
+        断言消息(await websocket.recv(), "text", "welcome")
+        try:
+            await websocket.recv()
+        except RuntimeError as error:
+            assert "size" in str(error).lower() or "message" in str(error).lower()
+        else:
+            raise AssertionError("超出max_websocket_message_bytes的消息没有被拒绝")
+
+    for path in ("/invalid-utf8", "/masked-server"):
+        async with AsyncSession(impersonate=测试版本, max_connections=1) as session:
+            websocket = await session.websocket(ws_url + path)
+            断言消息(await websocket.recv(), "text", "welcome")
+            try:
+                await websocket.recv()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"非法WebSocket帧没有被拒绝: {path}")
+            response = await asyncio.wait_for(
+                session.get(ws_url.replace("ws://", "http://")),
+                2,
+            )
+            assert response.content == b"mixed-http-ok"
 
 
 async def 测试并发流读取不释放槽位(
@@ -749,6 +828,7 @@ def main() -> None:
             )
         )
         asyncio.run(测试连接槽位生命周期(ws_url))
+        asyncio.run(测试接收队列溢出(ws_url))
         asyncio.run(
             测试并发流读取不释放槽位(
                 f"http://127.0.0.1:{slow_stream_server.server_address[1]}/slow-stream",

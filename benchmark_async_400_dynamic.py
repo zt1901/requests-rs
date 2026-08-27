@@ -96,6 +96,7 @@ async def main():
             async with AsyncSession(
                 impersonate=测试版本,
                 fingerprint_rotation=fingerprint_rotation,
+                max_connections=并发数,
             ) as session:
                 await session.get(
                 "http://dynamic.test/warmup",

@@ -227,7 +227,13 @@ def main() -> None:
             断言Rust后端响应(session.get(target_url + "?sync=direct", proxy=None))
 
         with Session(impersonate=测试指纹版本, proxies={"https": proxy_a}, verify=False) as session:
+            handler_a.清空记录()
+            handler_b.清空记录()
             断言Rust后端响应(session.get(target_url + "?sync=session_proxies"))
+            assert handler_a.命中次数() == 1
+            session.set_proxy(proxy_b)
+            断言Rust后端响应(session.get(target_url + "?sync=session_proxies_set_proxy"))
+            assert handler_b.命中次数() == 1
         断言Rust后端响应(get(target_url + "?sync=shortcut_proxy", impersonate=测试指纹版本, proxy=proxy_b, verify=False))
         断言Rust后端响应(get(target_url + "?sync=shortcut_proxies", impersonate=测试指纹版本, proxies={"https": proxy_a}, verify=False))
 

@@ -1409,6 +1409,7 @@ dependencies = [
  "http",
  "http2",
  "lru",
+ "once_cell",
  "pyo3",
  "pyo3-async-runtimes",
  "rand 0.9.5",

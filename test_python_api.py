@@ -100,6 +100,7 @@ class 目标处理器(静默处理器):
                 "upgrade_insecure_requests": self.headers.get("Upgrade-Insecure-Requests", ""),
                 "priority": self.headers.get("Priority", ""),
                 "runtime_default": self.headers.get("X-Runtime-Default", ""),
+                "cookie": self.headers.get("Cookie", ""),
             }
         ).encode()
         self.send_response(200)
@@ -207,7 +208,17 @@ def 创建代理处理器(name):
 
 
 def main():
-    from requests_rust import AsyncSession, Session, get
+    from requests_rust import AsyncSession, Response, Session, get
+
+    quoted_charset = Response(
+        status_code=200,
+        headers=[("Content-Type", 'text/plain; charset="utf-8"')],
+        content="中文".encode(),
+        url="https://example.com/",
+        fingerprint_id="test",
+        impersonate="chrome146",
+    )
+    assert quoted_charset.text == "中文"
 
     target = 启动服务(目标处理器)
     proxy_a_handler = 创建代理处理器("A")
@@ -278,6 +289,12 @@ def main():
                 proxy=None,
             ).json()["path"]
             assert tuple_query == "/query?bool=True&number=7&tuple=x%2Fy&tuple=raw+bytes", tuple_query
+            binary_query = session.get(
+                target_url + "/query",
+                params={"raw": b"\xff"},
+                proxy=None,
+            ).json()["path"]
+            assert binary_query == "/query?raw=%FF", binary_query
             form = session.post(
                 target_url + "/echo-form",
                 data={"tag": ["A B", "中文"], "empty": "", "none": None, "raw": b"raw bytes"},
@@ -287,6 +304,31 @@ def main():
                 "content_type": "application/x-www-form-urlencoded",
                 "body": "tag=A+B&tag=%E4%B8%AD%E6%96%87&empty=&none=None&raw=raw+bytes",
             }, form
+            binary_form = session.post(
+                target_url + "/echo-form",
+                data={"raw": b"\xff"},
+                proxy=None,
+            ).json()
+            assert binary_form["body"] == "raw=%FF", binary_form
+            try:
+                session.post(target_url + "/echo-json", data={"a": 1}, json={"b": 2})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("data与json同时传入没有被拒绝")
+            try:
+                session.post(target_url + "/echo-json", json={"value": float("nan")})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("非标准JSON NaN没有被拒绝")
+
+            session.cookies.set("foreign", "secret", url="https://other.invalid/")
+            filtered_cookie = session.get(
+                target_url + "/headers",
+                cookies=session.cookies,
+            ).json()["cookie"]
+            assert "foreign=secret" not in filtered_cookie, filtered_cookie
             encoded_json = session.post(
                 target_url + "/echo-json",
                 json={"text": "中文", "items": [True, None, 7], "nested": {"space": "A B"}},
@@ -429,6 +471,10 @@ def main():
                 assert uploaded["has_file_content"]
             finally:
                 Path(upload_path).unlink(missing_ok=True)
+
+        with Session(impersonate=测试版本, cookie_store=False) as no_cookie_store:
+            no_cookie_store.get(target_url + "/headers")
+            assert no_cookie_store.cookies.get_all() == []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             # 从内置指纹中按版本拆成两个互不相同的实例文件，验证按实例独立加载
@@ -593,12 +639,25 @@ def main():
                     body.extend(chunk)
                 assert bytes(body) == b"firstsecondthird"
 
+                blocked = await session.get(target_url + "/stream", stream=True)
+                try:
+                    _ = blocked.content
+                except RuntimeError as error:
+                    assert "aread" in str(error)
+                else:
+                    raise AssertionError("异步stream同步content没有被拒绝")
+                assert await blocked.aread() == b"firstsecondthird"
+
                 closing = await session.get(target_url + "/slow", stream=True)
                 pending_read = asyncio.ensure_future(closing._stream.read_async(4))
                 await asyncio.sleep(0.05)
-                started = time.perf_counter()
-                closing.close()
-                assert time.perf_counter() - started < 0.05
+                try:
+                    closing.close()
+                except RuntimeError as error:
+                    assert "aclose" in str(error)
+                else:
+                    raise AssertionError("异步stream同步close没有被拒绝")
+                await closing.aclose()
                 assert await asyncio.wait_for(pending_read, 0.2) == b""
 
                 async_closing = await session.get(target_url + "/slow", stream=True)
@@ -695,7 +754,7 @@ def main():
                     raise AssertionError("异步流读取任务没有被取消")
                 await asyncio.sleep(0.05)
                 assert await asyncio.wait_for(cancelled._stream.read_async(4), 1) == b"abcd"
-                cancelled.close()
+                await cancelled.aclose()
 
                 concurrent = await session.get(target_url + "/slow", stream=True)
                 first_read = asyncio.ensure_future(concurrent._stream.read_async(4))

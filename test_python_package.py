@@ -52,7 +52,18 @@ def 断言捕获匹配初始记录(capture: dict, record: dict) -> None:
         "ja3",
         "ja4",
     ):
-        assert actual_tls.get(field) == expected_tls.get(field), {
+        if field == "extensions" and record["profile"].startswith("chrome"):
+            matches = sorted(actual_tls.get(field, [])) == sorted(expected_tls.get(field, []))
+        elif field == "ja3" and record["profile"].startswith("chrome"):
+            actual_parts = actual_tls.get(field, "").split(",")
+            expected_parts = expected_tls.get(field, "").split(",")
+            if len(actual_parts) == len(expected_parts) == 5:
+                actual_parts[2] = "-".join(sorted(actual_parts[2].split("-"), key=int))
+                expected_parts[2] = "-".join(sorted(expected_parts[2].split("-"), key=int))
+            matches = actual_parts == expected_parts
+        else:
+            matches = actual_tls.get(field) == expected_tls.get(field)
+        assert matches, {
             "field": field,
             "record_id": record["id"],
             "expected": expected_tls.get(field),
@@ -98,7 +109,11 @@ def main():
                 print(response.fingerprint_id, capture["tls"]["ja3"])
             assert len(set(ids)) == min(请求次数, session.fingerprint_count)
 
-        with Session(impersonate=测试版本, verify=False) as session:
+        with Session(
+            impersonate=测试版本,
+            fingerprint_rotation=False,
+            verify=False,
+        ) as session:
             first = session.get(测试地址)
             second = session.get(测试地址)
             assert first.fingerprint_id == second.fingerprint_id

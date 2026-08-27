@@ -23,6 +23,7 @@ def 读取DNS名称(packet: bytes, offset: int = 12) -> tuple[str, int]:
 
 class DNS状态:
     查询名称: list[str] = []
+    TCP查询名称: list[str] = []
     锁 = threading.Lock()
 
 
@@ -45,7 +46,13 @@ def 构造DNS响应(packet: bytes) -> bytes:
 class UDPDNS处理器(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         data, sock = self.request
-        sock.sendto(构造DNS响应(data), self.client_address)
+        name, offset = 读取DNS名称(data)
+        if name == "tcp-fallback.test":
+            question = data[12 : offset + 4]
+            response = data[:2] + struct.pack("!HHHHH", 0x8380, 1, 0, 0, 0) + question
+        else:
+            response = 构造DNS响应(data)
+        sock.sendto(response, self.client_address)
 
 
 class TCPDNS处理器(socketserver.StreamRequestHandler):
@@ -54,6 +61,9 @@ class TCPDNS处理器(socketserver.StreamRequestHandler):
         if len(length_data) != 2:
             return
         packet = self.rfile.read(struct.unpack("!H", length_data)[0])
+        name, _offset = 读取DNS名称(packet)
+        with DNS状态.锁:
+            DNS状态.TCP查询名称.append(name)
         response = 构造DNS响应(packet)
         self.wfile.write(struct.pack("!H", len(response)) + response)
 
@@ -162,6 +172,8 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
             proxy=f"socks5h://socks-proxy.test:{socks_port}",
         )
         assert remote_socks.content == b"dns-ok"
+        fallback = await session.get(f"http://tcp-fallback.test:{http_port}/")
+        assert fallback.content == b"dns-ok"
 
     async with AsyncSession(
         impersonate=测试版本,
@@ -187,13 +199,59 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
         else:
             raise AssertionError("请求级DNS覆盖污染了Session默认DNS")
 
+    session = AsyncSession(
+        impersonate=测试版本,
+        max_connections=20,
+        max_cached_origins=20,
+    )
+    try:
+        for index in range(9):
+            response = await session.get(
+                f"http://dns-lru-{index}.test:{http_port}/",
+                dns_servers=[dns_server, f"127.0.0.1:{20000 + index}"],
+                dns_timeout=2,
+            )
+            assert response.content == b"dns-ok"
+        assert session.request_dns_client_count == 8
+        responses = await asyncio.gather(
+            *(
+                session.get(
+                    f"http://dns-lru-concurrent.test:{http_port}/{index}",
+                    dns_servers=[dns_server, "127.0.0.1:29999"],
+                    dns_timeout=2,
+                )
+                for index in range(100)
+            )
+        )
+        assert all(response.content == b"dns-ok" for response in responses)
+        assert session.request_dns_client_count == 8
+    finally:
+        await session.close()
+    assert session.request_dns_client_count == 0
+
+    equivalent = AsyncSession(impersonate=测试版本)
+    try:
+        for server in (["127.0.0.1"], ["127.0.0.1:53"]):
+            try:
+                await equivalent.get(
+                    "http://equivalent-dns.test/",
+                    dns_servers=server,
+                    dns_timeout=0.1,
+                    timeout=1,
+                )
+            except RuntimeError:
+                pass
+        assert equivalent.request_dns_client_count == 1
+    finally:
+        await equivalent.close()
+
 
 def main() -> None:
     from requests_rust import Session
 
-    udp_dns = 线程UDP服务(("127.0.0.1", 0), UDPDNS处理器)
-    dns_port = udp_dns.server_address[1]
-    tcp_dns = 线程TCP服务(("127.0.0.1", dns_port), TCPDNS处理器)
+    tcp_dns = 线程TCP服务(("127.0.0.1", 0), TCPDNS处理器)
+    dns_port = tcp_dns.server_address[1]
+    udp_dns = 线程UDP服务(("127.0.0.1", dns_port), UDPDNS处理器)
     http_server = 线程TCP服务(("127.0.0.1", 0), HTTP处理器)
     proxy_handler = type("HTTP代理处理器", (HTTP处理器,), {"请求行": [], "锁": threading.Lock()})
     proxy_server = 线程TCP服务(("127.0.0.1", 0), proxy_handler)
@@ -227,6 +285,7 @@ def main() -> None:
         } <= queried
         assert "proxy-target.test" not in queried
         assert "remote-target.test" not in queried
+        assert "tcp-fallback.test" in DNS状态.TCP查询名称
         assert proxy_handler.请求行 == ["GET http://proxy-target.test/resource HTTP/1.1"]
         assert (1, "127.0.0.1", http_server.server_address[1]) in socks_handler.目标记录
         assert (3, "remote-target.test", http_server.server_address[1]) in socks_handler.目标记录

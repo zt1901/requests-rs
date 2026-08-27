@@ -4,6 +4,7 @@ import asyncio
 import base64
 import ctypes
 import json
+import math
 import os
 import random
 import select
@@ -344,9 +345,9 @@ async def 运行一轮(name: str, total: int, target_url: str, proxy_url: str) -
         "success": successes,
         "failure": failures,
         "success_rate": successes / total * 100,
-        "throughput_rps": total / elapsed,
+        "throughput_rps": success / elapsed,
         "p50_ms": statistics.median(latencies) * 1000,
-        "p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] * 1000,
+        "p95_ms": latencies[math.ceil(len(latencies) * 0.95) - 1] * 1000,
         "peak_rss_delta_mb": (metrics["peak_rss"] - initial_rss) / 1024 / 1024,
         "end_rss_delta_mb": rss_delta / 1024 / 1024,
         "peak_threads": int(metrics["peak_threads"]),
@@ -379,7 +380,13 @@ async def main() -> None:
     if not 是管理员():
         # 自动化预检环境无法接受 UAC 时仅跳过 SYN 附加抓包；右键正常运行会自提权并保留完整抓包。
         environment["FINGERPRINT_DISABLE_TCP_CAPTURE"] = "1"
-    backend = subprocess.Popen([str(executable)], cwd=Rust后端目录, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    backend = subprocess.Popen(
+        [str(executable)],
+        cwd=Rust后端目录,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
     proxy = ThreadingHTTPServer(("127.0.0.1", 0), IPIPGO本地代理)
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
     proxy_url = f"http://{代理用户名}:{代理密码}@127.0.0.1:{proxy.server_port}"

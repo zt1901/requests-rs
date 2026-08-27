@@ -20,7 +20,7 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 
 # ══════════════════ 【可调参数】 ══════════════════
 # 从浏览器打开的 Facebook 群组页面复制；需要登录时填写浏览器当前 Cookie 与请求 Header。
-默认群组链接 = ["https://www.facebook.com/groups/python/"]
+默认群组链接 = ["https://www.facebook.com/groups/1004276887930426/"]
 默认帖子数量 = 30
 默认指纹版本 = "chrome142"
 默认指纹文件 = 项目目录 / "fingerprints.json"
@@ -30,7 +30,7 @@ from tests.facebook_groups_requests_rust.crawler import 默认代理  # noqa: E4
 默认指纹轮换 = False
 默认保留指纹连接池 = True
 默认指纹连接池数量 = 100
-默认缓存Origin数量 = 100
+默认缓存Origin数量 = 4
 # 空字符串保持浏览器默认的 gzip, deflate, br, zstd 协商；可传 br、zstd 或 gzip 进行流量对比。
 默认响应压缩协商 = ""
 # ══════════════════════════════════════════════════

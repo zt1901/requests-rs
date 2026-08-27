@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use brotli::{CompressorWriter as BrotliEncoder, Decompressor as BrotliDecoder};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use futures_util::{Stream, StreamExt};
 use hickory_resolver::{
@@ -25,6 +25,7 @@ use hickory_resolver::{
     net::runtime::TokioRuntimeProvider,
 };
 use lru::LruCache;
+use once_cell::sync::OnceCell;
 use pyo3::{
     exceptions::PyRuntimeError,
     ffi::c_str,
@@ -98,6 +99,7 @@ type RawNativeResponse = (
     String,
     String,
     String,
+    String,
     Vec<NativeHistoryEntry>,
     Option<NativeTransferCounters>,
 );
@@ -110,7 +112,26 @@ struct TransferCounters {
 struct TransferMeter {
     proxy: Proxy,
     counters: NativeTransferCounters,
-    _completed: tokio::task::JoinHandle<()>,
+    completed: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TransferMeter {
+    async fn finish(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            // 响应Body已经完整读完，计数字节已穿过meter；主动结束隧道，避免连接池保活阻塞等待。
+            tokio::task::yield_now().await;
+            completed.abort();
+            let _ = completed.await;
+        }
+    }
+}
+
+impl Drop for TransferMeter {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            completed.abort();
+        }
+    }
 }
 
 #[pyclass]
@@ -162,6 +183,8 @@ struct NativeResponse {
     fingerprint_id: String,
     #[pyo3(get)]
     impersonate: String,
+    #[pyo3(get)]
+    http_version: String,
     #[pyo3(get)]
     transfer_stats: Option<Py<NativeTransferStats>>,
     history: Vec<NativeHistoryEntry>,
@@ -522,7 +545,7 @@ fn extension_type(id: u16) -> Option<ExtensionType> {
     })
 }
 
-fn build_tls(capture: &TlsCapture) -> Result<TlsOptions> {
+fn build_tls(capture: &TlsCapture, permute_extensions: bool) -> Result<TlsOptions> {
     let cipher_names: Vec<_> = capture
         .cipher_suites
         .iter()
@@ -561,7 +584,7 @@ fn build_tls(capture: &TlsCapture) -> Result<TlsOptions> {
         .enable_signed_cert_timestamps(capture.has_signed_certificate_timestamp)
         .enable_ech_grease(capture.has_ech)
         .grease_enabled(capture.uses_grease)
-        .permute_extensions(false)
+        .permute_extensions(permute_extensions)
         .preserve_tls13_cipher_list(true)
         .aes_hw_override(true)
         .record_size_limit(capture.record_size_limit);
@@ -595,13 +618,15 @@ fn build_tls(capture: &TlsCapture) -> Result<TlsOptions> {
     if !compressors.is_empty() {
         builder = builder.certificate_compressors(compressors);
     }
-    let extension_order: Vec<_> = capture
-        .extensions
-        .iter()
-        .filter_map(|id| extension_type(*id))
-        .collect();
-    if !extension_order.is_empty() {
-        builder = builder.extension_permutation(extension_order);
+    if !permute_extensions {
+        let extension_order: Vec<_> = capture
+            .extensions
+            .iter()
+            .filter_map(|id| extension_type(*id))
+            .collect();
+        if !extension_order.is_empty() {
+            builder = builder.extension_permutation(extension_order);
+        }
     }
     if capture.extensions.contains(&17613) || capture.extensions.contains(&17513) {
         builder = builder
@@ -720,8 +745,7 @@ fn build_http2(capture: &HttpCapture) -> Http2Options {
 }
 
 fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
-    // 这些字段取决于当前请求类型、发起页面和调度优先级；采集自一次顶层导航，
-    // 不能作为所有 API、资源或跨站请求的固定浏览器默认值发送。
+    // 请求类型、来源和优先级相关字段不能固定到所有请求；主页导航和XHR应由业务层分别传入。
     let ignored = [
         "host",
         "content-length",
@@ -757,7 +781,10 @@ fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
 fn build_emulation(record: &Record) -> Result<Emulation> {
     let (headers, original) = build_headers(&record.http)?;
     let mut builder = Emulation::builder()
-        .tls_options(build_tls(&record.tls)?)
+        .tls_options(build_tls(
+            &record.tls,
+            record.profile.to_ascii_lowercase().starts_with("chrome"),
+        )?)
         .headers(headers)
         .orig_headers(original);
     if record.http.protocol == "HTTP/2" {
@@ -773,7 +800,17 @@ struct Variant {
     client: ArcSwapOption<Client>,
     client_init: Mutex<()>,
     // 请求级DNS配置按指纹变体隔离并有界复用，避免热路径重复构建Client和Resolver。
-    dns_clients: Mutex<LruCache<String, Client>>,
+    dns_clients: Mutex<LruCache<String, Arc<OnceCell<Client>>>>,
+}
+
+struct DefaultProxy {
+    identity: String,
+    proxy: Proxy,
+}
+
+struct CachedOriginState {
+    pending: usize,
+    committed: bool,
 }
 
 struct SessionState {
@@ -786,14 +823,13 @@ struct SessionState {
     fingerprint_pool_members: ArcSwap<Vec<usize>>,
     fingerprint_pool_init: Mutex<()>,
     max_cached_origins: usize,
-    cached_origins: Mutex<HashSet<String>>,
+    cached_origins: Mutex<HashMap<String, CachedOriginState>>,
     client_pool_max_size: usize,
     // 固定模式下当前代理会话绑定的指纹变体；切换代理会话时重新随机选择。
     selected_variant: AtomicUsize,
-    // 默认代理由set_proxy原子替换，请求仅加载快照，不阻塞其他并发请求。
-    proxy: ArcSwapOption<Proxy>,
-    // 仅用于识别代理会话是否从 A 切换到 B，不参与实际代理连接。
-    proxy_identity: ArcSwapOption<String>,
+    // 默认代理URL身份和Proxy对象必须来自同一原子快照。
+    default_proxy: ArcSwapOption<DefaultProxy>,
+    proxy_generation: AtomicU64,
     // Session默认请求头构造期预解析，普通请求只合并请求级增量头。
     default_headers: ArcSwap<HeaderMap>,
     verify: bool,
@@ -802,8 +838,11 @@ struct SessionState {
     dns_resolver: Option<CustomDnsResolver>,
     dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
     cookie_jar: Arc<Jar>,
+    cookie_store: bool,
     closed: AtomicBool,
     connection_slots: Arc<Semaphore>,
+    max_response_bytes: usize,
+    max_websocket_message_bytes: usize,
 }
 
 async fn acquire_connection_slot(state: &Arc<SessionState>) -> PyResult<OwnedSemaphorePermit> {
@@ -840,11 +879,13 @@ fn build_client_with_dns(
         // 浏览器按当前请求目标的域名发送SNI，不能由采集记录某次请求是否带SNI决定。
         .tls_sni(true)
         .tls_session_cache(variant.session_cache.clone())
-        .cookie_provider(state.cookie_jar.clone())
         .tcp_happy_eyeballs_timeout(state.happy_eyeballs_timeout)
         .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(2)
+        .pool_max_idle_per_host(state.client_pool_max_size)
         .pool_max_size(state.client_pool_max_size);
+    if state.cookie_store {
+        builder = builder.cookie_provider(state.cookie_jar.clone());
+    }
     let resolver = if dns_override {
         dns_resolver
     } else {
@@ -885,9 +926,9 @@ fn cache_route_allowed(
     state: &SessionState,
     url: &str,
     proxy_identity: Option<&str>,
-) -> PyResult<bool> {
+) -> PyResult<(bool, Option<String>)> {
     if state.max_cached_origins == 0 {
-        return Ok(false);
+        return Ok((false, None));
     }
     let uri = url.parse::<Uri>().map_err(to_py_error)?;
     let scheme = uri.scheme_str().unwrap_or("http");
@@ -918,14 +959,59 @@ fn cache_route_allowed(
         .cached_origins
         .lock()
         .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?;
-    if cached.contains(&route) {
-        return Ok(true);
+    if let Some(state) = cached.get_mut(&route) {
+        if state.committed {
+            return Ok((true, None));
+        }
+        state.pending += 1;
+        return Ok((true, Some(route)));
     }
     if cached.len() >= state.max_cached_origins {
-        return Ok(false);
+        return Ok((false, None));
     }
-    cached.insert(route);
-    Ok(true)
+    cached.insert(
+        route.clone(),
+        CachedOriginState {
+            pending: 1,
+            committed: false,
+        },
+    );
+    Ok((true, Some(route)))
+}
+
+struct CachedOriginReservation {
+    state: Arc<SessionState>,
+    route: Option<String>,
+}
+
+impl CachedOriginReservation {
+    fn new(state: Arc<SessionState>, route: Option<String>) -> Self {
+        Self { state, route }
+    }
+
+    fn commit(&mut self) {
+        if let Some(route) = self.route.take()
+            && let Ok(mut cached) = self.state.cached_origins.lock()
+            && let Some(route_state) = cached.get_mut(&route)
+        {
+            route_state.committed = true;
+            route_state.pending = route_state.pending.saturating_sub(1);
+        }
+    }
+}
+
+impl Drop for CachedOriginReservation {
+    fn drop(&mut self) {
+        if let Some(route) = self.route.take()
+            && let Ok(mut cached) = self.state.cached_origins.lock()
+            && let Some(route_state) = cached.get_mut(&route)
+        {
+            route_state.pending = route_state.pending.saturating_sub(1);
+            if route_state.pending == 0 && !route_state.committed {
+                cached.remove(&route);
+            }
+        }
+    }
 }
 
 fn request_dns_client(
@@ -933,36 +1019,46 @@ fn request_dns_client(
     variant: &Variant,
     dns_servers: Vec<String>,
     dns_timeout: Option<f64>,
+    proxy_generation: u64,
 ) -> PyResult<Client> {
-    let mut normalized = dns_servers;
-    normalized.iter_mut().for_each(|value| {
-        *value = value.trim().to_ascii_lowercase();
-    });
+    let normalized = dns_servers
+        .iter()
+        .map(|value| {
+            parse_dns_server(value).map(|(ip, port)| SocketAddr::new(ip, port).to_string())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     let key = format!("{}|{dns_timeout:?}", normalized.join(","));
     if !state.fingerprint_pool {
         let resolver = build_custom_dns_resolver(normalized, dns_timeout)?;
         return build_client_with_dns(state, variant, resolver.as_ref(), true).map_err(to_py_error);
     }
-    {
+    let cell = {
         let mut clients = variant
             .dns_clients
             .lock()
             .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?;
-        if let Some(client) = clients.get(&key) {
-            return Ok(client.clone());
+        if let Some(cell) = clients.get(&key) {
+            cell.clone()
+        } else {
+            let cell = Arc::new(OnceCell::new());
+            clients.put(key.clone(), cell.clone());
+            cell
         }
+    };
+    let client = cell
+        .get_or_try_init(|| {
+            let resolver = build_custom_dns_resolver(normalized, dns_timeout)?;
+            build_client_with_dns(state, variant, resolver.as_ref(), true).map_err(to_py_error)
+        })
+        .cloned()?;
+    if state.proxy_generation.load(Ordering::Acquire) != proxy_generation
+        && let Ok(mut clients) = variant.dns_clients.lock()
+        && clients
+            .peek(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+    {
+        clients.pop(&key);
     }
-    let resolver = build_custom_dns_resolver(normalized, dns_timeout)?;
-    let client =
-        build_client_with_dns(state, variant, resolver.as_ref(), true).map_err(to_py_error)?;
-    let mut clients = variant
-        .dns_clients
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?;
-    if let Some(existing) = clients.get(&key) {
-        return Ok(existing.clone());
-    }
-    clients.put(key, client.clone());
     Ok(client)
 }
 
@@ -988,7 +1084,7 @@ fn touch_fingerprint_pool(state: &SessionState, index: usize) -> PyResult<()> {
     Ok(())
 }
 
-fn cached_client(state: &SessionState, index: usize) -> PyResult<Client> {
+fn cached_client(state: &SessionState, index: usize, proxy_generation: u64) -> PyResult<Client> {
     let variant = &state.variants[index];
     if !state.fingerprint_pool {
         return build_client(state, variant).map_err(to_py_error);
@@ -1009,16 +1105,22 @@ fn cached_client(state: &SessionState, index: usize) -> PyResult<Client> {
     if state.closed.load(Ordering::Acquire) {
         return Ok(client);
     }
-    variant.client.store(Some(Arc::new(client.clone())));
-    touch_fingerprint_pool(state, index)?;
+    if state.proxy_generation.load(Ordering::Acquire) == proxy_generation {
+        variant.client.store(Some(Arc::new(client.clone())));
+        touch_fingerprint_pool(state, index)?;
+    }
     Ok(client)
 }
 
-async fn cached_client_async(state: Arc<SessionState>, index: usize) -> PyResult<Client> {
+async fn cached_client_async(
+    state: Arc<SessionState>,
+    index: usize,
+    proxy_generation: u64,
+) -> PyResult<Client> {
     if let Some(client) = state.variants[index].client.load_full() {
         return Ok((*client).clone());
     }
-    tokio::task::spawn_blocking(move || cached_client(&state, index))
+    tokio::task::spawn_blocking(move || cached_client(&state, index, proxy_generation))
         .await
         .map_err(|error| PyRuntimeError::new_err(format!("Client构建任务失败: {error}")))?
 }
@@ -1030,6 +1132,7 @@ fn selected_request_client(
     dns_servers: Vec<String>,
     dns_timeout: Option<f64>,
     cache_route: bool,
+    proxy_generation: u64,
 ) -> PyResult<Client> {
     let variant = &state.variants[index];
     if !cache_route {
@@ -1042,9 +1145,9 @@ fn selected_request_client(
             .map_err(to_py_error);
     }
     if dns_override {
-        request_dns_client(state, variant, dns_servers, dns_timeout)
+        request_dns_client(state, variant, dns_servers, dns_timeout, proxy_generation)
     } else {
-        cached_client(state, index)
+        cached_client(state, index, proxy_generation)
     }
 }
 
@@ -1055,9 +1158,10 @@ async fn selected_request_client_async(
     dns_servers: Vec<String>,
     dns_timeout: Option<f64>,
     cache_route: bool,
+    proxy_generation: u64,
 ) -> PyResult<Client> {
     if !dns_override && cache_route {
-        return cached_client_async(state, index).await;
+        return cached_client_async(state, index, proxy_generation).await;
     }
     tokio::task::spawn_blocking(move || {
         selected_request_client(
@@ -1067,6 +1171,7 @@ async fn selected_request_client_async(
             dns_servers,
             dns_timeout,
             cache_route,
+            proxy_generation,
         )
     })
     .await
@@ -1127,32 +1232,27 @@ fn ensure_open(state: &SessionState) -> PyResult<()> {
     Ok(())
 }
 
-fn selected_proxy(
+fn selected_proxy_snapshot(
     state: &SessionState,
     proxy_override: bool,
     proxy: Option<String>,
-) -> PyResult<Option<Proxy>> {
+) -> PyResult<(Option<String>, Option<Proxy>, u64)> {
+    let generation = state.proxy_generation.load(Ordering::Acquire);
     if proxy_override {
-        return proxy
-            .map(|value| Proxy::all(&value).map_err(to_py_error))
-            .transpose();
+        let parsed = proxy
+            .as_ref()
+            .map(|value| Proxy::all(value).map_err(to_py_error))
+            .transpose()?;
+        return Ok((proxy, parsed, generation));
     }
-    Ok(state.proxy.load_full().map(|proxy| (*proxy).clone()))
-}
-
-fn selected_proxy_url(
-    state: &SessionState,
-    proxy_override: bool,
-    proxy: Option<String>,
-) -> Option<String> {
-    if proxy_override {
-        proxy
-    } else {
-        state
-            .proxy_identity
-            .load_full()
-            .map(|value| (*value).clone())
-    }
+    let snapshot = state.default_proxy.load_full();
+    Ok(snapshot.map_or((None, None, generation), |value| {
+        (
+            Some(value.identity.clone()),
+            Some(value.proxy.clone()),
+            generation,
+        )
+    }))
 }
 
 fn parse_connect_target(value: &str) -> Result<(String, u16)> {
@@ -1190,6 +1290,23 @@ async fn copy_with_counter<R, W>(
     }
 }
 
+async fn read_meter_line<R>(reader: &mut R, total: &mut usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    const MAX_CONNECT_HEAD: usize = 64 * 1024;
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).await?;
+    if line.is_empty() {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
+    *total = total.saturating_add(line.len());
+    if *total > MAX_CONNECT_HEAD {
+        return Err(std::io::Error::other("CONNECT请求头超过64KiB"));
+    }
+    Ok(line)
+}
+
 async fn run_transfer_meter(
     listener: TcpListener,
     upstream_proxy: Option<String>,
@@ -1199,10 +1316,10 @@ async fn run_transfer_meter(
         return;
     };
     let mut reader = BufReader::new(client);
-    let mut request_head = Vec::new();
-    if reader.read_until(b'\n', &mut request_head).await.is_err() {
+    let mut request_head_bytes = 0;
+    let Ok(request_head) = read_meter_line(&mut reader, &mut request_head_bytes).await else {
         return;
-    }
+    };
     let request_line = String::from_utf8_lossy(&request_head);
     let mut parts = request_line.split_whitespace();
     if parts.next() != Some("CONNECT") {
@@ -1212,8 +1329,10 @@ async fn run_transfer_meter(
         return;
     };
     loop {
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line).await.is_err() || line == b"\r\n" {
+        let Ok(line) = read_meter_line(&mut reader, &mut request_head_bytes).await else {
+            return;
+        };
+        if line == b"\r\n" {
             break;
         }
     }
@@ -1234,7 +1353,12 @@ async fn run_transfer_meter(
         else {
             return;
         };
-        let mut connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let mut connect = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if !parsed.username().is_empty() || parsed.password().is_some() {
             let password = parsed.password().unwrap_or_default();
             let auth = BASE64.encode(format!("{}:{password}", parsed.username()));
@@ -1244,20 +1368,25 @@ async fn run_transfer_meter(
         if stream.write_all(connect.as_bytes()).await.is_err() {
             return;
         }
+        counters
+            .upload
+            .fetch_add(connect.len() as u64, Ordering::Relaxed);
         let mut upstream_reader = BufReader::new(stream);
-        let mut status = Vec::new();
-        if upstream_reader
-            .read_until(b'\n', &mut status)
-            .await
-            .is_err()
-            || !String::from_utf8_lossy(&status).contains(" 200 ")
-        {
+        let mut response_head_bytes = 0;
+        let Ok(status) = read_meter_line(&mut upstream_reader, &mut response_head_bytes).await
+        else {
+            return;
+        };
+        if !String::from_utf8_lossy(&status).contains(" 200 ") {
             return;
         }
         let mut connect_response_bytes = status.len();
         loop {
-            let mut line = Vec::new();
-            if upstream_reader.read_until(b'\n', &mut line).await.is_err() || line == b"\r\n" {
+            let Ok(line) = read_meter_line(&mut upstream_reader, &mut response_head_bytes).await
+            else {
+                return;
+            };
+            if line == b"\r\n" {
                 break;
             }
             connect_response_bytes += line.len();
@@ -1288,7 +1417,10 @@ async fn run_transfer_meter(
     );
 }
 
-async fn start_transfer_meter(upstream_proxy: Option<String>) -> PyResult<TransferMeter> {
+async fn start_transfer_meter(
+    upstream_proxy: Option<String>,
+    timeout: Duration,
+) -> PyResult<TransferMeter> {
     if let Some(proxy) = upstream_proxy.as_deref() {
         let parsed = Url::parse(proxy).map_err(|error| {
             PyRuntimeError::new_err(format!("transfer_stats代理URL无效: {error}"))
@@ -1307,16 +1439,19 @@ async fn start_transfer_meter(upstream_proxy: Option<String>) -> PyResult<Transf
         upload: AtomicU64::new(0),
         download: AtomicU64::new(0),
     });
-    let completed = tokio::spawn(run_transfer_meter(
-        listener,
-        upstream_proxy,
-        counters.clone(),
-    ));
+    let task_counters = counters.clone();
+    let completed = tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            timeout,
+            run_transfer_meter(listener, upstream_proxy, task_counters),
+        )
+        .await;
+    });
     let proxy = Proxy::all(format!("http://127.0.0.1:{port}")).map_err(to_py_error)?;
     Ok(TransferMeter {
         proxy,
         counters,
-        _completed: completed,
+        completed: Some(completed),
     })
 }
 
@@ -1450,6 +1585,17 @@ fn parse_websocket_version(version: &str) -> PyResult<Version> {
     }
 }
 
+fn http_version_name(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
+        _ => "UNKNOWN",
+    }
+}
+
 fn websocket_cookie_url(url: &str) -> PyResult<String> {
     let mut parsed = Url::parse(url).map_err(to_py_error)?;
     let scheme = match parsed.scheme() {
@@ -1580,14 +1726,15 @@ async fn execute_request(
     profile: String,
     transfer_stats: bool,
     upstream_proxy: Option<String>,
+    max_response_bytes: usize,
 ) -> PyResult<RawNativeResponse> {
     if transfer_stats && !url.starts_with("https://") {
         return Err(PyRuntimeError::new_err(
             "transfer_stats仅支持HTTPS请求，统计对象表示TLS隧道的实际TCP字节",
         ));
     }
-    let meter = if transfer_stats {
-        Some(start_transfer_meter(upstream_proxy).await?)
+    let mut meter = if transfer_stats {
+        Some(start_transfer_meter(upstream_proxy, timeout).await?)
     } else {
         None
     };
@@ -1614,18 +1761,18 @@ async fn execute_request(
     let response = request.send().await.map_err(to_py_error)?;
     let status = response.status().as_u16();
     let final_url = response.uri().to_string();
+    let http_version = http_version_name(response.version()).to_string();
     let history = response
         .extensions()
         .get::<redirect::History>()
         .map(history_entries)
         .unwrap_or_default();
     let response_headers = native_headers_from_map(response.headers());
-    let content = response.bytes().await.map_err(to_py_error)?;
-    let transfer_counters = if let Some(meter) = meter {
-        Some(meter.counters)
-    } else {
-        None
-    };
+    let content = collect_response_body(response.bytes_stream(), max_response_bytes).await?;
+    if let Some(meter) = meter.as_mut() {
+        meter.finish().await;
+    }
+    let transfer_counters = meter.as_ref().map(|meter| meter.counters.clone());
     Ok((
         status,
         response_headers,
@@ -1633,9 +1780,28 @@ async fn execute_request(
         fingerprint_id,
         profile,
         final_url,
+        http_version,
         history,
         transfer_counters,
     ))
+}
+
+async fn collect_response_body<S, E>(mut stream: S, limit: usize) -> PyResult<Bytes>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(PyRuntimeError::new_err(format!(
+                "响应Body超过max_response_bytes限制: {limit}字节"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1727,6 +1893,7 @@ async fn execute_multipart_request(
     max_redirects: usize,
     fingerprint_id: String,
     profile: String,
+    max_response_bytes: usize,
 ) -> PyResult<RawNativeResponse> {
     let mut form = multipart::Form::new();
     for (name, value) in fields {
@@ -1761,13 +1928,14 @@ async fn execute_multipart_request(
     let response = request.send().await.map_err(to_py_error)?;
     let status = response.status().as_u16();
     let final_url = response.uri().to_string();
+    let http_version = http_version_name(response.version()).to_string();
     let history = response
         .extensions()
         .get::<redirect::History>()
         .map(history_entries)
         .unwrap_or_default();
     let response_headers = native_headers_from_map(response.headers());
-    let content = response.bytes().await.map_err(to_py_error)?;
+    let content = collect_response_body(response.bytes_stream(), max_response_bytes).await?;
     Ok((
         status,
         response_headers,
@@ -1775,6 +1943,7 @@ async fn execute_multipart_request(
         fingerprint_id,
         profile,
         final_url,
+        http_version,
         history,
         None,
     ))
@@ -1784,8 +1953,17 @@ fn into_native_response(
     py: Python<'_>,
     response: RawNativeResponse,
 ) -> PyResult<Py<NativeResponse>> {
-    let (status, headers, content, fingerprint_id, profile, url, history, transfer_counters) =
-        response;
+    let (
+        status,
+        headers,
+        content,
+        fingerprint_id,
+        profile,
+        url,
+        http_version,
+        history,
+        transfer_counters,
+    ) = response;
     let native_headers = Py::new(py, headers)?;
     Py::new(
         py,
@@ -1796,6 +1974,7 @@ fn into_native_response(
             url,
             fingerprint_id,
             impersonate: profile,
+            http_version,
             history,
             transfer_stats: transfer_counters
                 .map(|counters| Py::new(py, NativeTransferStats { counters }))
@@ -1839,6 +2018,7 @@ fn raw_websocket_message(message: Message) -> RawWebSocketMessage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_websocket(
     _permit: OwnedSemaphorePermit,
     mut socket: WebSocket,
@@ -1846,6 +2026,7 @@ async fn run_websocket(
     mut close_commands: mpsc::Receiver<WebSocketCloseCommand>,
     events: mpsc::Sender<WebSocketEvent>,
     closed: Arc<AtomicBool>,
+    terminal_error: Arc<Mutex<Option<String>>>,
     io_timeout: Duration,
 ) {
     loop {
@@ -1914,7 +2095,14 @@ async fn run_websocket(
                 match message {
                     Some(Ok(message)) => {
                         let is_close = matches!(message, Message::Close(_));
-                        if events.try_send(WebSocketEvent::Message(raw_websocket_message(message))).is_err() {
+                        if let Err(error) = events.try_send(WebSocketEvent::Message(raw_websocket_message(message))) {
+                            if matches!(error, mpsc::error::TrySendError::Full(_))
+                                && let Ok(mut terminal) = terminal_error.lock()
+                            {
+                                *terminal = Some(
+                                    "WebSocket接收队列超过256条，连接已关闭".to_string(),
+                                );
+                            }
                             break;
                         }
                         if is_close {
@@ -1972,6 +2160,7 @@ async fn close_websocket_command(
 async fn recv_websocket_event(
     events: Arc<AsyncMutex<mpsc::Receiver<WebSocketEvent>>>,
     recv_active: Arc<AtomicBool>,
+    terminal_error: Arc<Mutex<Option<String>>>,
 ) -> PyResult<Option<RawWebSocketMessage>> {
     if recv_active.swap(true, Ordering::AcqRel) {
         return Err(PyRuntimeError::new_err(
@@ -1982,7 +2171,17 @@ async fn recv_websocket_event(
     match events.lock().await.recv().await {
         Some(WebSocketEvent::Message(message)) => Ok(Some(message)),
         Some(WebSocketEvent::Error(error)) => Err(PyRuntimeError::new_err(error)),
-        None => Ok(None),
+        None => {
+            if let Some(error) = terminal_error
+                .lock()
+                .ok()
+                .and_then(|mut value| value.take())
+            {
+                Err(PyRuntimeError::new_err(error))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -2001,6 +2200,7 @@ struct NativeWebSocket {
     events: Arc<AsyncMutex<mpsc::Receiver<WebSocketEvent>>>,
     closed: Arc<AtomicBool>,
     recv_active: Arc<AtomicBool>,
+    terminal_error: Arc<Mutex<Option<String>>>,
 }
 
 #[pymethods]
@@ -2093,13 +2293,18 @@ impl NativeWebSocket {
         let runtime = shared_runtime()?;
         let events = self.events.clone();
         let recv_active = self.recv_active.clone();
-        py.detach(|| runtime.block_on(recv_websocket_event(events, recv_active)))
+        let terminal_error = self.terminal_error.clone();
+        py.detach(|| runtime.block_on(recv_websocket_event(events, recv_active, terminal_error)))
     }
 
     fn recv_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let events = self.events.clone();
         let recv_active = self.recv_active.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, recv_websocket_event(events, recv_active))
+        let terminal_error = self.terminal_error.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            recv_websocket_event(events, recv_active, terminal_error),
+        )
     }
 
     #[pyo3(signature = (code=1000, reason=String::new()))]
@@ -2150,12 +2355,15 @@ async fn execute_websocket(
     proxy: Option<Proxy>,
     fingerprint_id: String,
     profile: String,
+    max_message_bytes: usize,
 ) -> PyResult<NativeWebSocket> {
     let mut request = client
         .websocket(&url)
         .headers(headers)
         .protocols(protocols)
-        .version(version);
+        .version(version)
+        .max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes);
     if let Some(proxy) = proxy {
         request = request.proxy(proxy);
     }
@@ -2176,6 +2384,7 @@ async fn execute_websocket(
     let (close_commands_tx, close_commands_rx) = mpsc::channel(1);
     let (events_tx, events_rx) = mpsc::channel(256);
     let closed = Arc::new(AtomicBool::new(false));
+    let terminal_error = Arc::new(Mutex::new(None));
     tokio::spawn(run_websocket(
         permit,
         socket,
@@ -2183,6 +2392,7 @@ async fn execute_websocket(
         close_commands_rx,
         events_tx,
         closed.clone(),
+        terminal_error.clone(),
         timeout,
     ));
     Ok(NativeWebSocket {
@@ -2195,6 +2405,7 @@ async fn execute_websocket(
         events: Arc::new(AsyncMutex::new(events_rx)),
         closed,
         recv_active: Arc::new(AtomicBool::new(false)),
+        terminal_error,
     })
 }
 
@@ -2405,6 +2616,15 @@ fn parse_ip(value: &str, field: &str) -> PyResult<IpAddr> {
         .map_err(|_| PyRuntimeError::new_err(format!("{field}包含无效IP地址: {value}")))
 }
 
+fn parse_dns_server(value: &str) -> PyResult<(IpAddr, u16)> {
+    let value = value.trim();
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        Ok((addr.ip(), addr.port()))
+    } else {
+        Ok((parse_ip(value, "dns_servers")?, 53))
+    }
+}
+
 fn build_custom_dns_resolver(
     dns_servers: Vec<String>,
     dns_timeout: Option<f64>,
@@ -2415,12 +2635,7 @@ fn build_custom_dns_resolver(
     let name_servers = dns_servers
         .iter()
         .map(|value| {
-            let value = value.trim();
-            let (ip, port) = if let Ok(addr) = value.parse::<SocketAddr>() {
-                (addr.ip(), addr.port())
-            } else {
-                (parse_ip(value, "dns_servers")?, 53)
-            };
+            let (ip, port) = parse_dns_server(value)?;
             let mut udp = ConnectionConfig::udp();
             udp.port = port;
             let mut tcp = ConnectionConfig::tcp();
@@ -2465,7 +2680,7 @@ fn parse_dns_overrides(
 impl NativeSession {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (impersonate, fingerprint_rotation=false, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3), resolve=Vec::new(), dns_servers=Vec::new(), dns_timeout=Some(5.0), fingerprint_pool=true, fingerprint_pool_size=100, max_cached_origins=100))]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=true, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3), resolve=Vec::new(), dns_servers=Vec::new(), dns_timeout=Some(5.0), fingerprint_pool=true, fingerprint_pool_size=100, max_cached_origins=4, max_response_bytes=67108864, max_websocket_message_bytes=16777216, cookie_store=true))]
     fn new(
         py: Python<'_>,
         impersonate: String,
@@ -2483,12 +2698,29 @@ impl NativeSession {
         fingerprint_pool: bool,
         fingerprint_pool_size: usize,
         max_cached_origins: usize,
+        max_response_bytes: usize,
+        max_websocket_message_bytes: usize,
+        cookie_store: bool,
     ) -> PyResult<Self> {
         if max_connections == 0 {
             return Err(PyRuntimeError::new_err("max_connections必须大于0"));
         }
+        if max_connections > Semaphore::MAX_PERMITS {
+            return Err(PyRuntimeError::new_err(format!(
+                "max_connections不能超过{}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
         if fingerprint_pool_size == 0 {
             return Err(PyRuntimeError::new_err("fingerprint_pool_size必须大于0"));
+        }
+        if max_response_bytes == 0 {
+            return Err(PyRuntimeError::new_err("max_response_bytes必须大于0"));
+        }
+        if max_websocket_message_bytes == 0 {
+            return Err(PyRuntimeError::new_err(
+                "max_websocket_message_bytes必须大于0",
+            ));
         }
         let happy_eyeballs_timeout =
             parse_optional_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout)?;
@@ -2503,9 +2735,12 @@ impl NativeSession {
         } else {
             fingerprints_path
         };
-        let proxy_identity = proxy.clone();
-        let proxy = proxy
-            .map(|value| Proxy::all(&value).map_err(to_py_error))
+        let default_proxy = proxy
+            .map(|identity| {
+                Proxy::all(&identity)
+                    .map(|proxy| DefaultProxy { identity, proxy })
+                    .map_err(to_py_error)
+            })
             .transpose()?;
         // 指纹来源：传入路径时由本实例独立读取解析（提前单实例加载），
         // 指纹随SessionState的variants持有，不进入进程级全局缓存，多个实例可各读各的文件；
@@ -2568,6 +2803,7 @@ impl NativeSession {
             .max(1)
             .div_ceil(effective_fingerprint_pools)
             .saturating_mul(2)
+            .max(max_connections.div_ceil(effective_fingerprint_pools))
             .max(2);
         let state = Arc::new(SessionState {
             profile: normalized,
@@ -2587,10 +2823,10 @@ impl NativeSession {
             fingerprint_pool_members: ArcSwap::from_pointee(Vec::new()),
             fingerprint_pool_init: Mutex::new(()),
             max_cached_origins,
-            cached_origins: Mutex::new(HashSet::new()),
+            cached_origins: Mutex::new(HashMap::new()),
             client_pool_max_size,
-            proxy: ArcSwapOption::from(proxy.map(Arc::new)),
-            proxy_identity: ArcSwapOption::<String>::from(proxy_identity.map(Arc::new)),
+            default_proxy: ArcSwapOption::from(default_proxy.map(Arc::new)),
+            proxy_generation: AtomicU64::new(0),
             default_headers: ArcSwap::from_pointee(parse_headers(default_headers)?),
             verify,
             connect_timeout: parse_optional_timeout("connect_timeout", connect_timeout)?,
@@ -2598,9 +2834,12 @@ impl NativeSession {
             dns_resolver,
             dns_overrides: Arc::new(dns_overrides),
             cookie_jar: Arc::new(Jar::default()),
+            cookie_store,
             selected_variant: AtomicUsize::new(selected_variant),
             closed: AtomicBool::new(false),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
+            max_response_bytes,
+            max_websocket_message_bytes,
         });
         Ok(Self { state })
     }
@@ -2623,6 +2862,20 @@ impl NativeSession {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("Origin缓存锁已损坏"))?
             .len())
+    }
+
+    #[getter]
+    fn request_dns_client_count(&self) -> PyResult<usize> {
+        self.state
+            .variants
+            .iter()
+            .try_fold(0usize, |total, variant| {
+                variant
+                    .dns_clients
+                    .lock()
+                    .map(|clients| total + clients.len())
+                    .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))
+            })
     }
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
@@ -2655,10 +2908,14 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let result = py.detach(move || {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = selected_request_client(
                 &state,
@@ -2667,11 +2924,11 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )?;
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
-            runtime.block_on(execute_request(
+            let result = runtime.block_on(execute_request(
                 permit,
                 client,
                 method,
@@ -2687,7 +2944,12 @@ impl NativeSession {
                 profile,
                 transfer_stats,
                 proxy_url,
-            ))
+                state.max_response_bytes,
+            ));
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })?;
         into_native_response(py, result)
     }
@@ -2720,12 +2982,16 @@ impl NativeSession {
         let state = self.state.clone();
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = acquire_connection_slot(&state).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -2733,9 +2999,9 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )
             .await?;
-            let permit = acquire_connection_slot(&state).await?;
             let response = execute_request(
                 permit,
                 client,
@@ -2752,8 +3018,10 @@ impl NativeSession {
                 profile,
                 transfer_stats,
                 proxy_url,
+                state.max_response_bytes,
             )
             .await?;
+            reservation.commit();
             Python::attach(|py| into_native_response(py, response))
         })
     }
@@ -2780,15 +3048,25 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let cookie_url = websocket_cookie_url(&url)?;
         let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         py.detach(move || {
-            let variant = &state.variants[index];
-            let client =
-                selected_request_client(&state, index, false, Vec::new(), None, cache_route)?;
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = runtime.block_on(acquire_connection_slot(&state))?;
-            runtime.block_on(execute_websocket(
+            let variant = &state.variants[index];
+            let client = selected_request_client(
+                &state,
+                index,
+                false,
+                Vec::new(),
+                None,
+                cache_route,
+                proxy_generation,
+            )?;
+            let result = runtime.block_on(execute_websocket(
                 permit,
                 client,
                 url,
@@ -2799,7 +3077,12 @@ impl NativeSession {
                 proxy,
                 variant.record.id.clone(),
                 state.profile.clone(),
-            ))
+                state.max_websocket_message_bytes,
+            ));
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })
     }
 
@@ -2824,12 +3107,16 @@ impl NativeSession {
         let state = self.state.clone();
         let cookie_url = websocket_cookie_url(&url)?;
         let headers = prepare_headers(&state, &cookie_url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = acquire_connection_slot(&state).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -2837,10 +3124,10 @@ impl NativeSession {
                 Vec::new(),
                 None,
                 cache_route,
+                proxy_generation,
             )
             .await?;
-            let permit = acquire_connection_slot(&state).await?;
-            execute_websocket(
+            let result = execute_websocket(
                 permit,
                 client,
                 url,
@@ -2851,8 +3138,13 @@ impl NativeSession {
                 proxy,
                 fingerprint_id,
                 profile,
+                state.max_websocket_message_bytes,
             )
-            .await
+            .await;
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })
     }
 
@@ -2885,10 +3177,14 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         py.detach(move || {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = selected_request_client(
                 &state,
@@ -2897,11 +3193,11 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )?;
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
-            runtime.block_on(execute_stream_request(
+            let result = runtime.block_on(execute_stream_request(
                 permit,
                 client,
                 method,
@@ -2915,7 +3211,11 @@ impl NativeSession {
                 max_redirects,
                 fingerprint_id,
                 profile,
-            ))
+            ));
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })
     }
 
@@ -2945,13 +3245,17 @@ impl NativeSession {
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&self.state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&self.state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = acquire_connection_slot(&state).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -2959,10 +3263,10 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )
             .await?;
-            let permit = acquire_connection_slot(&state).await?;
-            execute_stream_request(
+            let result = execute_stream_request(
                 permit,
                 client,
                 method,
@@ -2977,7 +3281,11 @@ impl NativeSession {
                 fingerprint_id,
                 profile,
             )
-            .await
+            .await;
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })
     }
 
@@ -3011,10 +3319,14 @@ impl NativeSession {
         let runtime = shared_runtime()?;
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let result = py.detach(move || {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let variant = &state.variants[index];
             let client = selected_request_client(
                 &state,
@@ -3023,11 +3335,11 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )?;
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = variant.record.id.clone();
             let profile = state.profile.clone();
-            runtime.block_on(execute_multipart_request(
+            let result = runtime.block_on(execute_multipart_request(
                 permit,
                 client,
                 method,
@@ -3042,7 +3354,12 @@ impl NativeSession {
                 max_redirects,
                 fingerprint_id,
                 profile,
-            ))
+                state.max_response_bytes,
+            ));
+            if result.is_ok() {
+                reservation.commit();
+            }
+            result
         })?;
         into_native_response(py, result)
     }
@@ -3074,13 +3391,17 @@ impl NativeSession {
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
-        let proxy_url = selected_proxy_url(&self.state, proxy_override, proxy.clone());
-        let cache_route = cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
-        let proxy = selected_proxy(&self.state, proxy_override, proxy)?;
+        let (proxy_url, proxy, proxy_generation) =
+            selected_proxy_snapshot(&self.state, proxy_override, proxy)?;
+        let (cache_route, cached_origin_reservation) =
+            cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut reservation =
+                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
+            let permit = acquire_connection_slot(&state).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -3088,9 +3409,9 @@ impl NativeSession {
                 dns_servers,
                 dns_timeout,
                 cache_route,
+                proxy_generation,
             )
             .await?;
-            let permit = acquire_connection_slot(&state).await?;
             let response = execute_multipart_request(
                 permit,
                 client,
@@ -3106,8 +3427,10 @@ impl NativeSession {
                 max_redirects,
                 fingerprint_id,
                 profile,
+                state.max_response_bytes,
             )
             .await?;
+            reservation.commit();
             Python::attach(|py| into_native_response(py, response))
         })
     }
@@ -3116,22 +3439,23 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let changed = self
             .state
-            .proxy_identity
+            .default_proxy
             .load_full()
             .as_deref()
-            .map(String::as_str)
+            .map(|value| value.identity.as_str())
             != proxy.as_deref();
-        let proxy_identity = proxy.clone();
-        let proxy = proxy
-            .map(|value| Proxy::all(&value).map_err(to_py_error))
+        let default_proxy = proxy
+            .map(|identity| {
+                Proxy::all(&identity)
+                    .map(|proxy| DefaultProxy { identity, proxy })
+                    .map_err(to_py_error)
+            })
             .transpose()?;
         if !changed {
             return Ok(());
         }
-        self.state
-            .proxy_identity
-            .store(proxy_identity.map(Arc::new));
-        self.state.proxy.store(proxy.map(Arc::new));
+        self.state.default_proxy.store(default_proxy.map(Arc::new));
+        self.state.proxy_generation.fetch_add(1, Ordering::AcqRel);
         if !self.state.rotation {
             self.state
                 .selected_variant

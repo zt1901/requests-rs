@@ -6,7 +6,8 @@ from http.cookiejar import CookieJar
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.request import Request
 
 from ._native import NativeSession, available_profiles, build_response_headers
 
@@ -131,31 +132,25 @@ def _header_items(headers: HeaderInput | None) -> list[tuple[str, str]]:
     return list(headers)
 
 
-def _urlencoded_items(values: Mapping[str, Any] | None) -> list[tuple[str, list[str]]]:
-    if not values:
-        return []
-    result = []
-    for name, value in values.items():
-        values = value if isinstance(value, (list, tuple)) else (value,)
-        normalized = []
-        for item in values:
-            if isinstance(item, bytes):
-                normalized.append(item.decode("latin1"))
-            else:
-                normalized.append(str(item))
-        result.append((str(name), normalized))
-    return result
+def _append_query(url: str, values: Mapping[str, Any]) -> str:
+    encoded = urlencode(values, doseq=True)
+    parts = urlsplit(url)
+    query = f"{parts.query}&{encoded}" if parts.query else encoded
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
-def _cookie_items(cookies: Any) -> list[tuple[str, str]]:
+def _cookie_items(cookies: Any, url: str) -> list[tuple[str, str]]:
+    if isinstance(cookies, Cookies):
+        return list(cookies._native.get_cookie_pairs(url))
     if isinstance(cookies, Mapping):
         return [(str(name), str(value)) for name, value in cookies.items()]
     if isinstance(cookies, list):
         return [(str(name), str(value)) for name, value in cookies]
-    if isinstance(cookies, Cookies):
-        return [(cookie.name, cookie.value) for cookie in cookies.get_all()]
     if isinstance(cookies, CookieJar):
-        return [(cookie.name, cookie.value) for cookie in cookies]
+        request = Request(url)
+        cookies.add_cookie_header(request)
+        value = request.get_header("Cookie", "")
+        return [tuple(item.strip().split("=", 1)) for item in value.split(";") if "=" in item]
     raise TypeError("cookies必须是Cookies、CookieJar、dict或list[tuple[str, str]]")
 
 
@@ -175,6 +170,7 @@ class Response:
         url: str,
         fingerprint_id: str,
         impersonate: str | os.PathLike[str],
+        http_version: str = "UNKNOWN",
         content: bytes | None = None,
         stream: Any = None,
         history: Sequence["Response"] = (),
@@ -185,10 +181,12 @@ class Response:
         self.fingerprint_id = fingerprint_id
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
+        self.http_version = http_version
         self._content = content
         self._stream = stream
         self.transfer_stats = None
         self._consumer_active = False
+        self._async_stream = False
         self.history = list(history)
 
     @classmethod
@@ -200,10 +198,12 @@ class Response:
         response.url = native.url
         response.fingerprint_id = native.fingerprint_id
         response.impersonate = native.impersonate
+        response.http_version = native.http_version
         response.transfer_stats = native.transfer_stats
         response._content = native.content
         response._stream = None
         response._consumer_active = False
+        response._async_stream = False
         response._history = None
         return response
 
@@ -236,6 +236,8 @@ class Response:
         if self._content is None:
             if self._stream is None:
                 raise RuntimeError("响应流已经关闭")
+            if self._async_stream:
+                raise RuntimeError("异步流响应不能同步读取content；请使用await response.aread()")
             try:
                 self._content = self._stream.read()
             finally:
@@ -245,10 +247,43 @@ class Response:
     @property
     def text(self) -> str:
         content_type = self.headers.get("content-type", "")
-        charset = "utf-8"
-        if "charset=" in content_type:
-            charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
+        charset = self._charset(content_type)
         return self.content.decode(charset, errors="replace")
+
+    @staticmethod
+    def _charset(content_type: str) -> str:
+        charset = "utf-8"
+        for item in content_type.split(";")[1:]:
+            name, separator, value = item.partition("=")
+            if separator and name.strip().casefold() == "charset":
+                charset = value.strip().strip('"\'') or "utf-8"
+                break
+        try:
+            "".encode(charset)
+        except LookupError:
+            return "utf-8"
+        return charset
+
+    async def aread(self) -> bytes:
+        if self._content is not None:
+            return self._content
+        if self._stream is None:
+            raise RuntimeError("响应流已经关闭")
+        chunks = []
+        try:
+            while chunk := await self._stream.read_async(64 * 1024):
+                chunks.append(chunk)
+            self._content = b"".join(chunks)
+            return self._content
+        finally:
+            await self.aclose()
+
+    async def atext(self) -> str:
+        content = await self.aread()
+        return content.decode(self._charset(self.headers.get("content-type", "")), errors="replace")
+
+    async def ajson(self) -> Any:
+        return json_module.loads(await self.aread())
 
     def json(self) -> Any:
         return json_module.loads(self.content)
@@ -302,6 +337,8 @@ class Response:
 
     def close(self) -> None:
         if self._stream is not None:
+            if self._async_stream:
+                raise RuntimeError("异步流响应请使用await response.aclose()")
             stream = self._stream
             self._stream = None
             stream.close()
@@ -430,19 +467,12 @@ class AsyncWebSocket:
     async def recv(self) -> WebSocketMessage | None:
         return WebSocketMessage._from_native(await self._native.recv_async())
 
-    def close(self, code: int = 1000, reason: str = "") -> Any:
+    async def close(self, code: int = 1000, reason: str = "") -> None:
         if self._close_task is None:
             self._close_task = asyncio.ensure_future(self._native.close_async(code, reason))
-        close_task = self._close_task
-
-        async def 等待关闭() -> None:
-            try:
-                await asyncio.shield(close_task)
-            except asyncio.CancelledError:
-                close_task.add_done_callback(self._consume_close_result)
-                raise
-
-        return 等待关闭()
+            self._close_task.add_done_callback(self._consume_close_result)
+        # 取消调用方等待不会取消已经开始的底层关闭。
+        await asyncio.shield(self._close_task)
 
     @staticmethod
     def _consume_close_result(task: asyncio.Future) -> None:
@@ -469,7 +499,7 @@ class Session:
         self,
         *,
         impersonate: str | os.PathLike[str],
-        fingerprint_rotation: bool = False,
+        fingerprint_rotation: bool = True,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
         proxies: ProxyInput | None = None,
@@ -485,7 +515,10 @@ class Session:
         dns_timeout: float | None = 5.0,
         fingerprint_pool: bool = True,
         fingerprint_pool_size: int = 100,
-        max_cached_origins: int = 100,
+        max_cached_origins: int = 4,
+        max_response_bytes: int = 64 * 1024 * 1024,
+        max_websocket_message_bytes: int = 16 * 1024 * 1024,
+        cookie_store: bool = True,
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
@@ -494,6 +527,8 @@ class Session:
         _validate_timeout("dns_timeout", dns_timeout, optional=True)
         if isinstance(max_connections, bool) or not isinstance(max_connections, int) or max_connections <= 0:
             raise ValueError("max_connections必须是正整数")
+        if max_connections > (1 << 61) - 1:
+            raise ValueError("max_connections超过Tokio Semaphore上限")
         if not isinstance(fingerprint_pool, bool):
             raise TypeError("fingerprint_pool必须是bool")
         if (
@@ -508,6 +543,20 @@ class Session:
             or max_cached_origins < 0
         ):
             raise ValueError("max_cached_origins必须是非负整数")
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("max_response_bytes必须是正整数")
+        if (
+            isinstance(max_websocket_message_bytes, bool)
+            or not isinstance(max_websocket_message_bytes, int)
+            or max_websocket_message_bytes <= 0
+        ):
+            raise ValueError("max_websocket_message_bytes必须是正整数")
+        if not isinstance(cookie_store, bool):
+            raise TypeError("cookie_store必须是bool")
         if proxy is not None and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
@@ -526,6 +575,7 @@ class Session:
         native_dns_servers = [str(server) for server in (dns_servers or [])]
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
+        self.fingerprint_rotation = fingerprint_rotation
         self.headers = _header_items(headers)
         self._native_headers = tuple(self.headers)
         self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
@@ -543,6 +593,9 @@ class Session:
         self.fingerprint_pool = fingerprint_pool
         self.fingerprint_pool_size = fingerprint_pool_size
         self.max_cached_origins = max_cached_origins
+        self.max_response_bytes = max_response_bytes
+        self.max_websocket_message_bytes = max_websocket_message_bytes
+        self.cookie_store = cookie_store
         self._native = NativeSession(
             impersonate,
             fingerprint_rotation,
@@ -559,6 +612,9 @@ class Session:
             fingerprint_pool,
             fingerprint_pool_size,
             max_cached_origins,
+            max_response_bytes,
+            max_websocket_message_bytes,
+            cookie_store,
         )
         self.cookies = Cookies(self._native)
 
@@ -574,9 +630,14 @@ class Session:
     def cached_origin_count(self) -> int:
         return self._native.cached_origin_count
 
+    @property
+    def request_dns_client_count(self) -> int:
+        return self._native.request_dns_client_count
+
     def set_proxy(self, proxy: str | None) -> None:
         self._native.set_proxy(proxy)
         self.proxy = proxy
+        self.proxies = None
 
     def _prepare_request(
         self,
@@ -601,7 +662,7 @@ class Session:
         if max_redirects < 0:
             raise ValueError("max_redirects不能小于0")
         if params:
-            url = self._native.append_query(url, _urlencoded_items(params))
+            url = _append_query(url, params)
 
         # 保持session.headers可变的兼容语义；仅在实际变更后同步到原生默认Header快照。
         current_headers = tuple(self.headers)
@@ -610,7 +671,7 @@ class Session:
             self._native_headers = current_headers
             self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
         merged_headers = _header_items(headers)
-        request_cookies = None if cookies is None else _cookie_items(cookies)
+        request_cookies = None if cookies is None else _cookie_items(cookies, url)
         if proxy is not _UNSET and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
@@ -627,14 +688,21 @@ class Session:
         else:
             proxy_override = False
             request_proxy = None
+        if data is not None and json is not None:
+            raise ValueError("data和json不能同时传入")
         if json is not None:
             body = self._native.encode_json(json)
             if body is None:
-                body = json_module.dumps(json, ensure_ascii=False, separators=(",", ":")).encode()
+                body = json_module.dumps(
+                    json,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
             if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/json"))
         elif isinstance(data, Mapping):
-            body = self._native.encode_form(_urlencoded_items(data))
+            body = urlencode(data, doseq=True).encode("ascii")
             if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/x-www-form-urlencoded"))
         elif isinstance(data, str):
@@ -677,22 +745,23 @@ class Session:
         if current_headers != self._native_headers:
             self._native.set_default_headers(self.headers)
             self._native_headers = current_headers
+            self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
         merged_headers = _header_items(headers)
-        request_cookies = None if cookies is None else _cookie_items(cookies)
+        cookie_url = "https://" + url[6:] if url.startswith("wss://") else "http://" + url[5:]
+        request_cookies = None if cookies is None else _cookie_items(cookies, cookie_url)
         if proxy is not _UNSET and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
             raise TypeError("proxies必须是Mapping或None")
-        proxy_url = "https://" + url[6:] if url.startswith("wss://") else "http://" + url[5:]
         if proxy is not _UNSET:
             proxy_override = True
             request_proxy = proxy
         elif proxies is not None:
             proxy_override = True
-            request_proxy = self._native.select_proxy(proxy_url, list(proxies.items()))
+            request_proxy = self._native.select_proxy(cookie_url, list(proxies.items()))
         elif self.proxies is not None:
             proxy_override = True
-            request_proxy = self._native.select_proxy(proxy_url, list(self.proxies.items()))
+            request_proxy = self._native.select_proxy(cookie_url, list(self.proxies.items()))
         else:
             proxy_override = False
             request_proxy = None
@@ -915,12 +984,20 @@ class AsyncSession:
         return self._session.fingerprint_count
 
     @property
+    def fingerprint_rotation(self) -> bool:
+        return self._session.fingerprint_rotation
+
+    @property
     def fingerprint_pool_count(self) -> int:
         return self._session.fingerprint_pool_count
 
     @property
     def cached_origin_count(self) -> int:
         return self._session.cached_origin_count
+
+    @property
+    def request_dns_client_count(self) -> int:
+        return self._session.request_dns_client_count
 
     async def request(self, method: str, url: str, **kwargs: Any) -> Response:
         allow_redirects = kwargs.pop("allow_redirects", True)
@@ -1007,7 +1084,7 @@ class AsyncSession:
                 native_dns_servers,
                 request_dns_timeout,
             )
-            return _response_from_stream(native)
+            return _response_from_stream(native, async_stream=True)
         result = await self._session._native.request_async(
             *prepared,
             allow_redirects,
@@ -1083,7 +1160,7 @@ def request(
     url: str,
     *,
     impersonate: str,
-    fingerprint_rotation: bool = False,
+    fingerprint_rotation: bool = True,
     proxy: str | None = None,
     proxies: ProxyInput | None = None,
     verify: bool = True,
@@ -1127,8 +1204,8 @@ def _response_from_native(result: Any) -> Response:
     return Response._from_native(result)
 
 
-def _response_from_stream(native: Any) -> Response:
-    return Response(
+def _response_from_stream(native: Any, *, async_stream: bool = False) -> Response:
+    response = Response(
         status_code=native.status_code,
         headers=native.headers,
         url=native.url,
@@ -1137,6 +1214,8 @@ def _response_from_stream(native: Any) -> Response:
         stream=native,
         history=_build_history(native.history, native.fingerprint_id, native.impersonate),
     )
+    response._async_stream = async_stream
+    return response
 
 
 def get(url: str, **kwargs: Any) -> Response:

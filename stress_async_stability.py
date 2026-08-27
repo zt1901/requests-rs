@@ -13,6 +13,9 @@ from requests_rust import AsyncSession
 每轮请求数 = 5000
 并发数 = 100
 测试轮数 = 4
+启用指纹轮换 = False
+指纹池上限 = 100
+缓存Origin上限 = 4
 测试地址 = ""
 
 
@@ -48,6 +51,11 @@ async def main():
     try:
         async with AsyncSession(
             impersonate=测试版本,
+            fingerprint_rotation=启用指纹轮换,
+            fingerprint_pool=True,
+            fingerprint_pool_size=指纹池上限,
+            max_cached_origins=缓存Origin上限,
+            max_connections=并发数,
         ) as session:
             for 轮次 in range(1, 测试轮数 + 1):
                 next_index = 0
@@ -76,7 +84,7 @@ async def main():
                 print(
                     f"第{轮次}轮: 吞吐={每轮请求数 / (time.perf_counter() - started):.2f}请求/秒，"
                     f"内存增量={(当前内存 - 初始内存) / 1024 / 1024:.2f}MB，"
-                    f"线程={process.num_threads()}"
+                    f"线程={process.num_threads()}，句柄={process.num_handles()}"
                 )
     finally:
         server.close()

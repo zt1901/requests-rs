@@ -42,7 +42,7 @@ print(available_profiles())
 Session(
     *,
     impersonate: str | os.PathLike[str],
-    fingerprint_rotation: bool = False,
+    fingerprint_rotation: bool = True,
     headers=None,
     proxy: str | None = None,
     proxies: Mapping[str, str | None] | None = None,
@@ -58,7 +58,10 @@ Session(
     dns_timeout: float | None = 5.0,
     fingerprint_pool: bool = True,
     fingerprint_pool_size: int = 100,
-    max_cached_origins: int = 100,
+    max_cached_origins: int = 4,
+    max_response_bytes: int = 64 * 1024 * 1024,
+    max_websocket_message_bytes: int = 16 * 1024 * 1024,
+    cookie_store: bool = True,
 )
 ```
 
@@ -68,7 +71,23 @@ Session(
 
 `max_connections`是Session内HTTP、HTTPS、HTTP代理、SOCKS5、流和WebSocket共同使用的Rust/Tokio原生上限。`happy_eyeballs_timeout`默认0.3秒；双栈域名首选地址族未及时连接时，Rust连接器并行尝试另一个地址族，设为`None`可关闭该回退。
 
-`fingerprint_pool=True`启用自然惰性指纹Client缓存；`fingerprint_pool_size`默认100，池未满时随机引入尚未入池的有效指纹，满后只在已有集合内随机，不淘汰、不新增。关闭时每次请求使用临时Client。`max_cached_origins`默认100，按Origin和完整代理身份哈希限制可保存连接的路由数；query、params和path不增加名额，超限路由仍请求但不缓存。Session关闭和`set_proxy()`会释放/清空全部相关Client与路由状态。
+`fingerprint_pool=True`启用自然惰性指纹Client缓存；`fingerprint_pool_size`默认100，池未满时随机引入尚未入池的有效指纹，满后只在已有集合内随机，不淘汰、不新增。关闭时每次请求使用临时Client。`max_cached_origins`默认4，按Origin和完整代理身份哈希限制可保存连接的路由数；query、params和path不增加名额，超限路由仍请求但不缓存。Session关闭和`set_proxy()`会释放/清空全部相关Client与路由状态。
+
+Chrome profile默认开启指纹轮换，并在每条自然新建TLS连接时启用BoringSSL ClientHello扩展随机排列。同一Client池内不同物理TLS连接可有不同JA3，已有H2连接仍原样复用；不主动拆连接换JA3。JA3N、Cipher集合、Groups和H2指纹保持profile语义。需要固定单指纹时显式设置`fingerprint_rotation=False`。
+
+`max_response_bytes`默认64MiB，限制普通和multipart响应解压后的Body；所有压缩编码都必须在解压后计数。超限返回明确RuntimeError并关闭该响应，避免压缩炸弹或高并发大Body耗尽进程内存。流式响应由调用方分块消费，不受完整Body上限约束。
+
+`max_websocket_message_bytes`默认16MiB，同时传给WebSocket协议层的消息和帧限制。接收事件队列固定256条；队列满或消息超限时actor立即退出、释放Rust permit，并在调用方后续recv时返回明确错误。
+
+`cookie_store=False`关闭响应`Set-Cookie`自动写入共享Jar，适合多源并发匿名爬虫；业务需要的Cookie仍可按请求显式传入。异步stream必须使用`aiter_content/aread/atext/ajson/aclose`，同步`content/text/json/close`会明确拒绝，避免阻塞Python事件循环。
+
+极端调试结果：8MiB gzip解压体在1MiB上限下被中止，stream模式完整分块读取；`max_connections=1`被长流占用时1000个不同DNS/Origin等待任务RSS只增加约17MB、线程增加0，Session关闭后全部快速失败；WebSocket突发300帧返回明确256条队列溢出错误；默认代理A/B高频切换期间500请求全部成功，身份和Proxy来自同一原子快照；IPv6计量代理首行确认为`CONNECT [::1]:443`。
+
+第二轮极端协议覆盖：响应Body恰好上限成功、上限+1字节失败；Body提前EOF、非法chunk、截断gzip和重定向环均稳定失败，随后同Session正常sentinel请求成功；非法Header名称/值、NaN/Infinity超时、超大Semaphore参数均在边界拒绝；1000等待任务取消后无后台Client构建；DNS UDP截断后TCP回退、9项配置对8项LRU淘汰、100并发同DNS配置去重和等价DNS地址归一化通过；WebSocket非法UTF-8、服务端掩码帧、2MiB消息对1MiB限制和无消费者300帧溢出均明确失败并释放permit。
+
+最新wheel长期本地HTTP/1稳定性：固定指纹100并发共10万请求全部成功，吞吐约3769至4929请求/秒、线程稳定49、句柄544至546、RSS约32至39MB；14个有效指纹轮换共10万请求全部成功，吞吐约3385至4446请求/秒、线程稳定49、句柄575至584、RSS约35至42MB。曾将单Host空闲上限误设为2，导致约3万请求后TIME_WAIT达到15117并耗尽accept；最终修正为每Client空闲上限等于其分摊的有界总池容量，复测不再失败。
+
+Session关闭语义：关闭Semaphore并清除Client、DNS和Origin缓存，所有等待者快速失败，之后拒绝新请求；已经返回给调用方的stream和WebSocket保持对象所有权，由调用方自身close/aclose，不会被其他任务关闭Session时强制截断。并发调用close 100次已验证幂等。
 
 当前chrome142文件有21条原始记录，其中7条含TLS扩展41，属于已恢复握手记录，不能独立用于首次连接；Rust过滤后`fingerprint_count=14`。自然轮换前14次随机无重复引入全部14个有效池，第15次起随机复用这些池。
 
@@ -355,6 +374,8 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 ## 指纹轮换与隔离
 
 `fingerprint_rotation=False` 时，一个 `AsyncSession`/`Session` Python 发包对象会在当前 `impersonate` Profile 的可独立复现变体中随机选择一个。该对象使用同一代理会话时始终保持该指纹，以复用同一变体的 Client、连接池和 TLS Session Cache，适合 Facebook 等连续 cursor 分页。
+
+固定指纹模式下禁止业务代码添加`Connection: close`或`Connection: keep-alive`。HTTP/2连接生命周期由协议层管理；请求级`proxy=`已经按完整代理身份隔离路由。旧客户端通过强制断连确保代理切换的兼容措施会破坏同一代理会话的CONNECT、TLS和HTTP/2复用，不得迁移到`requests_rust`。
 
 当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。依赖服务端既有 TLS ticket 的 PSK 恢复握手记录不会作为新代理会话的首个随机指纹。
 

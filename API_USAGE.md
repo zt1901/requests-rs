@@ -75,7 +75,7 @@ with Session(
 | 参数 | 含义 |
 |---|---|
 | `impersonate` | 必填，内置/自定义指纹中的 profile 名称，或直接传指纹 JSON 文件路径。 |
-| `fingerprint_rotation` | 默认为 `False`。关闭时，一个代理会话内固定选择一个可独立复现变体；开启时按请求轮换变体。 |
+| `fingerprint_rotation` | 默认为`True`，按请求自然轮换并复用已建立的指纹池；需要单一固定指纹时显式设为`False`。 |
 | `headers` | Session 默认 Header，支持 `dict` 或二元组序列。序列可保留重复 Header 和顺序。 |
 | `proxy` | Session 默认代理 URL。 |
 | `proxies` | 协议到代理 URL 的映射，不能和 `proxy` 同时传入。 |
@@ -91,7 +91,10 @@ with Session(
 | `max_connections` | Session内HTTP、代理、流和WebSocket共同使用的Rust原生活跃连接上限，默认`50`。 |
 | `fingerprint_pool` | 是否保存轮换指纹对应的Rust Client和连接池，默认`True`。 |
 | `fingerprint_pool_size` | 最多允许多少个指纹进入保存集合，默认`100`；满后只在已有指纹中随机轮换，不淘汰、不新增。 |
-| `max_cached_origins` | 最多缓存多少个`Origin + 代理身份`路由，默认`100`；超限路由正常请求但使用临时Client，不保存连接。 |
+| `max_cached_origins` | 最多缓存多少个`Origin + 代理身份`路由，默认`4`；超限路由正常请求但使用临时Client，不保存连接。 |
+| `max_response_bytes` | 普通和multipart响应解压后的Body上限，默认`64MiB`；超过立即中止并报错，流式响应不受该完整Body上限影响。 |
+| `max_websocket_message_bytes` | 单条WebSocket消息和帧的最大字节数，默认`16MiB`；超过后协议层终止连接。 |
+| `cookie_store` | 是否自动接收响应`Set-Cookie`并写入Session Jar，默认`True`；并发匿名爬虫可设为`False`并显式传请求Cookie。 |
 
 `impersonate` 直接传路径时，文件必须只包含一个 `profile`，但可以包含该 profile 的多个指纹变体。Session 会自动识别 profile，并继续遵循固定或轮换变体策略。此时不能再同时传 `fingerprints_path`。
 
@@ -187,7 +190,15 @@ asyncio.run(main())
 
 指纹轮换使用自然惰性建池。池未满时会随机选择一个尚未入池的有效指纹并保存其Client；达到`fingerprint_pool_size`后，只在已有指纹池中随机复用，不做LRU一进一出。当前chrome142原始记录21条，其中带TLS扩展41的恢复握手记录不能独立用于首次连接，实际可建池变体为14条，因此默认上限100时最终最多保留14个指纹池。普通`get/post`第一次命中某指纹时自然建立连接，不提供额外连接建立API，也不会产生隐藏请求流量。
 
+Chrome profile在每条自然新建TLS连接时由BoringSSL随机排列允许变化的ClientHello扩展，因此同一个指纹Client连接池可以包含多条不同JA3的TLS连接；每条已建立TLS/H2连接内部JA3固定并继续复用，不会为了变化JA3主动断开热连接。JA3扩展顺序可变化，归一化JA3N保持稳定。
+
 `max_cached_origins`按`scheme + host + port + 完整代理身份`的哈希计算。不同path、query和`params`不增加名额，例如`https://example.com/api?page=1`和`?page=2`都属于同一个Origin并可复用连接；换域名、端口、HTTP/HTTPS协议或代理session ID才算新路由。代理凭据不以明文存入路由集合。设为`0`表示不缓存任何Origin连接。
+
+业务代码不要为了切换代理而发送`Connection: close`，也不要显式发送`Connection: keep-alive`。HTTP/2禁止这类hop-by-hop Header；`requests_rust`会按完整代理身份自动隔离连接路由，并在同一Origin与同一代理身份下自然复用CONNECT、TLS和HTTP/2连接。旧HTTP客户端依赖强制断连换出口的兼容措施不适用于本库。
+
+普通非流式响应和multipart响应会在Rust中按解压后的字节数执行`max_response_bytes`限制，默认64MiB。gzip、Brotli、zstd或deflate小压缩包解压后超过上限也会被中止，不能依赖压缩前`Content-Length`绕过。需要处理更大响应时应使用`stream=True`分块消费，或在明确评估内存后提高该值。
+
+`Session.close()`/`AsyncSession.close()`关闭连接许可并清理Session缓存，之后拒绝新请求。已经返回给调用方的stream或WebSocket是独立的活跃对象，不会被Session强制异步销毁；调用方仍应使用响应/WebSocket自己的`close()`或`aclose()`结束它们。这样避免另一个任务关闭Session时截断正在消费的数据，同时保持资源所有权明确。
 
 
 异步方法：
@@ -298,6 +309,8 @@ async with AsyncSession(impersonate="chrome146") as session:
 
 WebSocket 长连接会持续占用 `AsyncSession.max_connections` 中的一个槽位。若 `max_connections=50` 且已经保持 25 条 WebSocket，普通 HTTP、HTTPS 或 SOCKS5 请求最多还能同时占用 25 个槽位；这 25 个槽位可以按任意比例混合，不要求预先固定每种协议的数量。
 
+WebSocket单条消息和单帧默认限制为16MiB；接收事件队列最多256条。超大消息或队列溢出都会明确终止连接并返回错误，不会把无限消息堆积到Python内存。需要更大业务消息时应在明确评估峰值内存后提高`max_websocket_message_bytes`。
+
 WebSocket 握手、发送和 Close frame 写入均使用传给 `websocket()` 的 `timeout`。Rust actor 在普通帧发送发生背压时仍会优先接收 Close 命令；Close 可以中断当前发送，并在关闭写入超时后强制结束 actor、释放底层连接和原生连接许可。
 
 ## Cookie 与代理会话
@@ -320,6 +333,8 @@ session.set_proxy("http://user:password@proxy-b.example:8080")
 `set_proxy()` 只应在代理身份真实变化时调用。它会清除旧代理的 Client、CONNECT、TCP、TLS 和 HTTP/2 链路，确保新代理不复用旧代理连接。高并发单请求换代理应使用请求级 `proxy=`，不要在多个协程中并发调用 `set_proxy()`。
 
 请求级代理按完整代理身份隔离连接池。即使 50 个 IPIPGO URL 的代理主机和端口相同，只要用户名中的 session ID 不同，HTTP Basic 认证值或 SOCKS5 用户名密码就不同，底层也会使用不同连接池分区并建立不同代理连接。业务侧仍应保持同一个 `AsyncSession`，不要为每个代理 session ID 新建 HTTP Session。
+
+切换请求级代理时不要附加`Connection: close`。新代理session ID已经产生独立路由；强制关闭连接只会破坏固定指纹模式下同一代理会话的连接复用，增加CONNECT、TLS和HTTP/2重建开销。
 
 对需保持 IP 的 cursor 分页，推荐：一个代理会话对应一个 `AsyncSession`，`fingerprint_rotation=False`，正常分页不切代理；仅请求失败重试时更换 sticky session。
 
@@ -390,6 +405,10 @@ finally:
 ```
 
 一个流式 `Response` 同时只能有一个活动消费者。提前退出循环时应显式 `close()` 或 `await aclose()`。
+
+异步流响应禁止同步读取`response.content/text/json()`或调用同步`close()`，这些操作会阻塞事件循环。使用`await response.aread()`、`await response.atext()`、`await response.ajson()`或`await response.aclose()`。
+
+`Session(proxies=...)`之后调用`set_proxy()`会清除原协议映射，后续默认请求改用新代理；请求级`proxy=`/`proxies=`仍只影响单次请求。
 
 ## Multipart 上传
 

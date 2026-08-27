@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -129,7 +130,7 @@ async def 运行一轮(库名称: str, 模式: str, 目标地址: str, 代理地
         "native_transfer_upload_bytes": 原生统计上行 or None,
         "native_transfer_download_bytes": 原生统计下行 or None,
         "p50_ms": statistics.median(latencies) * 1000,
-        "p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] * 1000,
+        "p95_ms": latencies[math.ceil(len(latencies) * 0.95) - 1] * 1000,
     }
 
 
@@ -159,7 +160,7 @@ async def main() -> None:
         [str(executable)],
         cwd=Rust后端目录,
         env=environment,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )
     proxy = ThreadingHTTPServer(("127.0.0.1", 0), IPIPGO本地代理)
@@ -173,8 +174,11 @@ async def main() -> None:
             for library in ("requests_rust", "curl_cffi"):
                 result = await 运行一轮(library, mode, target_url, proxy_url)
                 if library == "requests_rust":
-                    assert result["native_transfer_upload_bytes"] == result["proxy_client_to_server_bytes"]
-                    # 原生计量包含上游代理返回的CONNECT响应，外层代理统计从隧道建立后开始。
+                    # 原生计量包含上游CONNECT请求/响应；外层代理只统计隧道建立后的字节。
+                    connect_upload = (
+                        result["native_transfer_upload_bytes"] - result["proxy_client_to_server_bytes"]
+                    )
+                    assert 0 < connect_upload < 4096
                     assert result["native_transfer_download_bytes"] >= result["proxy_server_to_client_bytes"]
                 results.append(result)
                 print(json.dumps(result, ensure_ascii=False))

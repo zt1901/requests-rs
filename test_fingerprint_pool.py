@@ -154,6 +154,29 @@ async def 验证自然指纹池(port: int) -> None:
             assert response.content == b"pool-ok"
         assert session.fingerprint_pool_count == 0
 
+    async with AsyncSession(
+        impersonate="chrome146",
+        max_cached_origins=4,
+    ) as session:
+        for index in range(4):
+            try:
+                await session.get(
+                    f"http://failed-origin-{index}.test/",
+                    dns_servers=["127.0.0.1:1"],
+                    dns_timeout=0.1,
+                    timeout=1,
+                )
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("不可解析Origin意外请求成功")
+        assert session.cached_origin_count == 0
+        response = await session.get(
+            f"http://127.0.0.1:{port}/valid-origin",
+        )
+        assert response.content == b"pool-ok"
+        assert session.cached_origin_count == 1
+
 
 def main() -> None:
     server = 线程代理服务(("127.0.0.1", 0), 代理处理器)

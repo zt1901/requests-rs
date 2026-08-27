@@ -82,7 +82,7 @@ class RequestsRustCrawler:
         fingerprint_rotation: bool = False,
         fingerprint_pool: bool = True,
         fingerprint_pool_size: int = 100,
-        max_cached_origins: int = 100,
+        max_cached_origins: int = 4,
         transfer_stats: bool = False,
         accept_encoding: str | None = None,
     ) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import statistics
 import time
@@ -405,7 +406,7 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
                 if len(posts) >= results_limit or not next_cursor or not has_next_page:
                     if 分页耗时列表:
                         sorted_times = sorted(分页耗时列表)
-                        p95_index = min(len(sorted_times) - 1, int(len(sorted_times) * 0.95))
+                        p95_index = math.ceil(len(sorted_times) * 0.95) - 1
                         print(
                             "分页时效汇总: "
                             f"页数={len(分页耗时列表)}，"
