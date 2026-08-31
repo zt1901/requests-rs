@@ -11,7 +11,7 @@
 ## 优点
 
 - **Rust 网络路径**：DNS、代理、TLS、HTTP/1.1/2、WebSocket、连接池、Cookie、超时、流式 Body 和 multipart 均由 Rust/Tokio 执行。同步请求等待及自定义指纹文件读取、解析不占用 GIL。
-- **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome142`、`chrome146`、`chrome150`、`firefox151`。
+- **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome142`、`chrome146`、`chrome150`、`edge152`、`firefox151`；这些名称代表已采集并验证的固定快照，不等同于官网当前 Stable，也不会自动随浏览器更新。
 - **实例级指纹隔离**：每个 `Session` 可在构造时从不同 JSON 文件独立加载 profile，不修改进程全局指纹数据，也不影响其他实例。
 - **长期并发友好**：一个 `AsyncSession` 复用连接池和 Cookie Jar；代理、请求头与请求级 Cookie 可按单条请求独立传入。
 - **Rust 原生统一连接上限**：HTTP、HTTPS、HTTP 代理、SOCKS5、流和 WebSocket 共同使用 Tokio `Semaphore`，Python 不维护连接许可队列。
@@ -20,7 +20,8 @@
 ## 研究记录
 
 - Chrome 150 真实浏览器与 Rust profile 的采集对照为 41/41 字段一致。
-- Firefox 151 的 5 个 profile 变体在相同对照项中均为 41/41。
+- Firefox 151五次独立浏览器采集的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此只保留一条火种；新TLS连接继续使用固定NSS扩展顺序，不伪造Chromium式JA3乱序。
+- Edge 152.0.4191.53 使用 `playwright_rust` 操作本机正式版采集单条完整火种；强制50条新TLS连接实测得到50个不同JA3，`fingerprint_id`始终只有火种ID，未建立多变体指纹池。
 - 本地动态代理回显测试已验证 400 条请求的 Header、Cookie 和代理认证 session ID 逐条隔离；吞吐随机器负载和连接建立时序波动，不作为固定性能承诺。
 - 本地 keep-alive、动态代理和长任务脚本继续用于版本间回归；绝对吞吐受硬件、`max_connections`、指纹变体数量和目标服务影响，不作为发布承诺。
 - 同一个 `AsyncSession(max_connections=50)` 已验证同时保持 25 条 WebSocket、15 个 HTTP 代理请求和 10 个 SOCKS5 请求；第 51 个操作会在 Rust 等待 permit。
@@ -34,7 +35,7 @@
 requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ```
 
-Windows x64 本地开发可直接右键运行 `build_and_install.py`。GitHub Actions 已原生构建并安装冒烟验证 Windows ARM64、Linux x64、Linux ARM64、macOS Intel 和 macOS Apple Silicon wheel。云端冒烟确认原生模块可导入、内置profile可读取并可构造Session；HTTP、代理、SOCKS5、WebSocket、IPv6和Facebook完整协议回归仍以Windows x64为准。
+Windows x64 本地开发可直接右键运行 `build_and_install.py`。当前 GitHub Actions 矩阵原生构建并安装冒烟验证 Windows ARM64、Linux x64、Linux ARM64 和 macOS Apple Silicon wheel。云端冒烟确认原生模块可导入、内置 profile 可读取并可构造 Session；HTTP、代理、SOCKS5、WebSocket、IPv6 和 Facebook 完整协议回归仍以 Windows x64 为准。
 
 ## 最小用法
 
@@ -70,7 +71,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
 - HTTP/1.1、HTTP/2、重定向、总超时与 Body 读取超时
 - IPv4、IPv6 和 RFC 6555 Happy Eyeballs
-- Session级静态`resolve`映射和Rust Hickory自定义DNS服务器
+- Session 级静态 `resolve` 映射，以及 Session/请求级 Rust Hickory 自定义 DNS 服务器
 - 固定 profile 或按请求轮换 profile
 - Session Cookie Jar、每请求 Cookie 覆盖、重复 Header 保序
 - Session 默认代理和每请求代理覆盖
@@ -84,7 +85,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 ## 限制
 
 - 当前不发送 HTTP/3。
-- 原生 wheel 必须与操作系统和 CPU 架构匹配；六个平台均已构建，五个云端平台通过原生安装冒烟，当前完整协议回归以 Windows x64 为准。
+- 原生 wheel 必须与操作系统和 CPU 架构匹配；当前五个平台目标均已有构建产物，其中四个云端平台通过原生安装冒烟，完整协议回归以 Windows x64 为准。
 - Linux 构建目标为 glibc manylinux，不等同于 Alpine musl 支持。
 - 不同 profile 不共享 TLS/HTTP/2 连接池，这是指纹隔离的必要限制。
 - 不提供Rust原生`batch()`或库内业务Worker队列；该路线不能减少不同代理身份的握手成本，并会重复现有单请求Future与Rust统一连接上限的生命周期语义。批量业务使用Python有限Worker逐条调用同一个`AsyncSession`。

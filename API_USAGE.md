@@ -22,10 +22,9 @@ wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
 | Windows ARM64 | `win_arm64` |
 | Linux x64 | `manylinux_2_34_x86_64` |
 | Linux ARM64 | `manylinux_2_34_aarch64` |
-| macOS Intel | `macosx_10_12_x86_64` |
 | macOS Apple Silicon | `macosx_11_0_arm64` |
 
-wheel 必须与操作系统和 CPU 架构匹配。Windows ARM64、Linux x64、Linux ARM64、macOS Intel和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建、pip安装、原生模块导入、profile读取和Session构造冒烟。当前Windows x64已完成本文所列完整协议回归；其他平台的安装冒烟不等同于同等级全协议验证。Alpine musl当前不在发布矩阵中。
+wheel 必须与操作系统和 CPU 架构匹配。Windows ARM64、Linux x64、Linux ARM64 和 macOS Apple Silicon wheel 已在对应原生 GitHub runner 完成构建、pip 安装、原生模块导入、profile 读取和 Session 构造冒烟。当前 Windows x64 已完成本文所列完整协议回归；其他平台的安装冒烟不等同于同等级全协议验证。Alpine musl 当前不在发布矩阵中。
 
 ## 导入与内置指纹
 
@@ -47,7 +46,7 @@ from requests_rust import (
 print(available_profiles())
 ```
 
-当前内置 profile 为 `chrome142`、`chrome146`、`chrome150` 和 `firefox151`。profile 决定 TLS/HTTP2 指纹行为，不应当用它保存业务 Cookie、认证 Header、CSRF、签名、`Referer`、`Origin`、时间戳或 nonce。
+当前内置 profile 为 `chrome142`、`chrome146`、`chrome150`、`edge152` 和 `firefox151`。它们是已采集并验证的固定浏览器大版本快照，不代表官网当前 Stable，也不会自动跟随浏览器升级。`edge152`来自本机Edge 152.0.4191.53，产品UA为`Edg/152.0.0.0`。profile 决定 TLS/HTTP2 指纹行为，不应当用它保存业务 Cookie、认证 Header、CSRF、签名、`Referer`、`Origin`、时间戳或 nonce。
 
 ## 同步请求
 
@@ -190,7 +189,9 @@ asyncio.run(main())
 
 指纹轮换使用自然惰性建池。池未满时会随机选择一个尚未入池的有效指纹并保存其Client；达到`fingerprint_pool_size`后，只在已有指纹池中随机复用，不做LRU一进一出。当前chrome142原始记录21条，其中带TLS扩展41的恢复握手记录不能独立用于首次连接，实际可建池变体为14条，因此默认上限100时最终最多保留14个指纹池。普通`get/post`第一次命中某指纹时自然建立连接，不提供额外连接建立API，也不会产生隐藏请求流量。
 
-Chrome profile在每条自然新建TLS连接时由BoringSSL随机排列允许变化的ClientHello扩展，因此同一个指纹Client连接池可以包含多条不同JA3的TLS连接；每条已建立TLS/H2连接内部JA3固定并继续复用，不会为了变化JA3主动断开热连接。JA3扩展顺序可变化，归一化JA3N保持稳定。
+Chrome和Edge profile在每条自然新建TLS连接时由BoringSSL随机排列允许变化的ClientHello扩展，因此同一个指纹Client连接池可以包含多条不同JA3的TLS连接；每条已建立TLS/H2连接内部JA3固定并继续复用，不会为了变化JA3主动断开热连接。`edge152`只保存一条火种记录，轮换模式不会建立多个Edge指纹池；JA3扩展顺序可变化，归一化JA3N、Cipher、Groups、ALPN和HTTP/2指纹保持对应浏览器版本语义。
+
+`firefox151`同样只保存一条火种记录，但真实Firefox的五次独立采集均保持同一JA3和扩展顺序，因此不会启用Chromium式随机排列。`fingerprint_rotation=True`时Firefox池仍只有一个Client；新TLS连接的密钥、随机数和ECH载荷自然变化，JA3、JA4、Cipher、扩展顺序和HTTP/2指纹保持Firefox 151语义。
 
 `max_cached_origins`按`scheme + host + port + 完整代理身份`的哈希计算。不同path、query和`params`不增加名额，例如`https://example.com/api?page=1`和`?page=2`都属于同一个Origin并可复用连接；换域名、端口、HTTP/HTTPS协议或代理session ID才算新路由。代理凭据不以明文存入路由集合。设为`0`表示不缓存任何Origin连接。
 
@@ -246,6 +247,8 @@ created = post(
 | `files` | multipart 文件路径映射。不能和 `json` 同时使用。 |
 | `timeout` | 覆盖 Session 请求总超时。 |
 | `read_timeout` | 覆盖 Session Body 读取超时。 |
+| `dns_servers` | 本请求的 DNS 服务器列表；不传时继承 Session，传空列表时仅本请求恢复系统 DNS。 |
+| `dns_timeout` | 本请求的 DNS 查询超时；只能与请求级 `dns_servers` 同时传入。 |
 | `stream` | `True` 时不预读完整响应 Body。multipart 响应暂不支持。 |
 | `proxy` | 本请求代理覆盖；`None` 表示本请求直连。 |
 | `proxies` | 本请求协议代理映射；不能和 `proxy` 同时使用。 |

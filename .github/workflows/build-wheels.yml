@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --force-reinstall dist/requests_rust-*.whl
-          python -c "from requests_rust import AsyncSession, Session, available_profiles; p = available_profiles(); assert {'chrome146', 'chrome150', 'firefox151'} <= set(p), p; Session(impersonate='chrome146').close(); print('smoke ok:', p)"
+          python -c "from requests_rust import AsyncSession, Session, available_profiles; p = available_profiles(); assert {'chrome146', 'chrome150', 'edge152', 'firefox151'} <= set(p), p; e = Session(impersonate='edge152'); f = Session(impersonate='firefox151'); assert e.fingerprint_count == 1 and f.fingerprint_count == 1; e.close(); f.close(); print('smoke ok:', p)"
 
       - name: 上传wheel产物
         uses: actions/upload-artifact@v4

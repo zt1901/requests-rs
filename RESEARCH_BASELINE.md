@@ -100,6 +100,12 @@ with Session(
 3. **不自动猜业务**：库不根据 URL 猜 `Referer`、`Origin`、`Sec-Fetch-*`、签名、Cookie 或 CSRF。
 4. **不把会话态伪装成指纹**：认证、Cookie、CSRF、实验分桶和签名应留在业务模板/业务流程，不能污染可复用 profile。
 
+## 浏览器产品版本与 Profile 命名
+
+Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome142`、`chrome146`、`chrome150`、`edge152`、`firefox151`只代表已经采集并验证的指纹快照，不是“自动指向官网最新版”的别名。`edge152`以一条完整线级记录作为火种，后续JA3变化由BoringSSL每连接扩展排列产生；`firefox151`的五次独立采集保持相同JA3和扩展顺序，也收敛为一条火种，但不启用Chromium式乱序。不能复制多条随机连接记录伪装成多个Profile变体。
+
+新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
+
 ## 已证伪路线：Rust原生batch
 
 本项目明确不新增`session.batch()`、`submit_many()`、Rust常驻业务Worker队列或其他把一批业务请求整体搬进Rust调度的接口。

@@ -778,12 +778,17 @@ fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
     Ok((headers, original))
 }
 
+fn uses_chromium_extension_permutation(profile: &str) -> bool {
+    let normalized = normalize_profile(profile);
+    normalized.starts_with("chrome") || normalized.starts_with("edge")
+}
+
 fn build_emulation(record: &Record) -> Result<Emulation> {
     let (headers, original) = build_headers(&record.http)?;
     let mut builder = Emulation::builder()
         .tls_options(build_tls(
             &record.tls,
-            record.profile.to_ascii_lowercase().starts_with("chrome"),
+            uses_chromium_extension_permutation(&record.profile),
         )?)
         .headers(headers)
         .orig_headers(original);
@@ -893,9 +898,6 @@ fn build_client_with_dns(
     };
     if let Some(resolver) = resolver {
         builder = builder.dns_resolver(resolver.clone());
-    } else {
-        // 未指定DNS服务器时保持原有系统getaddrinfo语义。
-        builder = builder.no_hickory_dns();
     }
     for (domain, addrs) in state.dns_overrides.iter() {
         builder = builder.resolve_to_addrs(domain.clone(), addrs.clone());

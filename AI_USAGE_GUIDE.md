@@ -4,7 +4,7 @@
 
 `requests_rust`是Python 3.10+的浏览器指纹HTTP、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust负责DNS、IPv4/IPv6、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、WebSocket、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径直接使用进程级Tokio Runtime，不经过 `asyncio.to_thread`。
 
-当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64、macOS Intel和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建和安装冒烟；必须安装与平台、CPU匹配的wheel，安装冒烟不替代完整协议回归。
+当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建和安装冒烟；必须安装与平台、CPU匹配的wheel，安装冒烟不替代完整协议回归。
 
 ## 导入
 
@@ -30,7 +30,7 @@ from requests_rust import (
 )
 ```
 
-内置Profile：`chrome142`、`chrome146`、`chrome150`、`firefox151`。
+内置Profile：`chrome142`、`chrome146`、`chrome150`、`edge152`、`firefox151`。这些名称是已采集并验证的固定快照，不代表官网当前Stable，也不会自动随浏览器升级。`edge152`的火种来自本机Edge 152.0.4191.53，UA为`Edg/152.0.0.0`。
 
 ```python
 print(available_profiles())
@@ -73,33 +73,36 @@ Session(
 
 `fingerprint_pool=True`启用自然惰性指纹Client缓存；`fingerprint_pool_size`默认100，池未满时随机引入尚未入池的有效指纹，满后只在已有集合内随机，不淘汰、不新增。关闭时每次请求使用临时Client。`max_cached_origins`默认4，按Origin和完整代理身份哈希限制可保存连接的路由数；query、params和path不增加名额，超限路由仍请求但不缓存。Session关闭和`set_proxy()`会释放/清空全部相关Client与路由状态。
 
-Chrome profile默认开启指纹轮换，并在每条自然新建TLS连接时启用BoringSSL ClientHello扩展随机排列。同一Client池内不同物理TLS连接可有不同JA3，已有H2连接仍原样复用；不主动拆连接换JA3。JA3N、Cipher集合、Groups和H2指纹保持profile语义。需要固定单指纹时显式设置`fingerprint_rotation=False`。
+Chrome和Edge profile默认开启BoringSSL ClientHello扩展随机排列：每条自然新建TLS连接可得到不同JA3，已有H2连接仍原样复用，不主动拆连接换JA3。`edge152`只保留一条火种记录，不建立多变体指纹池；JA3N、Cipher集合、Groups、ALPN和H2指纹保持Edge 152语义。需要固定Profile选择时仍可显式设置`fingerprint_rotation=False`，但新TLS连接的Chromium扩展排列继续由底层生成。
+
+`firefox151`也只保留一条火种，但不启用BoringSSL扩展乱序。五次独立Firefox 151采集的JA3、JA4、ClientHello长度、扩展顺序、Cipher、Groups、Signature Algorithms、ALPN和HTTP/2参数全部一致；轮换模式池大小为1，新连接仅保留TLS协议本身应有的随机密钥/ECH载荷。
 
 `max_response_bytes`默认64MiB，限制普通和multipart响应解压后的Body；所有压缩编码都必须在解压后计数。超限返回明确RuntimeError并关闭该响应，避免压缩炸弹或高并发大Body耗尽进程内存。流式响应由调用方分块消费，不受完整Body上限约束。
 
 `max_websocket_message_bytes`默认16MiB，同时传给WebSocket协议层的消息和帧限制。接收事件队列固定256条；队列满或消息超限时actor立即退出、释放Rust permit，并在调用方后续recv时返回明确错误。
 
 `cookie_store=False`关闭响应`Set-Cookie`自动写入共享Jar，适合多源并发匿名爬虫；业务需要的Cookie仍可按请求显式传入。异步stream必须使用`aiter_content/aread/atext/ajson/aclose`，同步`content/text/json/close`会明确拒绝，避免阻塞Python事件循环。
+项目对wreq使用`default-features=false`。根证书由本库显式注入`CertStore`，自定义DNS由本库Hickory Resolver注入，因此不启用wreq重复的`webpki-roots`和`hickory-dns`默认分支；Cookie、stream、multipart、gzip/Brotli/zstd/deflate、SOCKS5、WebSocket和Tokio均有公开API实际使用，不能裁剪。
 
 极端调试结果：8MiB gzip解压体在1MiB上限下被中止，stream模式完整分块读取；`max_connections=1`被长流占用时1000个不同DNS/Origin等待任务RSS只增加约17MB、线程增加0，Session关闭后全部快速失败；WebSocket突发300帧返回明确256条队列溢出错误；默认代理A/B高频切换期间500请求全部成功，身份和Proxy来自同一原子快照；IPv6计量代理首行确认为`CONNECT [::1]:443`。
 
 第二轮极端协议覆盖：响应Body恰好上限成功、上限+1字节失败；Body提前EOF、非法chunk、截断gzip和重定向环均稳定失败，随后同Session正常sentinel请求成功；非法Header名称/值、NaN/Infinity超时、超大Semaphore参数均在边界拒绝；1000等待任务取消后无后台Client构建；DNS UDP截断后TCP回退、9项配置对8项LRU淘汰、100并发同DNS配置去重和等价DNS地址归一化通过；WebSocket非法UTF-8、服务端掩码帧、2MiB消息对1MiB限制和无消费者300帧溢出均明确失败并释放permit。
 
-最新wheel长期本地HTTP/1稳定性：固定指纹100并发共10万请求全部成功，吞吐约3769至4929请求/秒、线程稳定49、句柄544至546、RSS约32至39MB；14个有效指纹轮换共10万请求全部成功，吞吐约3385至4446请求/秒、线程稳定49、句柄575至584、RSS约35至42MB。曾将单Host空闲上限误设为2，导致约3万请求后TIME_WAIT达到15117并耗尽accept；最终修正为每Client空闲上限等于其分摊的有界总池容量，复测不再失败。
+长期稳定性和性能数据只用于同一构建、同一机器、同一后端及同一并发配置下的版本回归。不得把本地吞吐、线程、句柄、RSS或TIME_WAIT绝对值写成跨环境发布承诺。
 
 Session关闭语义：关闭Semaphore并清除Client、DNS和Origin缓存，所有等待者快速失败，之后拒绝新请求；已经返回给调用方的stream和WebSocket保持对象所有权，由调用方自身close/aclose，不会被其他任务关闭Session时强制截断。并发调用close 100次已验证幂等。
 
 当前chrome142文件有21条原始记录，其中7条含TLS扩展41，属于已恢复握手记录，不能独立用于首次连接；Rust过滤后`fingerprint_count=14`。自然轮换前14次随机无重复引入全部14个有效池，第15次起随机复用这些池。
 
-Facebook真实60帖对比：轮换且不保池平均3.367秒/页、1次重试；轮换且保池平均2.670秒/页、0次重试，约快20.7%。前14个有效指纹完成自然建池后，后续页时延从约2.5至3.9秒下降到约1.6至2.3秒。固定单指纹30帖平均1.844秒/页，短链路仍是最快模式。
+单Origin连续分页时，固定指纹更有利于持续复用同一条热CONNECT、TLS和HTTP/2链路；轮换模式优先获得指纹多样性，并在自然建池后复用各变体自己的连接。两种模式的取舍必须按当前代理出口和业务链路实测，不保留历史秒数或百分比作为当前结论。
 
-历史同口径`benchmark_proxy_rust_vs_curl_cffi.py`在fat LTO最终成品重跑1万请求、10 Worker、本地HTTPS+CONNECT代理：requests_rust 265.03请求/秒、P50 5.82ms、P95 206.63ms、RSS峰值增量29.34MB、CPU 5.80ms/请求；curl_cffi 32.98请求/秒、P50 305.65ms、P95 506.52ms、RSS峰值增量4.06MB、CPU 31.30ms/请求。Rust相对吞吐约8.04倍，但RSS仍更高。旧记录为3412/909请求每秒，当前rnet也从3387降至399，说明本机基准后端/代理环境整体比旧测试慢约一个数量级，绝对数字不能跨环境横比。热路径优化前同轮Rust为258.33请求/秒、P50 6.08ms、P95 226.58ms、RSS 31.00MB；优化后吞吐提升约2.6%、P95下降约8.8%、RSS下降约5.4%。
+`requests_rust`与`curl_cffi`的性能比较只允许使用同一构建、后端、代理、并发和连接复用条件；环境变化后的历史请求/秒和倍数结论不再作为维护依据。
 
 `resolve`提供Session级静态域名到IPv4/IPv6覆盖；连接IP改变但URL、Host、TLS SNI和证书域名保持不变。`dns_servers`接入Rust Hickory resolver，支持IP或IP:端口、A/AAAA、TTL缓存、UDP和TCP回退；`dns_timeout`控制单次查询。未指定时继续使用系统getaddrinfo。
 
 日常DNS配置只推荐`AsyncSession(dns_servers=[...])`。普通请求也支持`await session.get(url, dns_servers=[...], dns_timeout=...)`请求级覆盖；相同配置使用每指纹变体8项LRU Rust Client缓存，Session关闭或默认代理切换时清空。`resolve`只用于HTTPS/WSS固定连接IP但保持原域名SNI、证书和Host的高级场景，不要把它写成常规DNS服务器入口。
 
-DNS并发基准固定使用1000个独立`get()`任务一次性起跑并设置`max_connections=1000`，不增加Worker限流层。当前Windows本机冷启动1000条HTTP/1 TCP连接时，回显服务和Socket容量会拒绝大量连接：系统DNS/直接IP成功114、Session DNS成功132、单get DNS成功116，峰值RSS约50至71MB、线程51至54。三组成功量级接近，失败主要来自本机1000连接冷启动容量而非DNS覆盖。历史文档中的10k级本地吞吐当前无法复现；相同旧资源脚本当前约356请求/秒，旧绝对数字继续视为证伪，不可作为性能承诺。
+DNS性能测试必须固定服务、任务模型和连接状态，并同时记录成功率与资源峰值。千级冷连接一次起跑主要测量Socket、accept和临时端口容量，不能把连接拒绝归因于DNS覆盖本身。
 
 profile 默认 Header 只在调用方没有传同名 Header 时兜底。浏览器 Copy as cURL 或业务代码传入的所有 Header，包括 `User-Agent` 与 `sec-ch-ua*`，均原样优先，库不接管或替换。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化；调用方应按实际请求传入。
 
@@ -379,7 +382,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。依赖服务端既有 TLS ticket 的 PSK 恢复握手记录不会作为新代理会话的首个随机指纹。
 
-`fingerprint_rotation=True` 按原子计数器循环该 Profile 的全部变体。每个变体独立拥有 Client、连接池和 TLS Session Cache，不同指纹绝不共享 H2/TLS 连接；同一 Session 共享 Cookie Jar。多个 Session 不共享 Cookie、代理、连接池或 TLS Session Cache。
+`fingerprint_rotation=True`使用自然惰性指纹池：多变体Profile池未满时从尚未入池的有效变体中随机加入一个，达到`fingerprint_pool_size`后只在已有成员中随机复用，不淘汰也不继续扩池。`edge152`和`firefox151`都只有一条火种，因此池始终只有一个Client；Edge的JA3变化来自该Client每条新TLS连接的BoringSSL扩展排列，Firefox则保持真实NSS固定JA3和扩展顺序。每个变体独立拥有Client、连接池和TLS Session Cache，不同指纹绝不共享H2/TLS连接；同一Session共享Cookie Jar，多个Session不共享Cookie、代理、连接池或TLS Session Cache。
 
 ## GIL模型
 
@@ -403,7 +406,8 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 ## 已验证范围
 
 - Chrome 150真实浏览器与requests_rust：41/41，100%。
-- Firefox 151真实浏览器与requests_rust：5个变体均41/41，100%。
+- Firefox 151五次独立浏览器采集的核心TLS/HTTP2字段全部一致，已收敛为一条火种；公开Profile数量为1，不启用Chromium式扩展乱序。
+- Edge 152.0.4191.53由`playwright_rust`采集单条完整火种；公开Profile数量为1，默认UA与Client Hints通过同步/异步测试，强制50条新TLS连接得到50个不同JA3且始终使用同一`fingerprint_id`，公网HTTPS证书验证返回200。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
 - WebSocket覆盖同步/异步、WS/WSS、HTTP代理、WSS CONNECT预认证、SOCKS5、服务端Close、控制帧边界、50条不同代理身份和25 WS + 15 HTTP + 10 SOCKS5混合上限。
@@ -412,7 +416,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 已知边界
 
-- 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64、macOS Intel和Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
+- 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
 - 当前manylinux目标依赖glibc，不代表Alpine musl支持。
 - 当前不实现HTTP/3发送。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。

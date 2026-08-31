@@ -27,7 +27,7 @@ rand = "0.9"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
 url = "2"
 webpki-root-certs = "1"
-wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws", "hickory-dns"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws"] }
 zstd = "0.13"
 
 [dev-dependencies]
@@ -35,7 +35,7 @@ http = "1"
 http2 = { path = "vendor/http2" }
 
 [target.'cfg(not(windows))'.dependencies]
-wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws", "hickory-dns", "prefix-symbols"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws", "prefix-symbols"] }
 
 [profile.release]
 codegen-units = 1

@@ -2257,7 +2257,6 @@ dependencies = [
  "bytes",
  "cookie",
  "futures-util",
- "hickory-resolver",
  "http",
  "http-body",
  "http-body-util",
@@ -2279,7 +2278,6 @@ dependencies = [
  "tower",
  "tower-http",
  "url",
- "webpki-root-certs",
  "wreq-proto",
  "wreq-rt",
 ]

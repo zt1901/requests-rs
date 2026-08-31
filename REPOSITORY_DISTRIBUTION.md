@@ -28,7 +28,7 @@ https://github.com/zt1901/requests_rust-source.git
 - `.github/workflows/build-wheels.yml` 自动构建流水线。
 - 各平台 wheel 的构建产物和源码仓库内的构建 Release；构建成功与完整协议验证必须分别记录。
 
-自动构建目标：
+当前构建目标：
 
 | 平台 | Rust target | wheel 标签 | 构建位置 |
 |---|---|---|---|
@@ -36,10 +36,10 @@ https://github.com/zt1901/requests_rust-source.git
 | Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | GitHub Actions |
 | Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | GitHub Actions |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | GitHub Actions |
-| macOS Intel | `x86_64-apple-darwin` | `macosx_10_12_x86_64` | GitHub Actions |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | GitHub Actions |
 
-当前完整HTTP、代理、SOCKS5、WebSocket、IPv6和混合连接上限回归以Windows x64为准。Windows ARM64、Linux x64、Linux ARM64、macOS Intel和macOS Apple Silicon已在对应原生runner完成wheel构建、pip安装、原生模块导入、profile读取和Session构造冒烟；不得把安装冒烟写成同等级全协议验证。当前没有Alpine musllinux发布目标。
+当前完整HTTP、代理、SOCKS5、WebSocket、IPv6和混合连接上限回归以Windows x64为准。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已在对应原生runner完成wheel构建、pip安装、原生模块导入、profile读取和Session构造冒烟；不得把安装冒烟写成同等级全协议验证。当前没有macOS Intel或Alpine musllinux发布目标。
+标签触发的GitHub Release任务只汇总四个Actions平台产物；Windows x64由本机`build_and_install.py`构建，发布前必须单独核验并加入同版本Release。
 
 Windows x64 本机构建入口：
 
@@ -61,7 +61,7 @@ python build_and_install.py
 
 - 简短的 `README.md`，仅说明安装方式、支持平台和源码仓库边界。
 - GitHub Release。
-- 以下六种目标平台的已验证 `.whl` 文件；未实际构建或未通过对应平台验收的产物不得写成已发布支持。
+- 当前五种目标平台的已验证 `.whl` 文件；未实际构建或未通过对应平台验收的产物不得写成已发布支持。
 
 禁止内容：
 
@@ -89,7 +89,6 @@ requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 requests_rust-0.3.0-cp310-abi3-win_arm64.whl
 requests_rust-0.3.0-cp310-abi3-manylinux_2_34_x86_64.whl
 requests_rust-0.3.0-cp310-abi3-manylinux_2_34_aarch64.whl
-requests_rust-0.3.0-cp310-abi3-macosx_10_12_x86_64.whl
 requests_rust-0.3.0-cp310-abi3-macosx_11_0_arm64.whl
 ```
 
