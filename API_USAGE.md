@@ -88,9 +88,9 @@ with Session(
 | `dns_timeout` | 自定义DNS单次查询超时，默认`5`秒。 |
 | `fingerprints_path` | 可选自定义指纹 JSON 路径，仅在当前 Session 构造时独立加载。 |
 | `max_connections` | Session内HTTP、代理、流和WebSocket共同使用的Rust原生活跃连接上限，默认`50`。 |
-| `fingerprint_pool` | 是否保存多变体Profile对应的Rust Client，默认`True`；Chrome/Edge始终使用请求级临时Client，不借此复用物理连接。 |
+| `fingerprint_pool` | 是否保存多变体Profile对应的Rust Client，默认`True`；所有Profile都可复用匹配Origin和代理身份的物理连接。 |
 | `fingerprint_pool_size` | 自定义多变体Profile最多允许多少个变体进入保存集合，默认`100`；当前内置版本均只有一条火种。 |
-| `max_cached_origins` | 非Chromium Profile最多缓存多少个`Origin + 代理身份`路由，默认`4`；Chrome/Edge为保证每请求新JA3而不缓存路由。 |
+| `max_cached_origins` | 最多缓存多少个`Origin + 完整代理身份`路由，默认`4`；超限路由正常请求但使用临时Client。 |
 | `max_response_bytes` | 普通和multipart响应解压后的Body上限，默认`64MiB`；超过立即中止并报错，流式响应不受该完整Body上限影响。 |
 | `max_websocket_message_bytes` | 单条WebSocket消息和帧的最大字节数，默认`16MiB`；超过后协议层终止连接。 |
 | `cookie_store` | 是否自动接收响应`Set-Cookie`并写入Session Jar，默认`True`；并发匿名爬虫可设为`False`并显式传请求Cookie。 |
@@ -137,7 +137,7 @@ response = await session.get(
 )
 ```
 
-相同请求级DNS配置在Firefox等可复用Profile中进入8项LRU Rust Client缓存；Chrome/Edge为保证每请求新建TLS，使用请求级临时Client，不复用该Client的Resolver或连接池。传`dns_servers=[]`表示这一次请求临时恢复系统DNS。`dns_timeout`必须和请求级`dns_servers`同时传入。
+相同请求级DNS配置按指纹变体进入8项LRU Rust Client缓存；后续请求可复用Resolver TTL缓存和匹配路由的TCP/TLS/HTTP2连接。传`dns_servers=[]`表示这一次请求临时恢复系统DNS。`dns_timeout`必须和请求级`dns_servers`同时传入。
 
 `resolve`不是日常指定DNS服务器的接口，只用于已经知道目标IP、但HTTPS/WSS仍必须保留原域名TLS语义的高级场景。例如固定CDN节点、固定代理入口IP或绕过错误DNS答案：
 
@@ -189,13 +189,13 @@ asyncio.run(main())
 
 所有当前内置浏览器版本都只保存一条火种。`fingerprint_pool`和`fingerprint_pool_size`仅对调用方提供的多记录自定义Profile保留变体选择与Client缓存语义。
 
-Chrome和Edge每个HTTP请求都构建独立wreq Client；即使目标Origin和代理身份相同，也会重新建立TCP、HTTP代理CONNECT和TLS，确保每个请求发送新的ClientHello并由BoringSSL产生不同JA3。业务`Session`本身不重建，Cookie Jar、默认代理、DNS配置、连接许可和TLS Session Cache仍然共享。
+Chrome和Edge与`curl_cffi`采用相同连接模型：同一wreq Client复用匹配Origin和代理身份的TCP、HTTP代理CONNECT、TLS及HTTP/2连接；复用连接不会产生新ClientHello。连接池自然新建TLS连接时，BoringSSL重新随机排列允许变化的扩展，因此原始JA3可变，JA3N和JA4保持对应浏览器版本语义。
 
 `firefox151`同样只保存一条火种，五次真实完整握手均保持同一JA3和扩展顺序，因此继续缓存并复用Firefox Client与TLS/H2连接。需要新连接时，首次完整握手使用固定NSS JA3；命中共享TLS票据缓存后，恢复握手会自然增加PSK扩展41并形成对应的第二个JA3，这不是第二条Profile火种。
 
-`max_cached_origins`按`scheme + host + port + 完整代理身份`的哈希计算，只约束Firefox及其他非Chromium Profile的可复用路由。不同path、query和`params`不增加名额；Chrome/Edge的`cached_origin_count`保持0。
+`max_cached_origins`按`scheme + host + port + 完整代理身份`的哈希计算。不同path、query和`params`不增加名额；换域名、端口、协议或代理session ID会进入独立路由。
 
-业务代码不要发送`Connection: close`或`Connection: keep-alive`。Chrome/Edge已在库内使用请求级临时Client，额外Header无助于JA3变化；Firefox的HTTP/2连接生命周期由协议层管理。
+业务代码不要发送`Connection: close`或`Connection: keep-alive`。HTTP/2禁止这类hop-by-hop Header，连接复用和自然重连由协议层管理。
 
 普通非流式响应和multipart响应会在Rust中按解压后的字节数执行`max_response_bytes`限制，默认64MiB。gzip、Brotli、zstd或deflate小压缩包解压后超过上限也会被中止，不能依赖压缩前`Content-Length`绕过。需要处理更大响应时应使用`stream=True`分块消费，或在明确评估内存后提高该值。
 
@@ -335,11 +335,11 @@ session.set_proxy("http://user:password@proxy-b.example:8080")
 
 `set_proxy()` 只应在代理身份真实变化时调用。它会清除旧代理的 Client、CONNECT、TCP、TLS 和 HTTP/2 链路，确保新代理不复用旧代理连接。高并发单请求换代理应使用请求级 `proxy=`，不要在多个协程中并发调用 `set_proxy()`。
 
-请求级代理按完整代理身份隔离。不同session ID绝不会串用代理认证；Firefox为同一代理身份维护独立连接池，Chrome/Edge则每个请求都新建代理TCP、CONNECT和TLS。业务侧仍应保持同一个`AsyncSession`，不要为每个代理session ID新建业务Session。
+请求级代理按完整代理身份隔离连接池。不同session ID绝不会串用代理认证；相同目标与相同代理身份可以复用CONNECT、TLS和HTTP/2连接。业务侧始终保持同一个`AsyncSession`，不要为每个代理session ID新建业务Session。
 
-切换请求级代理时不要附加`Connection: close`。Chrome/Edge已经强制每请求新建传输连接；Firefox的新代理session ID会进入独立路由，手写该Header只会破坏协议语义。
+切换请求级代理时不要附加`Connection: close`。新的代理session ID已经形成独立路由；相同sticky ID继续复用现有链路。
 
-对需保持IP的cursor分页，始终复用一个业务`AsyncSession`和同一个sticky代理session。Firefox会复用TLS/H2连接；Chrome/Edge按每请求新JA3要求重新建立传输连接，仅请求失败重试时更换sticky session ID。
+对需保持IP的cursor分页，始终复用一个业务`AsyncSession`和同一个sticky代理session。所有Profile都优先复用匹配的TLS/H2连接，仅请求失败重试时更换sticky session ID。
 
 ## 响应对象与流
 

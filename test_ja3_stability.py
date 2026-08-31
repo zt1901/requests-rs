@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-# 可右键运行；每次强制新TLS连接，对照同一Rust指纹和curl_cffi的JA3变化。
+# 可右键运行；测试故意每次新建Session，强制新TLS连接并对照JA3扩展乱序。
 项目目录 = Path(__file__).resolve().parent
 捕获器目录 = 项目目录.parent
 请求次数 = 20
@@ -66,8 +66,8 @@ def main() -> None:
             path.write_text(json.dumps([valid[0]]), encoding="utf-8")
             rust_ja3 = []
             rust_ja4 = []
-            with Session(impersonate=path, verify=False) as session:
-                for _ in range(请求次数):
+            for _ in range(请求次数):
+                with Session(impersonate=path, verify=False) as session:
                     response = session.get(url, transfer_stats=True)
                     tls = response.json()["tls"]
                     rust_ja3.append(tls["ja3"])
@@ -95,8 +95,12 @@ def main() -> None:
         print("curl_cffi JA4唯一数:", len(set(curl_ja4)))
         print("Rust JA4:", *sorted(set(rust_ja4)), sep="\n")
         print("curl_cffi JA4:", *sorted(set(curl_ja4)), sep="\n")
-        assert len(set(rust_ja3)) > 1
+        assert len(set(rust_ja3)) == 请求次数
+        assert len(set(curl_ja3)) == 请求次数
         assert len({ja3n(value) for value in rust_ja3}) == 1
+        assert len({ja3n(value) for value in curl_ja3}) == 1
+        assert len(set(rust_ja4)) == 1
+        assert len(set(curl_ja4)) == 1
         print("Rust JA3:")
         print(*sorted(set(rust_ja3)), sep="\n")
         print("curl_cffi JA3:")

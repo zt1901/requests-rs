@@ -10,7 +10,7 @@ import sys
 import time
 
 
-# 可右键运行；每请求使用唯一代理身份，验证Chromium系JA3乱序和Firefox固定JA3。
+# 可右键运行；路由缓存保持1项，捕获器主动断连后验证新TLS握手指纹。
 测试版本列表 = ("chrome150", "edge152", "firefox151")
 每版本测试次数 = 50
 项目目录 = Path(__file__).resolve().parent
@@ -96,6 +96,7 @@ async def main() -> None:
                     tls = response.json()["tls"]
                     ja3_values.append(tls["ja3"])
                     fingerprint_ids.append(response.fingerprint_id)
+                assert session.cached_origin_count == 1
 
             unique_ja3 = len(set(ja3_values))
             unique_fingerprints = len(set(fingerprint_ids))

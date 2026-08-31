@@ -1012,11 +1012,6 @@ fn cache_route_allowed(
     url: &str,
     proxy_identity: Option<&str>,
 ) -> PyResult<(bool, Option<String>)> {
-    // Chrome和Edge要求每个请求产生新的ClientHello；业务Session及其Cookie、DNS和票据缓存仍然复用。
-    if is_chromium_profile(&state.profile) {
-        return Ok((false, None));
-    }
-
     if state.max_cached_origins == 0 {
         return Ok((false, None));
     }

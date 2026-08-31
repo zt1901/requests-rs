@@ -102,7 +102,7 @@ with Session(
 
 ## 浏览器产品版本与 Profile 命名
 
-Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种，不是“自动指向官网最新版”的别名。Chrome/Edge后续JA3变化由BoringSSL每请求新连接扩展排列产生；Firefox完整握手保持固定扩展顺序，票据恢复握手仅自然增加PSK扩展41。不能复制随机连接或恢复握手记录伪装成多个Profile变体。
+Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种，不是“自动指向官网最新版”的别名。Chrome/Edge的JA3变化来自BoringSSL在每条新TLS连接上的扩展排列，复用连接的HTTP请求不会产生新握手；Firefox完整握手保持固定扩展顺序，票据恢复握手仅自然增加PSK扩展41。不能复制随机连接或恢复握手记录伪装成多个Profile变体。
 
 新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
 
@@ -120,6 +120,8 @@ Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版�
 
 同tick隐式合批同样不采用。`benchmark_async_bridge.py`使用Firefox热连接、本地独立服务、20,000请求、同tick并发10、三轮独立客户端进程相邻复测：旧通用完成路径中位吞吐为1820.54请求/秒、CPU为757.03微秒/请求；专用Python完成线程为2935.40请求/秒、731.25微秒/请求，吞吐提高61.2%，CPU下降3.4%。两条路径都创建20,000个Python Task和20,000个Future；收益来自Python结果完成不再与冷Client构建争用Tokio阻塞池，不是batch。
 
-并发100、5000次Chrome本地请求中，专用完成线程吞吐从61.93提高到68.14请求/秒，峰值线程均为51，因为Chrome每请求冷Client构建仍会占满32条blocking线程；Firefox冷并发吞吐从686.42提高到831.73请求/秒。并发400动态代理下，固定指纹中位吞吐从563.74提高到587.09请求/秒，轮换从550.16提高到586.90请求/秒。隐式合批即使把10次PyO3桥接缩成1次，也仍需10个调用方Future分别交付结果，并重新实现单项取消、部分异常、ContextVars、Cookie更新顺序、流和WebSocket生命周期；每次调用还会增加至少一个事件循环tick延迟。专用完成线程已经在不改变单请求语义的前提下收敛桥接开销，不具备再引入batch的性能前提。
+连接复用改为与`curl_cffi`一致后，`benchmark_async_resources.py`在Chrome本地keep-alive、5000请求、并发100下由每请求临时Client的68.14请求/秒提高到851.81请求/秒；`benchmark_async_400_dynamic.py`固定模式中位吞吐从587.09提高到612.40请求/秒，轮换模式从586.90提高到601.49请求/秒，峰值线程从50降至30。差异说明短任务中重复Client构建是主要成本；绝对值仍只用于同机同配置回归。隐式合批仍需重新实现单项取消、部分异常、ContextVars、Cookie更新顺序、流和WebSocket生命周期，不具备引入条件。
 
-固定正确路线：Python使用有限数量的长期Worker逐条调用同一个`AsyncSession`；Rust负责单请求Future、代理身份隔离和全Session`max_connections`。Firefox优先复用sticky代理与HTTP/2连接；Chrome/Edge按每请求新JA3要求故意新建TCP/CONNECT/TLS，不能再把连接复用作为这两个Profile的优化目标。WebSocket仍按长连接生命周期管理，而不是增加batch抽象。
+真实Facebook群组同一sticky代理、同时起跑、连续50页复测：连接复用前`requests_rust`总耗时217.85秒、平均3715.43毫秒、P95 7852.45毫秒；连接复用后为121.77秒、平均2266.59毫秒、P95 2707.57毫秒，50/50成功。同期`curl_cffi`为119.93秒、平均2265.57毫秒、P95 2902.86毫秒；Rust总耗时相差1.54%，平均单页相差0.05%。
+
+固定正确路线：Python使用有限数量的长期Worker逐条调用同一个`AsyncSession`；Rust负责单请求Future、连接复用、代理身份隔离和全Session`max_connections`。正常分页复用sticky代理身份和HTTP/2连接，只有请求失败重试时轮换代理session ID；Chrome/Edge在自然新建TLS连接时保留扩展乱序。WebSocket继续按长连接生命周期管理，不增加batch抽象。

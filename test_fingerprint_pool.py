@@ -97,6 +97,23 @@ async def 验证自然指纹池(port: int) -> None:
         assert usernames == {"pool-session-a", "pool-session-b"}
 
 
+    for chromium_profile in ("chrome150", "edge152"):
+        with 代理处理器.锁:
+            before_chromium = len(代理处理器.连接记录)
+        async with AsyncSession(
+            impersonate=chromium_profile,
+            max_cached_origins=4,
+            max_connections=20,
+        ) as session:
+            chromium_proxy = 代理地址(port, f"{chromium_profile}-reuse")
+            first = await session.get(target, proxy=chromium_proxy)
+            second = await session.get(target, proxy=chromium_proxy)
+            assert first.content == second.content == b"pool-ok"
+            assert session.cached_origin_count == 1
+        with 代理处理器.锁:
+            chromium_connections = len(代理处理器.连接记录) - before_chromium
+        assert chromium_connections == 1
+
     before_origin_test = len(代理处理器.连接记录)
     async with AsyncSession(
         impersonate="firefox151",

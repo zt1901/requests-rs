@@ -71,9 +71,9 @@ Session(
 
 `max_connections`是Session内HTTP、HTTPS、HTTP代理、SOCKS5、流和WebSocket共同使用的Rust/Tokio原生上限。`happy_eyeballs_timeout`默认0.3秒；双栈域名首选地址族未及时连接时，Rust连接器并行尝试另一个地址族，设为`None`可关闭该回退。
 
-`fingerprint_pool`和`fingerprint_pool_size`保留给调用方自定义的多记录Profile。当前所有内置版本各一条火种；Firefox缓存Client与路由，Chrome/Edge为保证每请求新JA3而绕过Client、请求级DNS Client和Origin连接缓存。Session关闭和`set_proxy()`仍会释放全部共享状态。
+`fingerprint_pool`和`fingerprint_pool_size`保留给调用方自定义的多记录Profile。当前所有内置版本各一条火种；所有Profile都缓存Client，并按Origin和完整代理身份隔离可复用路由。Session关闭和`set_proxy()`会释放全部共享状态。
 
-Chrome和Edge每个HTTP请求都使用独立wreq Client，即使目标和代理身份相同也重新TCP/CONNECT/TLS；BoringSSL因此为每次请求发送新的ClientHello并随机排列允许变化的扩展。业务Session、Cookie Jar、DNS配置、TLS Session Cache和Rust连接许可继续复用，但物理TLS/H2连接不复用。
+Chrome和Edge与`curl_cffi`一致：同一Client可复用已有TCP、CONNECT、TLS和HTTP/2连接，复用连接的请求不会重新发送ClientHello；连接池确实新建TLS连接时，BoringSSL随机排列允许变化的扩展并产生新的原始JA3。业务Session、Cookie Jar、DNS配置、TLS Session Cache和Rust连接许可持续复用。
 
 `firefox151`也只保留一条火种，不启用BoringSSL扩展乱序。五次独立完整握手的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致；Firefox复用Client与连接，必须新建连接时允许TLS票据恢复自然增加PSK扩展41，因此最多出现固定完整握手JA3和固定恢复握手JA3两种结构。
 
@@ -94,7 +94,7 @@ Session关闭语义：关闭Semaphore并清除Client、DNS和Origin缓存，所�
 
 Chrome142源记录原有21条，其中14条首次握手记录仅扩展顺序不同，7条为带PSK扩展41的恢复握手。稳定TLS/HTTP2字段和扩展集合完全一致，现已选择一条首次握手火种；恢复握手由共享TLS Session Cache自然产生。
 
-Chrome/Edge每请求新JA3会牺牲CONNECT、TLS和HTTP/2复用，延迟与临时端口消耗明显高于Firefox复用模式；这是明确的指纹优先策略，不得再用热连接基准解释其性能。
+Chrome/Edge连接复用避免了每请求重复CONNECT、TLS和HTTP/2握手；自然新建连接时仍保留扩展乱序指纹。性能对比必须区分HTTP请求数与实际TLS握手数。
 
 `requests_rust`与`curl_cffi`的性能比较只允许使用同一构建、后端、代理、并发和连接复用条件；环境变化后的历史请求/秒和倍数结论不再作为维护依据。
 
@@ -376,13 +376,13 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 指纹轮换与隔离
 
-`fingerprint_rotation`只控制多记录Profile的变体选择。当前内置版本各一条火种，因此该开关不改变火种ID；Chrome/Edge无论该值都按请求新建TLS，Firefox复用连接并只在完整握手与PSK恢复握手之间出现协议要求的JA3差异。
+`fingerprint_rotation`只控制多记录Profile的变体选择。当前内置版本各一条火种，因此该开关不改变火种ID；所有Profile都会复用匹配路由的现有连接。Chrome/Edge只在自然新建TLS连接时随机扩展顺序，Firefox完整握手顺序固定并允许PSK恢复自然增加扩展41。
 
-业务代码禁止添加`Connection: close`或`Connection: keep-alive`。Chrome/Edge的新连接策略由Client生命周期保证，不依赖非法HTTP/2 Header；Firefox连接生命周期继续由协议层管理。
+业务代码禁止添加`Connection: close`或`Connection: keep-alive`。连接池按协议和服务端生命周期自然复用或新建连接，HTTP/2不接受这类hop-by-hop Header。
 
 当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。依赖服务端既有 TLS ticket 的 PSK 恢复握手记录不会作为新代理会话的首个随机指纹。
 
-当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种。Chrome/Edge每请求创建临时Client并产生新JA3；Firefox缓存单一Client，完整握手JA3固定，票据恢复时仅因扩展41形成固定恢复JA3。同一业务Session共享Cookie、代理配置、DNS、TLS Session Cache和连接许可。
+当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种。所有Profile缓存单一Client；Chrome/Edge的新TLS连接随机扩展顺序，Firefox完整握手JA3固定且票据恢复仅因扩展41形成固定恢复JA3。同一业务Session共享Cookie、代理配置、DNS、TLS Session Cache和连接许可。
 
 ## GIL模型
 
@@ -407,7 +407,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 - Chrome 150真实浏览器与requests_rust：41/41，100%。
 - Firefox 151五次独立完整握手的核心TLS/HTTP2字段全部一致，已收敛为一条火种；同路由50请求只出现固定完整握手JA3及增加PSK扩展41的恢复JA3，`fingerprint_id`始终唯一。
-- 同一目标、同一代理session连续50请求：Chrome142与Edge152均得到50个不同JA3且`fingerprint_id`唯一数为1；Firefox151只出现固定完整握手JA3和增加PSK扩展41的恢复JA3。
+- Chrome/Edge在本地keep-alive代理上连续请求只建立1条物理连接；指纹捕获器主动关闭连接后50次自然重连得到50个不同JA3，强制20条新TLS连接时JA3N、JA4和`fingerprint_id`保持唯一。Firefox保持固定完整握手与PSK恢复结构。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
 - WebSocket覆盖同步/异步、WS/WSS、HTTP代理、WSS CONNECT预认证、SOCKS5、服务端Close、控制帧边界、50条不同代理身份和25 WS + 15 HTTP + 10 SOCKS5混合上限。

@@ -198,7 +198,7 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
             pass
         else:
             raise AssertionError("请求级DNS覆盖污染了Session默认DNS")
-        assert session.request_dns_client_count == 0
+        assert session.request_dns_client_count == 1
 
     session = AsyncSession(
         impersonate="firefox151",
