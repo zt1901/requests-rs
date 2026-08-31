@@ -16,7 +16,7 @@ from requests_rust import AsyncSession
 
 
 # 可右键运行；所有HTTP和DNS流量仅使用本机回环地址。
-测试版本 = "chrome142"
+测试版本 = "chrome150"
 任务总数 = 1000
 采样间隔秒 = 0.005
 

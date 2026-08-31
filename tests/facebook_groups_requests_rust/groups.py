@@ -55,20 +55,14 @@ class FacebookGroupsCrawler(RequestsRustCrawler):
     RETRY_TIMES = 5
 
     headers = {
-        # 原 curl_cffi chrome142 impersonate 自动注入的页面导航 Header。
-        # 这是 Facebook 群组首页这一具体业务动作的固定请求模板，不属于指纹库默认配置。
-        "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        # 浏览器版本相关的UA和Client Hints由当前Profile提供，业务模板不固定浏览器版本。
         "upgrade-insecure-requests": "1",
         "accept-language": "en-US,en;q=0.9",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "sec-fetch-site": "none",
         "sec-fetch-mode": "navigate",
         "sec-fetch-user": "?1",
         "sec-fetch-dest": "document",
-        "accept-encoding": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     }
 

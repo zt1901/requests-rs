@@ -19,7 +19,7 @@ from pathlib import Path
 项目目录 = Path(__file__).resolve().parent
 捕获器目录 = 项目目录.parent
 Rust后端目录 = 捕获器目录 / "rust_fingerprint_server"
-测试指纹版本 = "chrome142"
+测试指纹版本 = "chrome150"
 并发请求数 = 20
 后端同时捕获数 = 4
 启动超时秒 = 20

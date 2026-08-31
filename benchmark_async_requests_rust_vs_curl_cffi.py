@@ -10,7 +10,7 @@ from requests_rust import AsyncSession
 
 
 # 可右键运行；脚本自动启动本地HTTP服务，不访问外网。
-测试版本 = "chrome142"
+测试版本 = "chrome150"
 请求次数 = 4000
 重复轮数 = 3
 并发列表 = [50, 500]

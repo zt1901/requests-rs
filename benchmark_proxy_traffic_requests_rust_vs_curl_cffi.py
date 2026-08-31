@@ -30,7 +30,7 @@ from benchmark_proxy_rust_vs_curl_cffi import (
 
 # 【可调参数】右键运行时使用本地 Rust HTTPS 页面和本地 CONNECT 代理，不访问外网。
 项目目录 = Path(__file__).resolve().parent
-测试指纹版本 = "chrome142"
+测试指纹版本 = "chrome150"
 并发数 = 3
 每轮请求数 = 12
 有效载荷字节 = 2 * 1024 * 1024

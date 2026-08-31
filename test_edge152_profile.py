@@ -86,7 +86,7 @@ def main() -> None:
             assert 轮换会话.fingerprint_pool_count == 1
 
         asyncio.run(验证异步请求(目标地址))
-        print("Edge 152单火种Profile、默认请求头、固定模式和单池复用验证通过")
+        print("Edge 152单火种Profile、默认请求头和请求级新Client验证通过")
     finally:
         服务.shutdown()
         服务.server_close()

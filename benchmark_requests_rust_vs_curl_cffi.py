@@ -8,7 +8,7 @@ from requests_rust import Session
 
 # 可右键运行；先用Debian 12容器在本机18080端口启动HTTP服务。
 测试地址 = "http://127.0.0.1:18080/"
-测试版本 = "chrome142"
+测试版本 = "chrome150"
 创建次数 = 200
 预热次数 = 10
 请求次数 = 200

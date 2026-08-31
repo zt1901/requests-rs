@@ -12,7 +12,7 @@ import time
 项目目录 = Path(__file__).resolve().parent
 捕获器目录 = 项目目录.parent
 测试地址 = ""
-测试版本 = "chrome142"
+测试版本 = "chrome150"
 请求次数 = 4
 测试记录文件 = 项目目录 / "test_python_package_records.json"
 
@@ -121,14 +121,14 @@ def main():
 
         records = json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as temp_dir:
-            chrome_records = [record for record in records if record["profile"] == "chrome142"]
+            chrome_records = [record for record in records if record["profile"] == "chrome150"]
             firefox_records = [record for record in records if record["profile"] == "firefox151"]
-            chrome_path = Path(temp_dir) / "chrome142.json"
+            chrome_path = Path(temp_dir) / "chrome150.json"
             firefox_path = Path(temp_dir) / "firefox151.json"
             chrome_path.write_text(json.dumps(chrome_records), encoding="utf-8")
             firefox_path.write_text(json.dumps(firefox_records), encoding="utf-8")
             with Session(
-                impersonate="chrome142",
+                impersonate="chrome150",
                 fingerprints_path=chrome_path,
                 verify=False,
             ) as chrome_session, Session(

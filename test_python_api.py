@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import socket
 import tempfile
@@ -631,6 +632,27 @@ def main():
                     session.get(target_url + "/headers"),
                 )
                 assert all(response.status_code == 200 for response in responses)
+                请求上下文 = contextvars.ContextVar("requests_rust_test_context")
+                上下文令牌 = 请求上下文.set("preserved")
+                try:
+                    context_response = await session.get(target_url + "/headers")
+                    assert context_response.status_code == 200
+                    assert 请求上下文.get() == "preserved"
+                finally:
+                    请求上下文.reset(上下文令牌)
+
+                pending_request = asyncio.create_task(
+                    session.get(target_url + "/slow-headers")
+                )
+                await asyncio.sleep(0.1)
+                pending_request.cancel()
+                try:
+                    await pending_request
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    raise AssertionError("普通异步请求没有被取消")
+                assert (await session.get(target_url + "/headers")).status_code == 200
                 mapped = await session.get(target_url + "/headers", proxies={"http": proxy_a_url})
                 assert mapped.headers["x-test-proxy"] == "A"
                 streamed = await session.get(target_url + "/stream", stream=True)
@@ -810,6 +832,25 @@ def main():
             native.close()
 
         asyncio.run(测试异步API())
+
+        多事件循环结果 = []
+
+        def 运行独立事件循环():
+            async def 请求一次():
+                async with AsyncSession(impersonate=测试版本) as session:
+                    response = await session.get(target_url + "/headers")
+                    return response.status_code, response.content
+
+            多事件循环结果.append(asyncio.run(请求一次()))
+
+        多事件循环线程 = [threading.Thread(target=运行独立事件循环) for _ in range(2)]
+        for loop_thread in 多事件循环线程:
+            loop_thread.start()
+        for loop_thread in 多事件循环线程:
+            loop_thread.join(timeout=10)
+            assert not loop_thread.is_alive()
+        assert len(多事件循环结果) == 2
+        assert all(status == 200 and content for status, content in 多事件循环结果)
         print("动态代理、Cookie、重复头、重定向、超时、原生异步流、异步multipart和API验证通过")
     finally:
         for server in (proxy_b, proxy_a, target):

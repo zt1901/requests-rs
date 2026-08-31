@@ -11,7 +11,7 @@ from requests_rust import AsyncSession
 
 
 # 可右键运行；脚本会自动启动本地代理，不访问外网。
-测试版本 = "chrome142"
+测试版本 = "chrome150"
 并发数 = 400
 重复轮数 = 3
 代理密码 = "password"

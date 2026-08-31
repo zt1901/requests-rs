@@ -11,7 +11,7 @@ import time
 
 
 # 可右键运行；每请求使用唯一代理身份，验证Chromium系JA3乱序和Firefox固定JA3。
-测试版本列表 = ("chrome142", "edge152", "firefox151")
+测试版本列表 = ("chrome150", "edge152", "firefox151")
 每版本测试次数 = 50
 项目目录 = Path(__file__).resolve().parent
 捕获器目录 = 项目目录.parent
@@ -34,6 +34,13 @@ def 等待端口(port: int, process: subprocess.Popen) -> None:
         except OSError:
             time.sleep(0.05)
     raise RuntimeError("服务启动超时")
+
+
+def 去除PSK扩展(ja3: str) -> str:
+    parts = ja3.split(",")
+    extensions = [value for value in parts[2].split("-") if value != "41"]
+    parts[2] = "-".join(extensions)
+    return ",".join(parts)
 
 
 async def main() -> None:
@@ -80,11 +87,11 @@ async def main() -> None:
                 max_connections=50,
                 max_cached_origins=100,
             ) as session:
-                for index in range(每版本测试次数):
-                    proxy_url = (
-                        f"http://customer-local-zone-residential-session-{测试版本}-ja3{index:04d}-time-5:"
-                        f"local-ipipgo-password@127.0.0.1:{proxy_port}"
-                    )
+                proxy_url = (
+                    f"http://customer-local-zone-residential-session-{测试版本}-same-route-time-5:"
+                    f"local-ipipgo-password@127.0.0.1:{proxy_port}"
+                )
+                for _ in range(每版本测试次数):
                     response = await session.get(target, proxy=proxy_url, timeout=30)
                     tls = response.json()["tls"]
                     ja3_values.append(tls["ja3"])
@@ -95,12 +102,12 @@ async def main() -> None:
             print(f"{测试版本}请求次数:", 每版本测试次数)
             print(f"{测试版本} JA3唯一数:", unique_ja3)
             print(f"{测试版本}指纹ID唯一数:", unique_fingerprints)
-            if 测试版本 in {"chrome142", "edge152"}:
+            if 测试版本 in {"chrome150", "edge152"}:
                 assert unique_ja3 == 每版本测试次数, json.dumps(ja3_values, ensure_ascii=False, indent=2)
             else:
-                assert unique_ja3 == 1, ja3_values
-            if 测试版本 in {"edge152", "firefox151"}:
-                assert unique_fingerprints == 1, fingerprint_ids
+                assert len({去除PSK扩展(ja3) for ja3 in ja3_values}) == 1, ja3_values
+                assert unique_ja3 <= 2, ja3_values
+            assert unique_fingerprints == 1, fingerprint_ids
     finally:
         proxy.terminate()
         backend.terminate()

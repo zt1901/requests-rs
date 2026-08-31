@@ -102,11 +102,11 @@ with Session(
 
 ## 浏览器产品版本与 Profile 命名
 
-Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome142`、`chrome146`、`chrome150`、`edge152`、`firefox151`只代表已经采集并验证的指纹快照，不是“自动指向官网最新版”的别名。`edge152`以一条完整线级记录作为火种，后续JA3变化由BoringSSL每连接扩展排列产生；`firefox151`的五次独立采集保持相同JA3和扩展顺序，也收敛为一条火种，但不启用Chromium式乱序。不能复制多条随机连接记录伪装成多个Profile变体。
+Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种，不是“自动指向官网最新版”的别名。Chrome/Edge后续JA3变化由BoringSSL每请求新连接扩展排列产生；Firefox完整握手保持固定扩展顺序，票据恢复握手仅自然增加PSK扩展41。不能复制随机连接或恢复握手记录伪装成多个Profile变体。
 
 新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
 
-## 已证伪路线：Rust原生batch
+## 已证伪路线：Rust原生batch与同tick隐式合批
 
 本项目明确不新增`session.batch()`、`submit_many()`、Rust常驻业务Worker队列或其他把一批业务请求整体搬进Rust调度的接口。
 
@@ -118,4 +118,8 @@ Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版�
 4. 爬虫需要逐条确认成功、逐条失败重试、逐条切换代理session ID。把业务队列和重试策略放入网络库会混淆业务生命周期，并增加整批滞留和内存占用。
 5. WebSocket、流式响应和multipart具有不同生命周期，无法放入一个一致且不误导的batch返回模型；人为限制batch只支持部分请求又会形成第二套API边界。
 
-固定正确路线：Python使用有限数量的长期Worker逐条调用同一个`AsyncSession`；Rust负责单请求网络Future、连接池、代理身份隔离、TLS/HTTP2复用和全Session `max_connections`。需要更高吞吐时优先复用sticky代理身份、HTTP/2连接和WebSocket长连接，而不是增加batch抽象。
+同tick隐式合批同样不采用。`benchmark_async_bridge.py`使用Firefox热连接、本地独立服务、20,000请求、同tick并发10、三轮独立客户端进程相邻复测：旧通用完成路径中位吞吐为1820.54请求/秒、CPU为757.03微秒/请求；专用Python完成线程为2935.40请求/秒、731.25微秒/请求，吞吐提高61.2%，CPU下降3.4%。两条路径都创建20,000个Python Task和20,000个Future；收益来自Python结果完成不再与冷Client构建争用Tokio阻塞池，不是batch。
+
+并发100、5000次Chrome本地请求中，专用完成线程吞吐从61.93提高到68.14请求/秒，峰值线程均为51，因为Chrome每请求冷Client构建仍会占满32条blocking线程；Firefox冷并发吞吐从686.42提高到831.73请求/秒。并发400动态代理下，固定指纹中位吞吐从563.74提高到587.09请求/秒，轮换从550.16提高到586.90请求/秒。隐式合批即使把10次PyO3桥接缩成1次，也仍需10个调用方Future分别交付结果，并重新实现单项取消、部分异常、ContextVars、Cookie更新顺序、流和WebSocket生命周期；每次调用还会增加至少一个事件循环tick延迟。专用完成线程已经在不改变单请求语义的前提下收敛桥接开销，不具备再引入batch的性能前提。
+
+固定正确路线：Python使用有限数量的长期Worker逐条调用同一个`AsyncSession`；Rust负责单请求Future、代理身份隔离和全Session`max_connections`。Firefox优先复用sticky代理与HTTP/2连接；Chrome/Edge按每请求新JA3要求故意新建TCP/CONNECT/TLS，不能再把连接复用作为这两个Profile的优化目标。WebSocket仍按长连接生命周期管理，而不是增加batch抽象。

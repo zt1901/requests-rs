@@ -8,6 +8,8 @@ from pathlib import Path
 记录文件 = 项目目录.parent / "fingerprint_records.json"
 浏览器基准文件 = 项目目录 / "browser_baselines.json"
 输出文件 = 项目目录 / "fingerprints.json"
+最低Chrome版本 = 146
+
 
 
 def 获取请求头(record, name):
@@ -31,6 +33,10 @@ def 识别版本(record):
         if match:
             return f"{browser}{match.group(1)}"
     return None
+
+
+def 需要单火种(profile):
+    return profile.startswith(("chrome", "edge", "firefox"))
 
 
 def 可嵌入(record):
@@ -61,18 +67,35 @@ def main():
         record for record in records
         if 识别版本(record) not in baseline_profiles
     ]
+    grouped = {}
     for record in sources:
         if not 可嵌入(record):
             continue
         profile = 识别版本(record)
-        item = {
-            "id": record["id"],
-            "profile": profile,
-            "tls": record["tls"],
-            "http": record["http"],
-        }
-        embedded.append(item)
-        counts[profile] = counts.get(profile, 0) + 1
+        if profile.startswith("chrome") and int(profile.removeprefix("chrome")) < 最低Chrome版本:
+            continue
+
+        grouped.setdefault(profile, []).append(record)
+
+    for profile, profile_records in grouped.items():
+        if 需要单火种(profile):
+            seed = next(
+                (
+                    record for record in profile_records
+                    if 41 not in record.get("tls", {}).get("extensions", [])
+                ),
+                profile_records[0],
+            )
+            profile_records = [seed]
+        for record in profile_records:
+            embedded.append({
+                "id": record["id"],
+                "profile": profile,
+                "tls": record["tls"],
+                "http": record["http"],
+            })
+            counts[profile] = counts.get(profile, 0) + 1
+
 
     if not embedded:
         raise RuntimeError("没有找到包含浏览器版本和完整网络字段的指纹记录")

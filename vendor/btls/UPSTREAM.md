@@ -18,7 +18,7 @@
 
 加密实现原本已经存在，本地只按BoringSSL新上游实现注册TLS codepoint、算法能力和配置名称。Chrome 150回归已验证JA4、Signature Algorithms、ClientHello长度模式和扩展线级摘要，最终为41/41。
 
-Edge 152补充：`edge152`复用Chromium的BoringSSL扩展随机排列能力，只保留一条本机Edge 152.0.4191.53火种记录。强制50条新TLS连接实测得到50个不同JA3且`fingerprint_id`唯一数为1；已建立TLS/H2连接继续复用。该能力不需要新增BoringSSL补丁。
+Edge 152补充：`edge152`只保留一条本机Edge 152.0.4191.53火种记录。每个HTTP请求使用独立wreq Client并新建TLS；同一目标、同一代理session连续50请求实测得到50个不同JA3且火种ID唯一。业务Session及TLS Session Cache继续共享，该能力不需要新增BoringSSL补丁。
 
 Firefox 151补充：
 
@@ -26,6 +26,6 @@ Firefox 151补充：
 - Profile开启普通GREASE时，继续使用Chrome的随机32字节桶，不改变Chrome ECH随机化。
 - build script显式监听三个本地BoringSSL补丁文件，避免增量构建误用旧静态库。
 
-Firefox 151五次独立采集的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此`firefox151`只保留一条火种并固定NSS扩展顺序，不启用Chromium式`permute_extensions`。
+Firefox 151五次独立完整握手的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此`firefox151`只保留一条火种并固定NSS扩展顺序。TLS票据恢复时由共享Session Cache自然增加PSK扩展41，不保存恢复握手为第二条火种。
 
-最终同一wheel下Chrome 150通过41/41；Firefox 151的五次等价采集收敛为单火种；Edge 152单火种通过50条新TLS连接的JA3随机排列和公网HTTPS回归。
+最终同一wheel下Chrome 150通过41/41；所有受支持浏览器版本均收敛为单火种。Chrome/Edge按请求产生新JA3，Firefox保留固定完整握手JA3和协议自然产生的PSK恢复JA3。

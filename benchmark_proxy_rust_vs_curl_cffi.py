@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 项目目录 = Path(__file__).resolve().parent
 捕获器目录 = 项目目录.parent
 Rust后端目录 = 捕获器目录 / "rust_fingerprint_server"
-测试指纹版本 = "chrome142"
+测试指纹版本 = "chrome150"
 并发Worker数 = 10
 # curl_cffi 允许保留更多 Client，实际同时请求数仍由并发Worker数决定。
 curl客户端上限 = 1_000

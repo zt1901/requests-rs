@@ -198,9 +198,10 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
             pass
         else:
             raise AssertionError("请求级DNS覆盖污染了Session默认DNS")
+        assert session.request_dns_client_count == 0
 
     session = AsyncSession(
-        impersonate=测试版本,
+        impersonate="firefox151",
         max_connections=20,
         max_cached_origins=20,
     )
@@ -229,7 +230,7 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
         await session.close()
     assert session.request_dns_client_count == 0
 
-    equivalent = AsyncSession(impersonate=测试版本)
+    equivalent = AsyncSession(impersonate="firefox151")
     try:
         for server in (["127.0.0.1"], ["127.0.0.1:53"]):
             try:

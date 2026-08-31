@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Write},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -282,6 +283,88 @@ fn shared_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
     );
     let _ = 共享运行时.set(runtime.clone());
     Ok(共享运行时.get().cloned().unwrap_or(runtime))
+}
+
+// Python Future完成由单线程串行回投事件循环，避免与冷Client构建争用Tokio阻塞池。
+type PythonCompletionJob = Box<dyn FnOnce() + Send + 'static>;
+static PYTHON完成任务发送端: LazyLock<
+    Result<std::sync::mpsc::Sender<PythonCompletionJob>, String>,
+> = LazyLock::new(|| {
+    let (sender, receiver) = std::sync::mpsc::channel::<PythonCompletionJob>();
+    std::thread::Builder::new()
+        .name("requests-rust-python-completion".to_string())
+        .spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            }
+        })
+        .map_err(|error| format!("无法创建Python异步完成线程: {error}"))?;
+    Ok(sender)
+});
+
+fn python_completion_sender() -> PyResult<&'static std::sync::mpsc::Sender<PythonCompletionJob>> {
+    PYTHON完成任务发送端
+        .as_ref()
+        .map_err(|error| PyRuntimeError::new_err(error.clone()))
+}
+
+struct RequestsRustAsyncRuntime;
+
+impl pyo3_async_runtimes::generic::Runtime for RequestsRustAsyncRuntime {
+    type JoinError = tokio::task::JoinError;
+    type JoinHandle = tokio::task::JoinHandle<()>;
+
+    fn spawn<F>(future: F) -> Self::JoinHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        共享运行时
+            .get()
+            .expect("共享Tokio运行时已经初始化")
+            .spawn(future)
+    }
+
+    fn spawn_blocking<F>(function: F) -> Self::JoinHandle
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let completion_thread_stopped = PYTHON完成任务发送端
+            .as_ref()
+            .expect("Python异步完成线程已经初始化")
+            .send(Box::new(function))
+            .is_err();
+        Self::spawn(async move {
+            assert!(!completion_thread_stopped, "Python异步完成线程已经停止");
+        })
+    }
+}
+
+impl pyo3_async_runtimes::generic::ContextExt for RequestsRustAsyncRuntime {
+    fn scope<F, R>(
+        _locals: pyo3_async_runtimes::TaskLocals,
+        future: F,
+    ) -> Pin<Box<dyn Future<Output = R> + Send>>
+    where
+        F: Future<Output = R> + Send + 'static,
+    {
+        Box::pin(future)
+    }
+
+    fn get_task_locals() -> Option<pyo3_async_runtimes::TaskLocals> {
+        None
+    }
+}
+
+fn rust_future_into_py<'py, F, T>(py: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'target> IntoPyObject<'target> + Send + 'static,
+{
+    python_completion_sender()?;
+    let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(py)?;
+    pyo3_async_runtimes::generic::future_into_py_with_locals::<RequestsRustAsyncRuntime, _, T>(
+        py, locals, future,
+    )
 }
 
 fn parse_records(source: &str) -> Result<Vec<Arc<Record>>> {
@@ -778,7 +861,7 @@ fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
     Ok((headers, original))
 }
 
-fn uses_chromium_extension_permutation(profile: &str) -> bool {
+fn is_chromium_profile(profile: &str) -> bool {
     let normalized = normalize_profile(profile);
     normalized.starts_with("chrome") || normalized.starts_with("edge")
 }
@@ -788,7 +871,7 @@ fn build_emulation(record: &Record) -> Result<Emulation> {
     let mut builder = Emulation::builder()
         .tls_options(build_tls(
             &record.tls,
-            uses_chromium_extension_permutation(&record.profile),
+            is_chromium_profile(&record.profile),
         )?)
         .headers(headers)
         .orig_headers(original);
@@ -929,6 +1012,11 @@ fn cache_route_allowed(
     url: &str,
     proxy_identity: Option<&str>,
 ) -> PyResult<(bool, Option<String>)> {
+    // Chrome和Edge要求每个请求产生新的ClientHello；业务Session及其Cookie、DNS和票据缓存仍然复用。
+    if is_chromium_profile(&state.profile) {
+        return Ok((false, None));
+    }
+
     if state.max_cached_origins == 0 {
         return Ok((false, None));
     }
@@ -2221,10 +2309,7 @@ impl NativeWebSocket {
             return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
         }
         let commands = self.commands.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            send_websocket_command(commands, Message::text(value)),
-        )
+        rust_future_into_py(py, send_websocket_command(commands, Message::text(value)))
     }
 
     fn send_bytes(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
@@ -2245,10 +2330,7 @@ impl NativeWebSocket {
             return Err(PyRuntimeError::new_err("WebSocket已经关闭"));
         }
         let commands = self.commands.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            send_websocket_command(commands, Message::binary(value)),
-        )
+        rust_future_into_py(py, send_websocket_command(commands, Message::binary(value)))
     }
 
     fn ping(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
@@ -2265,10 +2347,7 @@ impl NativeWebSocket {
             return Err(PyRuntimeError::new_err("WebSocket Ping载荷不能超过125字节"));
         }
         let commands = self.commands.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            send_websocket_command(commands, Message::ping(value)),
-        )
+        rust_future_into_py(py, send_websocket_command(commands, Message::ping(value)))
     }
 
     fn pong(&self, py: Python<'_>, value: Vec<u8>) -> PyResult<()> {
@@ -2285,10 +2364,7 @@ impl NativeWebSocket {
             return Err(PyRuntimeError::new_err("WebSocket Pong载荷不能超过125字节"));
         }
         let commands = self.commands.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            send_websocket_command(commands, Message::pong(value)),
-        )
+        rust_future_into_py(py, send_websocket_command(commands, Message::pong(value)))
     }
 
     fn recv(&self, py: Python<'_>) -> PyResult<Option<RawWebSocketMessage>> {
@@ -2303,7 +2379,7 @@ impl NativeWebSocket {
         let events = self.events.clone();
         let recv_active = self.recv_active.clone();
         let terminal_error = self.terminal_error.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
+        rust_future_into_py(
             py,
             recv_websocket_event(events, recv_active, terminal_error),
         )
@@ -2333,7 +2409,7 @@ impl NativeWebSocket {
     ) -> PyResult<Bound<'py, PyAny>> {
         let close_commands = self.close_commands.clone();
         let closed = self.closed.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
+        rust_future_into_py(
             py,
             close_websocket_command(close_commands, closed, code, reason),
         )
@@ -2571,7 +2647,7 @@ impl NativeStreamResponse {
         let close_notify = self.close_notify.clone();
         let read_active = self.read_active.clone();
         let permit = self.permit.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             read_stream(state, closed, close_notify, read_active, permit, size).await
         })
     }
@@ -2596,7 +2672,7 @@ impl NativeStreamResponse {
         let closed = self.closed.clone();
         let close_notify = self.close_notify.clone();
         let permit = self.permit.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             close_stream(state, closed, close_notify).await;
             permit.lock().ok().and_then(|mut permit| permit.take());
             Ok(())
@@ -2990,7 +3066,7 @@ impl NativeSession {
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
@@ -3115,7 +3191,7 @@ impl NativeSession {
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
@@ -3254,7 +3330,7 @@ impl NativeSession {
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
@@ -3400,7 +3476,7 @@ impl NativeSession {
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        rust_future_into_py(py, async move {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;

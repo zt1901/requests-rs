@@ -7,7 +7,7 @@ import threading
 
 
 # 可右键运行；本测试仅使用本机HTTP代理回显，不访问外网。
-测试版本 = "chrome142"
+测试版本 = "firefox151"
 代理密码 = "pool-password"
 
 
@@ -96,26 +96,10 @@ async def 验证自然指纹池(port: int) -> None:
         assert new_proxy_connections <= warmed_connections * 2
         assert usernames == {"pool-session-a", "pool-session-b"}
 
-    before_limited = new_proxy_connections
-    async with AsyncSession(
-        impersonate=测试版本,
-        fingerprint_rotation=True,
-        fingerprint_pool=True,
-        fingerprint_pool_size=5,
-        max_connections=50,
-    ) as session:
-        responses = []
-        for _ in range(100):
-            responses.append(await session.get(target, proxy=proxy_a))
-        assert len({response.fingerprint_id for response in responses}) == 5
-        assert session.fingerprint_pool_count == 5
-        with 代理处理器.锁:
-            limited_connections = len(代理处理器.连接记录) - before_limited
-        assert limited_connections == 5
 
     before_origin_test = len(代理处理器.连接记录)
     async with AsyncSession(
-        impersonate="chrome146",
+        impersonate="firefox151",
         max_cached_origins=1,
         max_connections=20,
     ) as session:
@@ -155,7 +139,7 @@ async def 验证自然指纹池(port: int) -> None:
         assert session.fingerprint_pool_count == 0
 
     async with AsyncSession(
-        impersonate="chrome146",
+        impersonate="firefox151",
         max_cached_origins=4,
     ) as session:
         for index in range(4):

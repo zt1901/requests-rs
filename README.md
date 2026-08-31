@@ -11,17 +11,17 @@
 ## 优点
 
 - **Rust 网络路径**：DNS、代理、TLS、HTTP/1.1/2、WebSocket、连接池、Cookie、超时、流式 Body 和 multipart 均由 Rust/Tokio 执行。同步请求等待及自定义指纹文件读取、解析不占用 GIL。
-- **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome142`、`chrome146`、`chrome150`、`edge152`、`firefox151`；这些名称代表已采集并验证的固定快照，不等同于官网当前 Stable，也不会自动随浏览器更新。
+- **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome146`、`chrome150`、`edge152`、`firefox151`；这些名称代表已采集并验证的固定快照，不等同于官网当前 Stable，也不会自动随浏览器更新。
 - **实例级指纹隔离**：每个 `Session` 可在构造时从不同 JSON 文件独立加载 profile，不修改进程全局指纹数据，也不影响其他实例。
-- **长期并发友好**：一个 `AsyncSession` 复用连接池和 Cookie Jar；代理、请求头与请求级 Cookie 可按单条请求独立传入。
+- **长期并发状态**：一个`AsyncSession`持续复用Cookie Jar、DNS配置和TLS票据缓存；Firefox复用连接池，Chrome/Edge按要求每请求新建传输Client和TLS连接。代理、请求头与请求级Cookie仍可逐条独立传入。
 - **Rust 原生统一连接上限**：HTTP、HTTPS、HTTP 代理、SOCKS5、流和 WebSocket 共同使用 Tokio `Semaphore`，Python 不维护连接许可队列。
 - **双栈网络**：支持 IPv4、IPv6 字面量和双栈域名；Happy Eyeballs 默认在 300ms 后并行尝试另一个地址族。
 
 ## 研究记录
 
 - Chrome 150 真实浏览器与 Rust profile 的采集对照为 41/41 字段一致。
-- Firefox 151五次独立浏览器采集的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此只保留一条火种；新TLS连接继续使用固定NSS扩展顺序，不伪造Chromium式JA3乱序。
-- Edge 152.0.4191.53 使用 `playwright_rust` 操作本机正式版采集单条完整火种；强制50条新TLS连接实测得到50个不同JA3，`fingerprint_id`始终只有火种ID，未建立多变体指纹池。
+- Firefox 151五次独立完整握手的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此只保留一条火种；完整握手保持固定NSS JA3，命中TLS票据后的恢复握手会自然增加PSK扩展41并形成第二个恢复JA3。
+- Edge 152.0.4191.53使用`playwright_rust`操作本机正式版采集单条完整火种；同一目标、同一代理session连续50请求时，Chrome142和Edge152均得到50个不同JA3且始终只有一个火种ID。
 - 本地动态代理回显测试已验证 400 条请求的 Header、Cookie 和代理认证 session ID 逐条隔离；吞吐随机器负载和连接建立时序波动，不作为固定性能承诺。
 - 本地 keep-alive、动态代理和长任务脚本继续用于版本间回归；绝对吞吐受硬件、`max_connections`、指纹变体数量和目标服务影响，不作为发布承诺。
 - 同一个 `AsyncSession(max_connections=50)` 已验证同时保持 25 条 WebSocket、15 个 HTTP 代理请求和 10 个 SOCKS5 请求；第 51 个操作会在 Rust 等待 permit。
@@ -76,10 +76,10 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 - Session Cookie Jar、每请求 Cookie 覆盖、重复 Header 保序
 - Session 默认代理和每请求代理覆盖
 - `ws://`、`wss://` 同步/异步 WebSocket，支持 HTTP CONNECT 预认证与 SOCKS5 认证
-- `http://`、`socks5://`、`socks5h://` 代理，按完整代理身份隔离连接池
+- `http://`、`socks5://`、`socks5h://`代理，按完整代理身份隔离；Firefox可复用对应连接池，Chrome/Edge每请求新建代理链路
 - Session 级 Rust 原生 `max_connections`，允许 HTTP、SOCKS5 和 WebSocket 混合占用
-- 自然随机指纹池：默认最多100个指纹，池满后只复用已有池，不进行淘汰抖动
-- `max_cached_origins`限制可保留连接的Origin与代理身份组合，query/params/path不额外计数
+- 所有内置浏览器版本各一条火种；多变体指纹池仅用于调用方自定义的多记录Profile
+- `max_cached_origins`限制Firefox及其他非Chromium Profile可保留的Origin与代理身份组合；Chrome/Edge不缓存传输连接
 - 同步/异步流式响应与 Rust Tokio multipart 文件流
 
 ## 限制

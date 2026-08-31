@@ -59,7 +59,7 @@ def main() -> None:
         valid = [
             record
             for record in records
-            if record["profile"] == "chrome142" and 41 not in record["tls"]["extensions"]
+            if record["profile"] == "chrome150" and 41 not in record["tls"]["extensions"]
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "one-fingerprint.json"
