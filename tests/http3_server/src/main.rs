@@ -1,7 +1,6 @@
 use std::{
     env,
-    fs::File,
-    io::{self, BufReader, Write},
+    io::{self, Write},
     net::{Ipv4Addr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -12,18 +11,6 @@ use quinn::crypto::rustls::QuicServerConfig;
 use serde_json::json;
 
 static 连接序号: AtomicU64 = AtomicU64::new(1);
-
-fn 读取证书(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::certs(&mut reader).collect()
-}
-
-fn 读取私钥(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PEM文件中没有私钥"))
-}
-
 fn 构造响应(
     request: &Request<()>,
     request_body: &[u8],
@@ -101,13 +88,16 @@ async fn 处理连接(connection: quinn::Connection, connection_id: u64) -> Resu
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let cert_path = env::var("HTTP3_CERT_FILE")?;
-    let key_path = env::var("HTTP3_KEY_FILE")?;
     let port = env::var("HTTP3_TEST_PORT")?.parse::<u16>()?;
-
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])?;
+    let certs = vec![cert.der().clone()];
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(读取证书(&cert_path)?, 读取私钥(&key_path)?)?;
+        .with_single_cert(certs, key)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
     let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
         QuicServerConfig::try_from(tls)?,

@@ -52,8 +52,6 @@ def 启动服务(port: int) -> subprocess.Popen[str]:
         env=environment,
         check=True,
     )
-    environment["HTTP3_CERT_FILE"] = str(捕获器目录 / "fingerprint_cert.pem")
-    environment["HTTP3_KEY_FILE"] = str(捕获器目录 / "fingerprint_key.pem")
     environment["HTTP3_TEST_PORT"] = str(port)
     process = subprocess.Popen(
         [str(executable)],
