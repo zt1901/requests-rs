@@ -11,6 +11,13 @@ use quinn::crypto::rustls::QuicServerConfig;
 use serde_json::json;
 
 static 连接序号: AtomicU64 = AtomicU64::new(1);
+fn 查询参数<'a>(request: &'a Request<()>, name: &str) -> Option<&'a str> {
+    request.uri().query()?.split('&').find_map(|item| {
+        let (key, value) = item.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
 fn 构造响应(
     request: &Request<()>,
     request_body: &[u8],
@@ -28,6 +35,18 @@ fn 构造响应(
             .header(header::SET_COOKIE, "redirected=1; Path=/")
             .body(Bytes::new())
             .expect("重定向响应有效");
+    }
+    if path == "/benchmark" {
+        let size = 查询参数(request, "size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1024)
+            .min(8 * 1024 * 1024);
+        let body = Bytes::from(vec![b'x'; size]);
+        return builder
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(body)
+            .expect("基准响应有效");
     }
     let body = json!({
         "method": request.method().as_str(),
@@ -66,8 +85,15 @@ async fn 处理连接(connection: quinn::Connection, connection_id: u64) -> Resu
                 }
                 let response = 构造响应(&request, &body, connection_id);
                 let (parts, body) = response.into_parts();
-                if request.uri().path() == "/slow" {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let delay_ms = if request.uri().path() == "/slow" {
+                    500
+                } else {
+                    查询参数(&request, "delay_ms")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 stream.send_response(Response::from_parts(parts, ())).await?;
                 if !body.is_empty() {
