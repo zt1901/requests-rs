@@ -5,20 +5,34 @@ build-backend = "maturin"
 [project]
 name = "requests_rust"
 version = "0.3.0"
-description = "基于wreq和内置采集指纹的浏览器网络客户端"
+description = "Browser-fingerprint HTTP, HTTP/3 and WebSocket client powered by Rust"
+readme = "README.md"
 requires-python = ">=3.10"
-license = "Proprietary"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "zt1901" }]
+keywords = ["http", "browser-fingerprint", "http2", "http3", "websocket", "rust"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Topic :: Internet :: WWW/HTTP",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zt1901/requests_rust-source"
+Documentation = "https://github.com/zt1901/requests_rust-source/blob/main/API_USAGE.md"
+Repository = "https://github.com/zt1901/requests_rust-source"
+Issues = "https://github.com/zt1901/requests_rust-source/issues"
 
 [tool.maturin]
 python-source = "python"
 module-name = "requests_rust._native"
 bindings = "pyo3"
 features = ["pyo3/abi3-py310", "pyo3/bytes", "pyo3/extension-module"]
-include = ["fingerprints.json", "README.md", "AI_USAGE_GUIDE.md"]
+include = ["fingerprints.json", "README.md", "API_USAGE.md", "AI_USAGE_GUIDE.md", "RESEARCH_BASELINE.md", "REPOSITORY_DISTRIBUTION.md", "CHROME152_SUPPORT_FEEDBACK.md", "examples/*.py", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE.txt"]

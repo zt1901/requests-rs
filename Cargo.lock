@@ -174,8 +174,6 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c5e60b8c8d282c86360cab651ded04ab0335a7b5390c8d34145cbeab8cacf5f"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -2703,8 +2701,6 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wreq"
 version = "6.0.0-rc.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f0eba5f5814a94e5f1a99156f187133464e525b66bdbc69a9627d46530af2e1"
 dependencies = [
  "btls",
  "btls-sys",

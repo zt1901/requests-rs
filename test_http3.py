@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -41,7 +45,7 @@ def Cargo环境() -> tuple[dict[str, str], Path]:
     return environment, executable
 
 
-def 启动服务(port: int) -> subprocess.Popen[str]:
+def 启动服务(port: int, certificate: Path, private_key: Path) -> subprocess.Popen[str]:
     environment, executable = Cargo环境()
     cargo = shutil.which("cargo", path=environment.get("PATH"))
     if cargo is None:
@@ -53,6 +57,8 @@ def 启动服务(port: int) -> subprocess.Popen[str]:
         check=True,
     )
     environment["HTTP3_TEST_PORT"] = str(port)
+    environment["HTTP3_TEST_CERT"] = str(certificate)
+    environment["HTTP3_TEST_KEY"] = str(private_key)
     process = subprocess.Popen(
         [str(executable)],
         cwd=项目目录,
@@ -81,7 +87,7 @@ def 验证同步(url: str) -> None:
     with Session(
         impersonate=测试版本,
         verify=False,
-        http_version="v3only",
+        http_version="http3",
         max_connections=20,
     ) as session:
         first = session.get(
@@ -91,6 +97,7 @@ def 验证同步(url: str) -> None:
             cookies={"explicit": "yes"},
         )
         assert first.http_version == "HTTP/3"
+        assert first.fingerprint_scope == "headers-only"
         first_data = first.json()
         assert first_data["method"] == "GET"
         assert first_data["query"] == "page=1"
@@ -111,10 +118,12 @@ def 验证同步(url: str) -> None:
 
         streamed = session.get(url + "/stream", stream=True)
         assert streamed.http_version == "HTTP/3"
+        assert streamed.fingerprint_scope == "headers-only"
         assert streamed.content
         streamed.close()
 
     with Session(impersonate=测试版本, verify=False) as session:
+        assert session.http_version == "http2"
         overridden = session.get(url + "/echo", http_version="v3")
         assert overridden.http_version == "HTTP/3"
 
@@ -130,7 +139,7 @@ def 验证同步(url: str) -> None:
         assert resolved.json()["path"] == "/echo"
 
 
-def 验证拒绝边界(url: str) -> None:
+def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> None:
     from requests_rust import Session
 
     try:
@@ -140,38 +149,87 @@ def 验证拒绝边界(url: str) -> None:
     else:
         raise AssertionError("无效http_version没有被拒绝")
 
-    with Session(
-        impersonate=测试版本,
-        verify=False,
-        http_version="http3",
-        proxy="http://127.0.0.1:1",
-    ) as session:
-        try:
-            session.get(url + "/echo")
-        except ValueError as error:
-            assert "QUIC需要UDP" in str(error)
-        else:
-            raise AssertionError("HTTP/3代理请求没有被拒绝")
+    class Http1Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
 
-    with Session(impersonate=测试版本, verify=False, http_version="http3") as session:
+        def respond(self) -> None:
+            content_length = int(self.headers.get("content-length", "0"))
+            if content_length:
+                self.rfile.read(content_length)
+            body = b"http1 fallback"
+            self.send_response(200)
+            self.send_header("x-test-proxy", "yes")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = respond
+        do_POST = respond
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Http1Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        fallback_url = f"http://127.0.0.1:{server.server_port}/"
+        with Session(impersonate=测试版本) as session:
+            assert session.http_version == "http2"
+            response = session.get(fallback_url)
+            assert response.http_version == "HTTP/1.1"
+            assert response.fingerprint_scope == "tls-http"
+
+        for preference in ("http3", "http2", "http1.1"):
+            with Session(impersonate=测试版本, http_version=preference) as session:
+                response = session.get(fallback_url)
+                assert response.http_version == "HTTP/1.1"
+                assert response.content == b"http1 fallback"
+
+        proxy_url = f"http://127.0.0.1:{server.server_port}"
+        with Session(
+            impersonate=测试版本,
+            http_version="http3",
+            proxy=proxy_url,
+        ) as session:
+            proxied = session.get("http://target.invalid/through-proxy")
+            assert proxied.http_version == "HTTP/1.1"
+            assert proxied.headers["x-test-proxy"] == "yes"
+
+        with Session(impersonate=测试版本, http_version="http3") as session:
+            uploaded = session.post(fallback_url, files={"document": Path(__file__)})
+            assert uploaded.http_version == "HTTP/1.1"
+
+        tls_server = ThreadingHTTPServer(("127.0.0.1", 0), Http1Handler)
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(certificate, private_key)
+        tls_server.socket = tls_context.wrap_socket(tls_server.socket, server_side=True)
+        tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
+        tls_thread.start()
         try:
-            session.get("http://127.0.0.1/")
-        except RuntimeError as error:
-            assert "只支持https" in str(error)
-        else:
-            raise AssertionError("HTTP/3明文URL没有被拒绝")
-        try:
-            session.get(url + "/echo", transfer_stats=True)
-        except ValueError as error:
-            assert "transfer_stats" in str(error)
-        else:
-            raise AssertionError("HTTP/3 transfer_stats没有被拒绝")
-        try:
-            session.post(url + "/echo", files={"document": Path(__file__)})
-        except ValueError as error:
-            assert "multipart" in str(error)
-        else:
-            raise AssertionError("HTTP/3 multipart没有被拒绝")
+            tls_url = f"https://127.0.0.1:{tls_server.server_port}/"
+            with Session(
+                impersonate=测试版本,
+                verify=False,
+                connect_timeout=0.2,
+                timeout=3,
+                http_version="http3",
+            ) as session:
+                response = session.get(tls_url)
+                assert response.http_version == "HTTP/1.1"
+                assert response.content == b"http1 fallback"
+                metered = session.get(tls_url, transfer_stats=True)
+                assert metered.http_version == "HTTP/1.1"
+                assert metered.transfer_stats is not None
+                assert metered.transfer_stats.response_size > 0
+        finally:
+            tls_server.shutdown()
+            tls_server.server_close()
+            tls_thread.join(timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
     with Session(
         impersonate=测试版本,
@@ -200,6 +258,7 @@ async def 验证异步(url: str) -> None:
             *(session.post(url + "/echo", data=f"body-{index}") for index in range(10))
         )
         assert all(response.http_version == "HTTP/3" for response in responses)
+        assert all(response.fingerprint_scope == "headers-only" for response in responses)
         assert [response.json()["body"] for response in responses] == [
             f"body-{index}" for index in range(10)
         ]
@@ -225,16 +284,19 @@ async def 验证异步(url: str) -> None:
 
 def main() -> None:
     port = 获取UDP端口()
-    process = 启动服务(port)
-    url = f"https://127.0.0.1:{port}"
-    try:
-        验证同步(url)
-        asyncio.run(验证异步(url))
-        验证拒绝边界(url)
-        print("HTTP/3同步、异步、连接复用、重定向、Cookie、流和拒绝边界验证通过")
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
+    with tempfile.TemporaryDirectory(prefix="requests-rust-http3-test-") as temp_dir:
+        certificate = Path(temp_dir) / "certificate.pem"
+        private_key = Path(temp_dir) / "private-key.pem"
+        process = 启动服务(port, certificate, private_key)
+        url = f"https://127.0.0.1:{port}"
+        try:
+            验证同步(url)
+            asyncio.run(验证异步(url))
+            验证降级与边界(url, certificate, private_key)
+            print("HTTP/3优先、HTTP/1.1降级、同步、异步、连接复用、重定向、Cookie和流验证通过")
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
 
 if __name__ == "__main__":

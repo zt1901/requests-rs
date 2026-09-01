@@ -15,6 +15,8 @@ from ._native import NativeSession, available_profiles, build_response_headers
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
 FileInput = Mapping[str, str | os.PathLike[str] | tuple[str, str | os.PathLike[str], str | None]]
 ProxyInput = Mapping[str, str | None]
+FingerprintDocument = Mapping[str, Any] | Sequence[Mapping[str, Any]]
+FingerprintInput = str | os.PathLike[str] | FingerprintDocument
 _UNSET = object()
 
 
@@ -128,8 +130,11 @@ def _header_items(headers: HeaderInput | None) -> list[tuple[str, str]]:
     if headers is None:
         return []
     if isinstance(headers, Mapping):
-        return list(headers.items())
-    return list(headers)
+        headers = headers.items()
+    try:
+        return [(str(name), str(value)) for name, value in headers]
+    except (TypeError, ValueError) as error:
+        raise TypeError("headers必须是Mapping或(name, value)序列") from error
 
 
 def _append_query(url: str, values: Mapping[str, Any]) -> str:
@@ -167,9 +172,9 @@ def _normalize_http_version(value: str) -> str:
     aliases = {
         "auto": "auto",
         "default": "auto",
-        "http1": "http1",
-        "http1.1": "http1",
-        "http/1.1": "http1",
+        "http1": "http1.1",
+        "http1.1": "http1.1",
+        "http/1.1": "http1.1",
         "http2": "http2",
         "h2": "http2",
         "http/2": "http2",
@@ -182,7 +187,7 @@ def _normalize_http_version(value: str) -> str:
     try:
         return aliases[value.lower()]
     except KeyError as error:
-        raise ValueError("http_version必须是auto、http1、http2或http3") from error
+        raise ValueError("http_version必须是auto、http1.1、http2或http3") from error
 
 class Response:
     def __init__(
@@ -194,6 +199,7 @@ class Response:
         fingerprint_id: str,
         impersonate: str | os.PathLike[str],
         http_version: str = "UNKNOWN",
+        fingerprint_scope: str = "tls-http",
         content: bytes | None = None,
         stream: Any = None,
         history: Sequence["Response"] = (),
@@ -205,6 +211,7 @@ class Response:
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self.http_version = http_version
+        self.fingerprint_scope = fingerprint_scope
         self._content = content
         self._stream = stream
         self.transfer_stats = None
@@ -222,6 +229,7 @@ class Response:
         response.fingerprint_id = native.fingerprint_id
         response.impersonate = native.impersonate
         response.http_version = native.http_version
+        response.fingerprint_scope = native.fingerprint_scope
         response.transfer_stats = native.transfer_stats
         response._content = native.content
         response._stream = None
@@ -247,6 +255,7 @@ class Response:
                 self._native_response.history(),
                 self.fingerprint_id,
                 self.impersonate,
+                self.fingerprint_scope,
             )
         return self._history
 
@@ -521,7 +530,7 @@ class Session:
     def __init__(
         self,
         *,
-        impersonate: str | os.PathLike[str],
+        impersonate: FingerprintInput,
         fingerprint_rotation: bool = True,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
@@ -542,7 +551,7 @@ class Session:
         max_response_bytes: int = 64 * 1024 * 1024,
         max_websocket_message_bytes: int = 16 * 1024 * 1024,
         cookie_store: bool = True,
-        http_version: str = "auto",
+        http_version: str = "http2",
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
@@ -598,8 +607,25 @@ class Session:
         if isinstance(dns_servers, str):
             raise TypeError("dns_servers必须是字符串序列，不能是单个字符串")
         native_dns_servers = [str(server) for server in (dns_servers or [])]
-        impersonate = os.fspath(impersonate)
-        self.impersonate = impersonate
+        fingerprints_json = None
+        if isinstance(impersonate, Mapping) or (
+            isinstance(impersonate, Sequence)
+            and not isinstance(impersonate, (str, bytes, bytearray))
+        ):
+            if fingerprints_path is not None:
+                raise TypeError("impersonate使用捕获结果对象时不能同时传fingerprints_path")
+            try:
+                fingerprints_json = json_module.dumps(
+                    impersonate,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as error:
+                raise TypeError(f"impersonate捕获结果不能序列化为JSON: {error}") from error
+            native_impersonate = ""
+        else:
+            native_impersonate = os.fspath(impersonate)
+        self.impersonate = native_impersonate
         self.fingerprint_rotation = fingerprint_rotation
         self.headers = _header_items(headers)
         self._native_headers = tuple(self.headers)
@@ -623,7 +649,7 @@ class Session:
         self.cookie_store = cookie_store
         self.http_version = http_version
         self._native = NativeSession(
-            impersonate,
+            native_impersonate,
             fingerprint_rotation,
             proxy,
             verify,
@@ -641,7 +667,10 @@ class Session:
             max_response_bytes,
             max_websocket_message_bytes,
             cookie_store,
+            fingerprints_json,
         )
+        if fingerprints_json is not None:
+            self.impersonate = self._native.impersonate
         self.cookies = Cookies(self._native)
 
     @property
@@ -718,9 +747,6 @@ class Session:
         request_http_version = (
             self.http_version if http_version is None else _normalize_http_version(http_version)
         )
-        effective_proxy = request_proxy if proxy_override else self.proxy
-        if request_http_version == "http3" and effective_proxy is not None:
-            raise ValueError("HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输")
         if data is not None and json is not None:
             raise ValueError("data和json不能同时传入")
         if json is not None:
@@ -899,10 +925,6 @@ class Session:
             request_cookies,
             request_http_version,
         ) = prepared
-        if request_http_version == "http3" and files is not None:
-            raise ValueError("HTTP/3模式暂不支持multipart文件上传")
-        if request_http_version == "http3" and transfer_stats:
-            raise ValueError("HTTP/3模式暂不支持transfer_stats TCP隧道计量")
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -955,7 +977,12 @@ class Session:
                 native_dns_servers,
                 request_dns_timeout,
             )
-            history = _build_history(native.history, native.fingerprint_id, native.impersonate)
+            history = _build_history(
+                native.history,
+                native.fingerprint_id,
+                native.impersonate,
+                native.fingerprint_scope,
+            )
             return Response(
                 status_code=native.status_code,
                 headers=native.headers,
@@ -964,6 +991,7 @@ class Session:
                 impersonate=native.impersonate,
                 stream=native,
                 http_version=native.http_version,
+                fingerprint_scope=native.fingerprint_scope,
                 history=history,
             )
 
@@ -1089,10 +1117,6 @@ class AsyncSession:
             unexpected = next(iter(kwargs))
             raise TypeError(f"request() got an unexpected keyword argument {unexpected!r}")
         request_http_version = prepared[-1]
-        if request_http_version == "http3" and files is not None:
-            raise ValueError("HTTP/3模式暂不支持multipart文件上传")
-        if request_http_version == "http3" and transfer_stats:
-            raise ValueError("HTTP/3模式暂不支持transfer_stats TCP隧道计量")
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -1223,7 +1247,7 @@ def request(
     method: str,
     url: str,
     *,
-    impersonate: str,
+    impersonate: FingerprintInput,
     fingerprint_rotation: bool = True,
     proxy: str | None = None,
     proxies: ProxyInput | None = None,
@@ -1250,6 +1274,7 @@ def _build_history(
     entries: Sequence[tuple[int, str, str, Sequence[tuple[str, str]]]],
     fingerprint_id: str,
     impersonate: str,
+    fingerprint_scope: str = "tls-http",
 ) -> list[Response]:
     return [
         Response(
@@ -1259,6 +1284,7 @@ def _build_history(
             url=previous,
             fingerprint_id=fingerprint_id,
             impersonate=impersonate,
+            fingerprint_scope=fingerprint_scope,
         )
         for status, previous, _target, headers in entries
     ]
@@ -1277,7 +1303,13 @@ def _response_from_stream(native: Any, *, async_stream: bool = False) -> Respons
         impersonate=native.impersonate,
         stream=native,
         http_version=native.http_version,
-        history=_build_history(native.history, native.fingerprint_id, native.impersonate),
+        fingerprint_scope=native.fingerprint_scope,
+        history=_build_history(
+            native.history,
+            native.fingerprint_id,
+            native.impersonate,
+            native.fingerprint_scope,
+        ),
     )
     response._async_stream = async_stream
     return response

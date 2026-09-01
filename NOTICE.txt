@@ -1,9 +1,9 @@
 requests_rust
-Copyright (c) 2026 zt1901. All rights reserved.
+Copyright (c) 2026 zt1901
 
-The original requests_rust source code, build scripts, test projects,
-fingerprint record organization, and release artifacts are proprietary.
-Use of this software does not transfer copyright, trademark, or redistribution rights.
+Original requests_rust code is available under your choice of the MIT License
+or the Apache License, Version 2.0. See LICENSE-MIT and LICENSE-APACHE.
 
-Third-party components remain subject to their respective licenses.
+Third-party components and vendored source remain subject to their respective
+licenses and notices. Those licenses are not replaced by the project license.
 See the repository vendor directories for applicable third-party notices.

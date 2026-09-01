@@ -1,88 +1,86 @@
-# 仓库职责与发布约定
+# 开源仓库与发布约定
 
-本项目拆分为两个 GitHub 私有仓库。后续维护、构建和发布必须严格遵守本文件，避免将源码泄露到 wheel 分发仓库。
+## 权威仓库
 
-## 1. 源码与构建仓库
+项目的权威源码仓库为：
 
-仓库：`zt1901/requests_rust-source`
+<https://github.com/zt1901/requests_rust-source>
 
-地址：<https://github.com/zt1901/requests_rust-source>
+公开仓库保存完整Rust/PyO3源码、Python API、指纹记录、vendored依赖、测试、构建配置、示例和研究文档。Issue、Pull Request、Git标签和GitHub Release均以该仓库为准。
 
-本地项目目录：
+原`zt1901/requests_rust` wheel分发仓库可以保留为兼容镜像，但不能成为第二个源码真值；README、版本号、Release说明和wheel摘要必须从权威仓库同步生成。
 
-```text
-C:\Users\admin\Desktop\实验项目\指纹对撞机\请求捕获器\wreq_replayer
-```
+## 开源许可证
 
-本地 Git `origin` 必须始终指向该源码仓库：
+项目原创代码采用`MIT OR Apache-2.0`双许可证。使用者可以任选其一：
 
-```text
-https://github.com/zt1901/requests_rust-source.git
-```
+- [`LICENSE-MIT`](LICENSE-MIT)
+- [`LICENSE-APACHE`](LICENSE-APACHE)
 
-该仓库存放：
+vendored第三方组件继续遵循各自许可证和NOTICE。修改或分发vendor内容时不得删除原版权和许可证文件。
 
-- 完整 Rust/PyO3 源码、Python API 外壳、指纹记录和 vendored 依赖。
-- `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock` 与本机构建脚本。
-- 所有测试、Facebook 真实回归、性能基准和研究文档。
-- `.github/workflows/build-wheels.yml` 自动构建流水线。
-- 各平台 wheel 的构建产物和源码仓库内的构建 Release；构建成功与完整协议验证必须分别记录。
+## 仓库内容
 
-当前构建目标：
+应提交：
 
-| 平台 | Rust target | wheel 标签 | 构建位置 |
+- `src/`与`python/`中的Rust/Python实现。
+- `Cargo.toml`、`Cargo.lock`、`pyproject.toml`和构建配置。
+- `fingerprints.json`及其可公开的采集元数据。
+- 直接保护公开行为的测试与本地测试服务。
+- `examples/`、用户手册、维护手册和研究边界。
+- `.github/workflows/build-wheels.yml`。
+- vendored依赖及其许可证、补丁和上游说明。
+
+不得提交：
+
+- 真实账号、Cookie、Token、API Key、代理密码或可用私钥。
+- 与个人账号绑定的请求Body、CSRF、签名、时间戳或业务抓包。
+- 本机构建缓存、虚拟环境、`.pyd`、`target/`、临时wheel和测试下载目录。
+- 包含真实代理身份或客户数据的基准结果。
+
+公开测试需要凭据时，用户在本地文件顶部填写；仓库中的默认值必须为空或不可用示例值。
+
+## 构建矩阵
+
+| 平台 | Rust target | wheel标签 | 当前验证级别 |
 |---|---|---|---|
-| Windows x64 | `x86_64-pc-windows-msvc` | `win_amd64` | 本机 `build_and_install.py` |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | GitHub Actions |
-| Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | GitHub Actions |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | GitHub Actions |
-| macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | GitHub Actions |
+| Windows x64 | `x86_64-pc-windows-msvc` | `win_amd64` | 完整协议回归 |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | 原生构建与安装冒烟 |
+| Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | 原生构建与安装冒烟 |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | 原生构建与安装冒烟 |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | 原生构建与安装冒烟 |
 
-当前完整HTTP、代理、SOCKS5、WebSocket、IPv6和混合连接上限回归以Windows x64为准。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已在对应原生runner完成wheel构建、pip安装、原生模块导入、profile读取和Session构造冒烟；不得把安装冒烟写成同等级全协议验证。当前没有macOS Intel或Alpine musllinux发布目标。
-标签触发的GitHub Release任务只汇总四个Actions平台产物；Windows x64由本机`build_and_install.py`构建，发布前必须单独核验并加入同版本Release。
+“构建成功”“原生安装冒烟”和“完整协议回归”是三个不同状态。Release说明必须逐平台写明实际达到的级别，不能把导入成功描述成代理、WebSocket、IPv6和指纹均已验证。
 
-Windows x64 本机构建入口：
+## 本机构建
+
+Windows x64开发环境可右键运行：
+
+```text
+build_and_install.py
+```
+
+该脚本同步指纹、设置本机Cargo/LLVM路径、构建CPython 3.10 stable ABI wheel、安装到当前Python，并同步editable源码目录中的原生模块。
+
+通用构建：
 
 ```bash
-python build_and_install.py
+python -m pip install "maturin>=1.9,<2"
+maturin build --release --out dist
 ```
 
-每次变更源码、测试、指纹、构建配置或 Actions 工作流时，只能提交并推送至 `requests_rust-source`。
+## 发布流程
 
-## 2. Wheel 分发仓库
+1. 更新版本号、README、API手册和变更说明。
+2. 运行与改动直接相关的本地回归；浏览器profile变更还需线级对撞。
+3. 推送提交并等待GitHub Actions矩阵完成。
+4. 收集每个平台实际生成的wheel，记录文件名和SHA-256。
+5. 创建`vX.Y.Z`标签；工作流生成draft GitHub Release。
+6. 在Release说明中分别列出平台、验证级别、内置profile和已知限制。
+7. 核对wheel中不含凭据、个人路径、测试输出或本机构建缓存。
+8. 由维护者把draft发布为正式Release。
 
-仓库：`zt1901/requests_rust`
-
-地址：<https://github.com/zt1901/requests_rust>
-
-该仓库必须保持私有，并且只用于 Release 分发。
-
-允许内容：
-
-- 简短的 `README.md`，仅说明安装方式、支持平台和源码仓库边界。
-- GitHub Release。
-- 当前五种目标平台的已验证 `.whl` 文件；未实际构建或未通过对应平台验收的产物不得写成已发布支持。
-
-禁止内容：
-
-- Rust 源码、Python 源码、Cargo 文件、测试、研究文档、指纹 JSON、vendored 依赖。
-- GitHub Actions workflow、构建日志或任何能还原源码的资料。
-- 将本地项目目录设置为该仓库的 `origin`。
-
-发布仓库的 `main` 分支只保留上述简短 `README.md`；wheel 仅作为 GitHub Release asset 上传。
-
-## 3. 发布流程
-
-发布新版本时按以下顺序执行：
-
-1. 在 `requests_rust-source` 完成源码测试、当前原生平台协议回归与多平台构建；各平台的运行验证状态必须单独记录。
-2. 收集本次实际完成构建与验收的平台 wheel，确认文件名和 SHA-256 digest。
-3. 在源码仓库保留构建记录和 wheel Release，用于可重复构建与审计。
-4. 在 `zt1901/requests_rust` 创建同版本 draft Release，并只上传本次已验收的 wheel。
-5. 核对分发 Release 中没有源码文件、压缩源码包或 workflow artifact。
-6. 由用户决定是否将 draft Release 发布为正式 Release。
-
-对于 `v0.3.0`，wheel 名称为：
+当前版本wheel命名示例：
 
 ```text
 requests_rust-0.3.0-cp310-abi3-win_amd64.whl
@@ -92,25 +90,26 @@ requests_rust-0.3.0-cp310-abi3-manylinux_2_34_aarch64.whl
 requests_rust-0.3.0-cp310-abi3-macosx_11_0_arm64.whl
 ```
 
-## 4. 交接检查
+## Profile发布门禁
 
-后续 AI 开始工作前应先检查：
+新增或更新浏览器profile时必须提供：
+
+1. 浏览器正式产品名称、完整版本、来源和二进制摘要。
+2. TLS、HTTP/2、Header顺序和生命周期采集记录。
+3. 对GREASE、随机KeyShare、ECH载荷和Chromium扩展乱序的正确归一化。
+4. `requests_rust`直接加载捕获JSON的回放结果。
+5. 内置profile同步脚本结果和对应回归。
+
+禁止通过修改profile名称、UA或Client Hints让旧记录冒充新浏览器。Juggler、Nightly、Chromium和其他研发构建必须明确标注，不能写成Chrome或Firefox官网Stable。
+
+## 贡献检查
+
+提交Pull Request前至少检查：
 
 ```bash
-git remote -v
-git status --short
+cargo fmt --check
+cargo check --lib
+python test_python_api.py
 ```
 
-预期 `origin` 为：
-
-```text
-https://github.com/zt1901/requests_rust-source.git
-```
-
-如需更新 wheel 分发仓库，必须使用显式仓库参数，例如：
-
-```bash
-gh release upload vX.Y.Z <wheel-files> --repo zt1901/requests_rust
-```
-
-不得用 `git push` 向 `zt1901/requests_rust` 推送项目源码。
+如果当前平台缺少`libclang`，应设置`LIBCLANG_PATH`后再构建BTLS；Windows本机优先使用`build_and_install.py`。测试范围应随改动风险扩大，不能用与改动无关的全量压力测试代替直接行为验证。

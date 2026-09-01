@@ -39,6 +39,15 @@ def 需要单火种(profile):
     return profile.startswith(("chrome", "edge", "firefox"))
 
 
+def 读取记录(path):
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(document, list):
+        return document
+    if isinstance(document, dict) and isinstance(document.get("records"), list):
+        return document["records"]
+    raise RuntimeError(f"{path} 必须是指纹数组或包含 records 数组的 MCP envelope")
+
+
 def 可嵌入(record):
     tls = record.get("tls", {})
     http = record.get("http", {})
@@ -56,10 +65,10 @@ def 可嵌入(record):
 
 
 def main():
-    records = json.loads(记录文件.read_text(encoding="utf-8"))
+    records = 读取记录(记录文件)
     baselines = []
     if 浏览器基准文件.exists():
-        baselines = json.loads(浏览器基准文件.read_text(encoding="utf-8"))
+        baselines = 读取记录(浏览器基准文件)
     baseline_profiles = {识别版本(record) for record in baselines if 可嵌入(record)}
     embedded = []
     counts = {}
@@ -89,6 +98,7 @@ def main():
             profile_records = [seed]
         for record in profile_records:
             embedded.append({
+                "schema_version": record.get("schema_version", 1),
                 "id": record["id"],
                 "profile": profile,
                 "tls": record["tls"],

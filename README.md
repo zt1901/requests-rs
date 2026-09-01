@@ -1,101 +1,226 @@
 # requests_rust
 
-`requests_rust` 是一个面向浏览器指纹 HTTP、HTTP/3直连、代理和 WebSocket 的 Python 原生扩展。Python 负责请求参数和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过Reqwest/Quinn/Rustls执行HTTP/3，公开接口保持接近`curl_cffi.requests`的同步和异步调用习惯。
+<p align="center">
+  <strong>Python 的浏览器网络指纹客户端，核心网络路径由 Rust 执行。</strong>
+</p>
 
-## API 命名兼容
+<p align="center">
+  <a href="https://github.com/zt1901/requests_rust-source/actions/workflows/build-wheels.yml"><img alt="Build wheels" src="https://github.com/zt1901/requests_rust-source/actions/workflows/build-wheels.yml/badge.svg"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Rust" src="https://img.shields.io/badge/core-Rust-000000?logo=rust&logoColor=white">
+  <img alt="HTTP" src="https://img.shields.io/badge/HTTP-1.1%20%7C%202%20%7C%203-2F6FEB">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green">
+</p>
 
-公开 API 优先沿用 `curl_cffi.requests` 的高频命名与调用习惯：`Session`、`AsyncSession`、`Response`、`Headers`、`Cookies`，以及 `request/get/post/put/patch/delete/head/options`。常用请求参数如 `params`、`headers`、`cookies`、`data`、`json`、`files`、`timeout`、`stream`、`proxy`、`proxies`、`allow_redirects` 同样保持对应名称。
+`requests_rust` 为 Python 提供接近 `curl_cffi.requests` 使用习惯的同步和原生异步 API。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行；HTTP/3 优先路径由 Reqwest、Quinn 与 Rustls 执行。
 
-这是迁移便利性的兼容目标，而非逐项复刻承诺。`requests_rust` 不兼容或尚未实现 `curl_cffi` 的专有选项时会明确报错，不会静默忽略；指纹数据模型、TLS/HTTP2 实现、代理参数形式与响应内部对象以本库的 Rust 实现为准。
+适合需要长期 Session、真实连接复用、代理身份隔离和可审计浏览器传输画像的采集、自动化与网络研究项目。
 
-## 优点
+## 为什么使用
 
-- **Rust 网络路径**：DNS、代理、BoringSSL HTTP/1.1/2、Rustls/Quinn HTTP/3、WebSocket、连接池、Cookie、超时、流式 Body 和 multipart 均由Rust/Tokio执行。同步请求等待及自定义指纹文件读取、解析不占用GIL。
-- **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome146`、`chrome150`、`edge152`、`firefox151`；这些名称代表已采集并验证的固定快照，不等同于官网当前 Stable，也不会自动随浏览器更新。
-- **实例级指纹隔离**：每个 `Session` 可在构造时从不同 JSON 文件独立加载 profile，不修改进程全局指纹数据，也不影响其他实例。
-- **长期并发状态**：一个`AsyncSession`持续复用Cookie Jar、DNS配置、Client和匹配路由的连接池；Chrome/Edge只在自然新建TLS连接时随机ClientHello扩展顺序。代理、请求头与请求级Cookie仍可逐条独立传入。
-- **Rust 原生统一连接上限**：HTTP、HTTPS、HTTP 代理、SOCKS5、流和 WebSocket 共同使用 Tokio `Semaphore`，Python 不维护连接许可队列。
-- **双栈网络**：支持 IPv4、IPv6 字面量和双栈域名；Happy Eyeballs 默认在 300ms 后并行尝试另一个地址族。
+- **网络路径在 Rust**：DNS、连接池、TLS、HTTP、代理、Cookie、流、multipart 和 WebSocket 不依赖 Python 工作线程。
+- **真实浏览器采集画像**：profile 来自浏览器 TLS/HTTP2 线级记录，不靠修改 UA 冒充版本。
+- **自定义指纹零全局污染**：每个 `Session` 可以直接加载自己的单 profile JSON，不修改进程全局配置。
+- **同步与 asyncio 同一语义**：`Session`、`AsyncSession`、模块级方法、响应对象和错误边界保持一致。
+- **统一连接上限**：HTTP、代理、流和 WebSocket 共用 Rust `Semaphore`，不会各自突破 Session 上限。
+- **连接身份隔离**：Origin、完整代理身份、DNS配置和指纹变体共同决定可复用链路。
 
-## 研究记录
+## 快速开始
 
-- Chrome 150 真实浏览器与 Rust profile 的采集对照为 41/41 字段一致。
-- Firefox 151五次独立完整握手的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致，因此只保留一条火种；完整握手保持固定NSS JA3，命中TLS票据后的恢复握手会自然增加PSK扩展41并形成第二个恢复JA3。
-- Edge 152.0.4191.53使用`playwright_rust`操作本机正式版采集单条完整火种；同一连接上的请求复用握手，强制新建TLS连接时Chrome/Edge扩展顺序随机而JA3N、JA4和火种ID保持稳定。
-- 本地动态代理回显测试已验证 400 条请求的 Header、Cookie 和代理认证 session ID 逐条隔离；吞吐随机器负载和连接建立时序波动，不作为固定性能承诺。
-- 本地 keep-alive、动态代理和长任务脚本继续用于版本间回归；绝对吞吐受硬件、`max_connections`、指纹变体数量和目标服务影响，不作为发布承诺。
-- 同一个 `AsyncSession(max_connections=50)` 已验证同时保持 25 条 WebSocket、15 个 HTTP 代理请求和 10 个 SOCKS5 请求；第 51 个操作会在 Rust 等待 permit。
-- Webshare 真实外网代理已验证 HTTPS 出口和 WSS 文本帧回显。
+### 1. 安装 wheel
 
-## 安装
+项目发布 wheel 后，从 [GitHub Releases](https://github.com/zt1901/requests_rust-source/releases) 下载与系统和 CPU 匹配的文件：
 
-当前本机产物为 Windows x64、CPython 3.10+ 的稳定 ABI wheel：
-
-```text
-requests_rust-0.3.0-cp310-abi3-win_amd64.whl
+```bash
+python -m pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ```
 
-Windows x64 本地开发可直接右键运行 `build_and_install.py`。当前 GitHub Actions 矩阵原生构建并安装冒烟验证 Windows ARM64、Linux x64、Linux ARM64 和 macOS Apple Silicon wheel。云端冒烟确认原生模块可导入、内置 profile 可读取并可构造 Session；HTTP、代理、SOCKS5、WebSocket、IPv6 和 Facebook 完整协议回归仍以 Windows x64 为准。
+当前 wheel 使用 CPython stable ABI，支持 CPython 3.10 及以上版本。仓库尚未发布对应 Release 时，可按下方“从源码构建”操作。
 
-## 最小用法
+### 2. 发起请求
 
 ```python
 from requests_rust import Session
 
+with Session(impersonate="edge152", timeout=30) as 会话:
+    响应 = 会话.get(
+        "https://example.com/",
+        headers={"accept": "text/html,application/xhtml+xml"},
+    )
+    响应.raise_for_status()
+    print(响应.status_code)
+    print(响应.http_version)
+    print(响应.fingerprint_id)
+```
+
+### 3. 原生异步并发
+
+```python
+import asyncio
+from requests_rust import AsyncSession
+
+
+async def 异步主程序() -> None:
+    目标地址列表 = [f"https://example.com/?task={序号}" for 序号 in range(10)]
+    async with AsyncSession(
+        impersonate="edge152",
+        max_connections=10,
+    ) as 会话:
+        响应列表 = await asyncio.gather(*(会话.get(地址) for 地址 in 目标地址列表))
+    print([响应.status_code for 响应 in 响应列表])
+
+
+asyncio.run(异步主程序())
+```
+
+仓库内还有可右键运行的完整示例：
+
+- [`examples/basic_sync.py`](examples/basic_sync.py)：同步请求与响应字段。
+- [`examples/async_concurrency.py`](examples/async_concurrency.py)：复用一个 `AsyncSession` 并发请求。
+- [`examples/custom_fingerprint.py`](examples/custom_fingerprint.py)：直接加载捕获器 JSON 并保留浏览器 Header 顺序。
+
+## 加载捕获器指纹
+
+捕获器输出是一个 JSON 记录列表；MCP `read_fingerprint_result`返回包含`records`的Python字典。单一`profile`的文件路径、记录列表或MCP结果对象都可以直接作为`impersonate`传入，不需要手动落盘或重写JSON：
+
+```python
+from pathlib import Path
+from requests_rust import Session
+
+指纹文件 = Path(r"C:\fingerprints\edge152.json")
+
+浏览器请求头 = [
+    ("upgrade-insecure-requests", "1"),
+    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-user", "?1"),
+    ("sec-fetch-dest", "document"),
+]
+
 with Session(
-    impersonate="firefox151",
-) as session:
-    response = session.get("https://example.com/api")
-    print(response.status_code, response.fingerprint_id)
+    impersonate=指纹文件,
+    fingerprint_rotation=False,
+    headers=浏览器请求头,
+) as 会话:
+    响应 = 会话.get("https://example.com/")
+    print(会话.fingerprint_count)
+    print(响应.fingerprint_id)
 ```
 
-## 实例级自定义指纹
+MCP对象直传：
 
 ```python
-from requests_rust import get
-
-response = get(
-    "https://example.com/",
-    impersonate=r"D:\fingerprints\firefox151.json",
+# 捕获结果是MCP客户端调用read_fingerprint_result后得到的dict。
+捕获结果 = await mcp_client.call_tool(
+    "read_fingerprint_result",
+    {"task_id": 任务ID},
 )
+
+记录 = 捕获结果["records"][0]
+with Session(
+    impersonate=捕获结果,
+    fingerprint_rotation=False,
+) as 会话:
+    响应 = 会话.get(
+        "https://example.com/",
+        # JSON二维list会自动规范化并保持捕获顺序；值是否适合目标业务由调用方决定。
+        headers=记录["http"]["headers"],
+    )
 ```
 
-`impersonate` 直接传路径时，文件必须只包含一个 profile，但可以包含该 profile 的多个变体；Session 会自动识别 profile。旧写法 `impersonate="firefox151", fingerprints_path=...` 仍保留。文件内容仅属于当前实例，不进入内置指纹全局缓存。
+已验证的加载契约：
 
-profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 Copy as cURL 或业务代码传入的全部 Header，包括 `User-Agent` 与 `sec-ch-ua*`，均原样优先，库不会接管或替换。
+- 单 profile 文件允许包含一个或多个变体。
+- Session 自动识别 profile 名称。
+- `response.fingerprint_id` 返回本次实际选择的源记录 ID。
+- `response.fingerprint_scope`在wreq/BoringSSL的HTTP/1.1/2路径为`tls-http`，在通用Rustls/Quinn HTTP/3路径为`headers-only`。
+- 文件只属于当前实例，不进入内置指纹全局缓存。
+- `fingerprints_path=` 仍可用于从多 profile 文件中显式选择名称。
+- 裸记录数组、Python记录序列和捕获器MCP的完整`{schema_version, records, ...}` dict envelope都可直接加载；未知schema、未知非GREASE TLS/H2 ID、损坏的扩展payload或顺序冲突会在Session构造期失败。
+- 2026-09-02真实Chrome 152闭环验证：MCP形状对象直传后，源/回放ClientHello均为1914字节，JA4均为`t13i1516h2_8daaf6152771_cb7bf5808d99`，`0xca34` payload 206字节完全一致，HTTP/2 SETTINGS、优先级和Akamai参数一致。
 
-`accept`、`origin`、`referer`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 必须由具体请求上下文传入。
+业务 Cookie、认证、CSRF、签名、时间戳和 nonce 不应写入指纹文件。它们属于当前请求或账号状态，应通过 `headers=`、`cookies=`、`data=` 或 `json=` 传入。
 
-## 核心能力
+## 架构
 
-- 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
-- HTTP/1.1、HTTP/2及显式HTTP/3直连，支持重定向、总超时与Body读取超时
-- IPv4、IPv6 和 RFC 6555 Happy Eyeballs
-- Session 级静态 `resolve` 映射，以及 Session/请求级 Rust Hickory 自定义 DNS 服务器
-- 固定 profile 或按请求轮换 profile
-- Session Cookie Jar、每请求 Cookie 覆盖、重复 Header 保序
-- Session 默认代理和每请求代理覆盖
-- `ws://`、`wss://` 同步/异步 WebSocket，支持 HTTP CONNECT 预认证与 SOCKS5 认证
-- `http://`、`socks5://`、`socks5h://`代理，按完整代理身份隔离连接池；相同sticky代理身份可复用CONNECT、TLS和HTTP/2链路
-- Session 级 Rust 原生 `max_connections`，允许 HTTP、SOCKS5 和 WebSocket 混合占用
-- 所有内置浏览器版本各一条火种；多变体指纹池仅用于调用方自定义的多记录Profile
-- `max_cached_origins`限制可保留连接的Origin与完整代理身份组合，query、params和path不额外计数
-- 同步/异步流式响应与 Rust Tokio multipart 文件流
-
-## 限制
-
-- HTTP/3使用Reqwest/Quinn/Rustls，仅支持直连HTTPS普通/流式请求；不支持当前TCP代理、multipart、WebSocket、`transfer_stats`或浏览器QUIC指纹模拟。
-- 原生 wheel 必须与操作系统和 CPU 架构匹配；当前五个平台目标均已有构建产物，其中四个云端平台通过原生安装冒烟，完整协议回归以 Windows x64 为准。
-- Linux 构建目标为 glibc manylinux，不等同于 Alpine musl 支持。
-- 不同 profile 不共享 TLS/HTTP/2 连接池，这是指纹隔离的必要限制。
-- 不提供Rust原生`batch()`或库内业务Worker队列；该路线不能减少不同代理身份的握手成本，并会重复现有单请求Future与Rust统一连接上限的生命周期语义。批量业务使用Python有限Worker逐条调用同一个`AsyncSession`。
-
-完整安装、同步/异步 API、请求参数、Cookie、代理、WebSocket、流和 multipart 示例见 [API_USAGE.md](API_USAGE.md)。面向维护者的并发用法和边界说明见 [AI_USAGE_GUIDE.md](AI_USAGE_GUIDE.md)。浏览器 Copy as cURL 请求模板与指纹库的固定边界见 [RESEARCH_BASELINE.md](RESEARCH_BASELINE.md)。
-
-## 查看内置版本
-
-```python
-from requests_rust import available_profiles
-
-print(available_profiles())
+```mermaid
+flowchart LR
+    A[Python Session / AsyncSession] --> B[PyO3 API]
+    B --> C[Tokio Runtime]
+    C --> D[wreq + BoringSSL]
+    C --> E[Reqwest + Quinn + Rustls]
+    D --> F[HTTP/1.1 · HTTP/2 · WebSocket]
+    E --> G[HTTP/3 优先路径]
+    C --> H[DNS · Proxy · Cookie · Stream · Multipart]
 ```
+
+`http_version="http2"` 默认按 HTTP/2 → HTTP/1.1 协商。`http_version="http3"` 表示 HTTP/3 优先，并在允许安全降级时进入 HTTP/2/1.1 路径。当前 QUIC 后端不宣称复现 Chrome、Edge 或 Firefox 的 QUIC 指纹。
+
+## Profile 状态
+
+profile名称是已采集并验证的快照，不是自动指向官网最新版的别名。
+
+| Profile | 来源 | 状态 |
+|---|---|---|
+| `chrome146` | Google Chrome 历史采集 | 已验证固定快照 |
+| `chrome150` | Google Chrome 历史采集 | 已验证固定快照 |
+| `chrome152` | Google Chrome `152.0.7977.64`官方正式版 | 已完成Trust Anchor IDs `0xca34`线级回放并内置 |
+| `edge152` | Microsoft Edge `152.0.4191.53` 系统稳定版 | 当前正式版基线，已完成采集与回放 |
+| `firefox151` | playwright_rust Firefox Juggler | 已验证研发兼容快照，不代表 Mozilla 官网 Stable |
+
+Google Chrome `152.0.7977.64`的内置记录ID为`66e05a9d467e4b54b2c2b71f12ced6f7`。真实回放ClientHello已确认携带206字节`0xca34` payload，SHA-256为`c9378cede9834fac982362518778475db2d9c3b3c54092910632ed74ab80ee01`，与捕获样本完全相同。本机Firefox为`146.0a1`预发行构建，不满足官网Stable基线；`firefox151`仍明确标注为Juggler研发兼容快照。
+
+新增或替换 profile 必须同时满足：正式产品身份校验、完整版本记录、真实 TLS/HTTP2 采集、GREASE/随机扩展归一化比较、Header顺序回放、生命周期回收和下游回归。
+
+## 支持平台
+
+| 平台 | Rust target | wheel 标签 | 验证级别 |
+|---|---|---|---|
+| Windows x64 | `x86_64-pc-windows-msvc` | `win_amd64` | 完整协议回归 |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | 原生构建与安装冒烟 |
+| Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | 原生构建与安装冒烟 |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | 原生构建与安装冒烟 |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | 原生构建与安装冒烟 |
+
+Alpine musl 和 macOS Intel 当前不在发布矩阵中。原生安装冒烟不等同于 Windows x64 的 HTTP、代理、SOCKS5、WebSocket、IPv6 与线级指纹完整回归。
+
+## 功能边界
+
+- `requests_rust` 兼容 `curl_cffi.requests` 的高频命名，不承诺兼容全部专有参数；未知关键字会明确报错。
+- HTTP/3 使用独立 Rustls/Quinn 指纹边界，响应明确标记`fingerprint_scope="headers-only"`；不能把成功协商 HTTP/3 解释为浏览器 QUIC 指纹一致。
+- `verify=False` 只适用于受控本地自签名测试。
+- 不同 profile 不共享 TLS/HTTP2 连接池，这是指纹隔离要求。
+- `set_proxy()`和Session关闭会同时清空连接池与每个变体的TLS session ticket cache，避免旧代理身份通过恢复握手关联到新代理。
+- 库不提供业务 `batch()`、任务重试或常驻业务队列；业务层应使用有限 Worker 调用同一个长期 `AsyncSession`。
+- profile 默认 Header 只在调用方未传同名字段时兜底；请求上下文 Header、Cookie 和认证由调用方负责。
+
+## 文档
+
+- [使用与 API 手册](API_USAGE.md)：从安装、同步/异步请求到代理、DNS、WebSocket、流和 multipart。
+- [AI 与维护者手册](AI_USAGE_GUIDE.md)：完整参数、并发语义、资源边界与工程决策。
+- [指纹与业务请求边界](RESEARCH_BASELINE.md)：哪些字段属于 profile，哪些字段必须由业务代码维护。
+- [仓库与发布约定](REPOSITORY_DISTRIBUTION.md)：构建矩阵、Release 和贡献流程。
+- [Chrome 152验收记录](CHROME152_SUPPORT_FEEDBACK.md)：Trust Anchor IDs端到端实现、线级证据和发布门禁。
+
+## 从源码构建
+
+需要 Rust stable、Python 3.10+、maturin、CMake、Clang/libclang，以及平台原生 C/C++ 工具链：
+
+```bash
+git clone https://github.com/zt1901/requests_rust-source.git
+cd requests_rust-source
+python -m pip install "maturin>=1.9,<2"
+maturin build --release --out dist
+python -m pip install --force-reinstall dist/requests_rust-*.whl
+```
+
+Windows 开发环境也可右键运行 `build_and_install.py`。该脚本同步内置指纹、构建wheel、安装到当前Python，并同步editable源码目录中的原生模块。
+
+## 贡献
+
+提交改动时应保持最小边界，并运行与改动直接相关的测试。指纹变更必须附真实浏览器版本、采集记录和线级对撞证据；网络功能变更必须覆盖同步与异步生命周期、错误路径和资源释放。
+
+## 许可证
+
+项目原创代码按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 双许可证发布，使用者可任选其一。vendored第三方组件继续遵循各自许可证与NOTICE。

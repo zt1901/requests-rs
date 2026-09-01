@@ -10,7 +10,7 @@ use std::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -121,6 +121,7 @@ type RawNativeResponse = (
     String,
     String,
     String,
+    String,
     Vec<NativeHistoryEntry>,
     Option<NativeTransferCounters>,
 );
@@ -206,6 +207,8 @@ struct NativeResponse {
     impersonate: String,
     #[pyo3(get)]
     http_version: String,
+    #[pyo3(get)]
+    fingerprint_scope: String,
     #[pyo3(get)]
     transfer_stats: Option<Py<NativeTransferStats>>,
     history: Vec<NativeHistoryEntry>,
@@ -388,9 +391,35 @@ where
 }
 
 fn parse_records(source: &str) -> Result<Vec<Arc<Record>>> {
-    serde_json::from_str::<Vec<Record>>(source)
-        .map(|records| records.into_iter().map(Arc::new).collect())
-        .context("JSON结构不是指纹记录列表")
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RecordDocument {
+        Records(Vec<Record>),
+        Envelope {
+            schema_version: Option<u32>,
+            records: Vec<Record>,
+        },
+    }
+
+    let document = serde_json::from_str::<RecordDocument>(source)
+        .context("JSON结构不是指纹记录列表或包含records的捕获器结果")?;
+    let records = match document {
+        RecordDocument::Records(records) => records,
+        RecordDocument::Envelope {
+            schema_version,
+            records,
+        } => {
+            validate_schema_version(schema_version, "捕获结果")?;
+            records
+        }
+    };
+    if records.is_empty() {
+        bail!("指纹记录列表不能为空")
+    }
+    for record in &records {
+        validate_record(record)?;
+    }
+    Ok(records.into_iter().map(Arc::new).collect())
 }
 
 fn embedded_records() -> PyResult<&'static Vec<Arc<Record>>> {
@@ -402,6 +431,8 @@ fn embedded_records() -> PyResult<&'static Vec<Arc<Record>>> {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Record {
+    #[serde(default)]
+    schema_version: Option<u32>,
     id: String,
     profile: String,
     tls: TlsCapture,
@@ -416,6 +447,8 @@ struct TlsCapture {
     _server_name: Option<String>,
     cipher_suites: Vec<u16>,
     extensions: Vec<u16>,
+    #[serde(default)]
+    extension_wire: Vec<TlsExtensionWire>,
     supported_groups: Vec<u16>,
     #[serde(default)]
     key_share_groups: Vec<u16>,
@@ -441,10 +474,19 @@ struct TlsCapture {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct TlsExtensionWire {
+    id: u16,
+    length: usize,
+    payload_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct HttpCapture {
     protocol: String,
     #[serde(default)]
     headers: Vec<(String, String)>,
+    #[serde(default)]
+    header_order: Vec<String>,
     #[serde(default)]
     pseudo_header_order: Vec<String>,
     #[serde(default)]
@@ -467,6 +509,220 @@ struct Http2Priority {
     dependency: u32,
     weight: u16,
     source: String,
+}
+
+fn validate_schema_version(version: Option<u32>, scope: &str) -> Result<()> {
+    if let Some(version) = version
+        && version != 1
+    {
+        bail!("{scope}使用不支持的schema_version={version}，当前仅支持1")
+    }
+    Ok(())
+}
+
+fn is_grease_value(value: u16) -> bool {
+    value & 0x0f0f == 0x0a0a
+}
+
+fn ensure_unique_ids(values: &[u16], scope: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    for value in values {
+        if !is_grease_value(*value) && !seen.insert(*value) {
+            bail!("{scope}包含重复ID 0x{value:04x}")
+        }
+    }
+    Ok(())
+}
+
+fn validate_record(record: &Record) -> Result<()> {
+    validate_schema_version(record.schema_version, &format!("指纹{}", record.id))?;
+    if record.id.trim().is_empty() || record.profile.trim().is_empty() {
+        bail!("指纹id和profile不能为空")
+    }
+
+    let tls = &record.tls;
+    ensure_unique_ids(&tls.cipher_suites, "cipher_suites")?;
+    ensure_unique_ids(&tls.extensions, "extensions")?;
+    ensure_unique_ids(&tls.supported_groups, "supported_groups")?;
+    ensure_unique_ids(&tls.key_share_groups, "key_share_groups")?;
+    for (scope, values, supported) in [
+        (
+            "cipher_suites",
+            tls.cipher_suites.as_slice(),
+            cipher_name as fn(u16) -> Option<&'static str>,
+        ),
+        (
+            "supported_groups",
+            tls.supported_groups.as_slice(),
+            group_name,
+        ),
+        (
+            "signature_algorithms",
+            tls.signature_algorithms.as_slice(),
+            signature_name,
+        ),
+        (
+            "delegated_credentials",
+            tls.delegated_credentials.as_slice(),
+            signature_name,
+        ),
+    ] {
+        let unknown = values
+            .iter()
+            .copied()
+            .filter(|value| !is_grease_value(*value) && supported(*value).is_none())
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            bail!("{scope}包含尚不能等价回放的ID: {unknown:?}")
+        }
+    }
+    let unknown_key_shares = tls
+        .key_share_groups
+        .iter()
+        .copied()
+        .filter(|value| !is_grease_value(*value) && key_share(*value).is_none())
+        .collect::<Vec<_>>();
+    if !unknown_key_shares.is_empty() {
+        bail!("key_share_groups包含尚不能等价回放的ID: {unknown_key_shares:?}")
+    }
+    let unknown_extensions = tls
+        .extensions
+        .iter()
+        .copied()
+        .filter(|value| !is_grease_value(*value) && extension_type(*value).is_none())
+        .collect::<Vec<_>>();
+    if !unknown_extensions.is_empty() {
+        bail!("extensions包含尚不能等价回放的ID: {unknown_extensions:?}")
+    }
+    let unknown_compressors = tls
+        .certificate_compression_algorithms
+        .iter()
+        .copied()
+        .filter(|value| !matches!(value, 1..=3))
+        .collect::<Vec<_>>();
+    if !unknown_compressors.is_empty() {
+        bail!("certificate_compression_algorithms包含未知ID: {unknown_compressors:?}")
+    }
+    let unknown_alpn = tls
+        .alpn
+        .iter()
+        .filter(|value| !matches!(value.as_str(), "h2" | "http/1.1"))
+        .collect::<Vec<_>>();
+    if !unknown_alpn.is_empty() {
+        bail!("alpn包含尚不能回放的协议: {unknown_alpn:?}")
+    }
+
+    if !tls.extension_wire.is_empty() {
+        let mut wire_ids = Vec::new();
+        for extension in &tls.extension_wire {
+            let payload = BASE64
+                .decode(&extension.payload_base64)
+                .with_context(|| format!("TLS扩展0x{:04x}的payload_base64无效", extension.id))?;
+            if payload.len() != extension.length {
+                bail!(
+                    "TLS扩展0x{:04x}声明长度{}，实际payload长度{}",
+                    extension.id,
+                    extension.length,
+                    payload.len()
+                )
+            }
+            if !is_grease_value(extension.id) {
+                wire_ids.push(extension.id);
+            }
+        }
+        if wire_ids != tls.extensions {
+            bail!("extension_wire与extensions的非GREASE顺序不一致")
+        }
+    }
+    requested_trust_anchors(tls)?;
+
+    let http = &record.http;
+    if !matches!(http.protocol.as_str(), "HTTP/1.1" | "HTTP/2") {
+        bail!(
+            "捕获协议{}尚不能作为浏览器传输指纹回放；HTTP/3当前仅提供通用QUIC传输",
+            http.protocol
+        )
+    }
+    if !http.header_order.is_empty() {
+        let actual = http
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let declared = http
+            .header_order
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if actual != declared {
+            bail!("http.header_order与http.headers中的实际顺序不一致")
+        }
+    }
+    let mut setting_ids = HashSet::new();
+    for setting in &http.settings {
+        if !setting_ids.insert(setting.id) {
+            bail!("HTTP/2 SETTINGS包含重复ID {}", setting.id)
+        }
+        if !(1..=6).contains(&setting.id) {
+            bail!("HTTP/2 SETTINGS ID {}尚不能等价回放", setting.id)
+        }
+    }
+    for name in &http.pseudo_header_order {
+        if !matches!(
+            name.as_str(),
+            ":method" | ":path" | ":authority" | ":scheme"
+        ) {
+            bail!("未知HTTP/2伪Header: {name}")
+        }
+    }
+    for priority in &http.priorities {
+        if !matches!(priority.source.as_str(), "HEADERS" | "PRIORITY")
+            || priority.exclusive > 1
+            || !(1..=256).contains(&priority.weight)
+        {
+            bail!("HTTP/2 priority字段无法等价回放: {priority:?}")
+        }
+    }
+    build_emulation(record).map(|_| ())
+}
+
+fn requested_trust_anchors(capture: &TlsCapture) -> Result<Option<Vec<u8>>> {
+    let mut matches = capture
+        .extension_wire
+        .iter()
+        .filter(|extension| extension.id == 0xca34);
+    let wire = matches.next();
+    if matches.next().is_some() {
+        bail!("TLS扩展0xca34重复")
+    }
+    if !capture.extensions.contains(&0xca34) {
+        if wire.is_some() {
+            bail!("extension_wire包含0xca34但extensions未声明")
+        }
+        return Ok(None);
+    }
+    let wire = wire.context("TLS扩展0xca34缺少extension_wire payload，不能等价回放")?;
+    let payload = BASE64
+        .decode(&wire.payload_base64)
+        .context("TLS扩展0xca34的payload_base64无效")?;
+    if payload.len() < 2 {
+        bail!("TLS扩展0xca34 payload缺少外层列表长度")
+    }
+    let declared = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let ids = &payload[2..];
+    if declared != ids.len() {
+        bail!("TLS扩展0xca34列表声明长度{declared}，实际长度{}", ids.len())
+    }
+    let mut offset = 0;
+    while offset < ids.len() {
+        let length = ids[offset] as usize;
+        offset += 1;
+        if length == 0 || offset + length > ids.len() {
+            bail!("TLS扩展0xca34包含空或截断的Trust Anchor ID")
+        }
+        offset += length;
+    }
+    Ok(Some(ids.to_vec()))
 }
 
 #[derive(Debug)]
@@ -598,6 +854,9 @@ fn key_share(id: u16) -> Option<KeyShare> {
 }
 
 fn signature_name(id: u16) -> Option<&'static str> {
+    if is_grease_value(id) {
+        return Some("grease");
+    }
     Some(match id {
         0x0401 => "rsa_pkcs1_sha256",
         0x0201 => "rsa_pkcs1_sha1",
@@ -644,6 +903,7 @@ fn extension_type(id: u16) -> Option<ExtensionType> {
         17613 => ExtensionType::APPLICATION_SETTINGS,
         0xff01 => ExtensionType::RENEGOTIATE,
         0xfe0d => ExtensionType::ENCRYPTED_CLIENT_HELLO,
+        0xca34 => ExtensionType::TRUST_ANCHORS,
         _ => return None,
     })
 }
@@ -691,6 +951,10 @@ fn build_tls(capture: &TlsCapture, permute_extensions: bool) -> Result<TlsOption
         .preserve_tls13_cipher_list(true)
         .aes_hw_override(true)
         .record_size_limit(capture.record_size_limit);
+
+    if let Some(ids) = requested_trust_anchors(capture)? {
+        builder = builder.requested_trust_anchors(ids);
+    }
 
     let shares: Vec<_> = capture
         .key_share_groups
@@ -848,35 +1112,47 @@ fn build_http2(capture: &HttpCapture) -> Http2Options {
 }
 
 fn build_headers(capture: &HttpCapture) -> Result<(HeaderMap, OrigHeaderMap)> {
-    // 请求类型、来源和优先级相关字段不能固定到所有请求；主页导航和XHR应由业务层分别传入。
-    let ignored = [
-        "host",
-        "content-length",
-        "connection",
-        "cookie",
-        "authorization",
-        "proxy-authorization",
-        "accept",
-        "origin",
-        "referer",
-        "upgrade-insecure-requests",
-        "sec-fetch-site",
-        "sec-fetch-mode",
-        "sec-fetch-user",
-        "sec-fetch-dest",
-        "priority",
+    // 只固化与浏览器/平台稳定绑定的传输Header。业务、认证和导航上下文必须由调用方传入。
+    let stable = [
+        "user-agent",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+        "sec-ch-ua-wow64",
+        "accept-encoding",
+        "accept-language",
+        "dnt",
+        "sec-gpc",
+        "te",
     ];
     let mut headers = HeaderMap::new();
     let mut original = OrigHeaderMap::new();
+    let order = if capture.header_order.is_empty() {
+        capture
+            .headers
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    } else {
+        capture.header_order.iter().collect::<Vec<_>>()
+    };
+    for name in order {
+        original.insert(name.clone());
+    }
     for (name, value) in &capture.headers {
-        if ignored.contains(&name.to_ascii_lowercase().as_str()) {
+        if !stable.contains(&name.to_ascii_lowercase().as_str()) {
             continue;
         }
         headers.append(
             HeaderName::from_bytes(name.as_bytes())?,
             HeaderValue::from_str(value)?,
         );
-        original.insert(name.clone());
     }
     Ok((headers, original))
 }
@@ -921,6 +1197,12 @@ struct CachedOriginState {
     committed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct Http3Capability {
+    available: bool,
+    expires_at: Instant,
+}
+
 struct SessionState {
     profile: String,
     variants: Vec<Variant>,
@@ -947,6 +1229,8 @@ struct SessionState {
     dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
     // HTTP/3使用独立QUIC连接池；键包含DNS与读取超时，避免配置串用。
     http3_clients: Mutex<LruCache<String, Arc<OnceCell<reqwest::Client>>>>,
+    // QUIC能力按origin和请求级DNS路由缓存；短期负缓存避免每次都等待UDP超时。
+    http3_capabilities: Mutex<LruCache<String, Http3Capability>>,
     cookie_jar: Arc<Jar>,
     cookie_store: bool,
     closed: AtomicBool,
@@ -1793,7 +2077,7 @@ fn parse_request_http_version(version: &str) -> PyResult<RequestHttpVersion> {
         "http2" | "h2" | "http/2" => Ok(RequestHttpVersion::Http2),
         "http3" | "h3" | "http/3" | "v3" | "v3only" => Ok(RequestHttpVersion::Http3),
         _ => Err(PyRuntimeError::new_err(
-            "http_version必须是auto、http1、http2或http3",
+            "http_version必须是auto、http1.1、http2或http3",
         )),
     }
 }
@@ -1805,8 +2089,8 @@ fn apply_wreq_request_version(
     match version {
         RequestHttpVersion::Auto => request,
         RequestHttpVersion::Http1 => request.version(Version::HTTP_11),
-        RequestHttpVersion::Http2 => request.version(Version::HTTP_2),
-        RequestHttpVersion::Http3 => unreachable!("HTTP/3请求必须走QUIC后端"),
+        // wreq默认ALPN顺序优先h2，同时允许服务端只支持HTTP/1.1时平滑降级。
+        RequestHttpVersion::Http2 | RequestHttpVersion::Http3 => request,
     }
 }
 
@@ -2060,6 +2344,11 @@ async fn send_http3_request(
     }
 }
 
+struct Http3AttemptError {
+    error: PyErr,
+    response_received: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_http3_request(
     _permit: OwnedSemaphorePermit,
@@ -2075,7 +2364,7 @@ async fn execute_http3_request(
     fingerprint_id: String,
     profile: String,
     max_response_bytes: usize,
-) -> PyResult<RawNativeResponse> {
+) -> std::result::Result<RawNativeResponse, Http3AttemptError> {
     let (response, history, final_url) = send_http3_request(
         &state,
         &client,
@@ -2087,10 +2376,19 @@ async fn execute_http3_request(
         allow_redirects,
         max_redirects,
     )
-    .await?;
+    .await
+    .map_err(|error| Http3AttemptError {
+        error,
+        response_received: false,
+    })?;
     let status = response.status().as_u16();
     let response_headers = native_headers_from_map(response.headers());
-    let content = collect_response_body(response.bytes_stream(), max_response_bytes).await?;
+    let content = collect_response_body(response.bytes_stream(), max_response_bytes)
+        .await
+        .map_err(|error| Http3AttemptError {
+            error,
+            response_received: true,
+        })?;
     Ok((
         status,
         response_headers,
@@ -2099,6 +2397,7 @@ async fn execute_http3_request(
         profile,
         final_url,
         "HTTP/3".to_string(),
+        "headers-only".to_string(),
         history,
         None,
     ))
@@ -2145,6 +2444,7 @@ async fn execute_http3_stream_request(
         fingerprint_id,
         impersonate: profile,
         http_version: "HTTP/3".to_string(),
+        fingerprint_scope: "headers-only".to_string(),
         history,
         state: Arc::new(AsyncMutex::new(StreamState {
             stream: Some(stream),
@@ -2231,6 +2531,7 @@ async fn execute_request(
         profile,
         final_url,
         http_version,
+        "tls-http".to_string(),
         history,
         transfer_counters,
     ))
@@ -2319,6 +2620,7 @@ async fn execute_stream_request(
         fingerprint_id,
         impersonate: profile,
         http_version,
+        fingerprint_scope: "tls-http".to_string(),
         history,
         state: Arc::new(AsyncMutex::new(StreamState {
             stream: Some(stream),
@@ -2331,6 +2633,380 @@ async fn execute_stream_request(
         read_active: Arc::new(AtomicBool::new(false)),
         permit: Arc::new(Mutex::new(Some(permit))),
     })
+}
+
+const HTTP3_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+const HTTP3_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(600);
+const HTTP3_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+fn is_safe_http_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
+}
+
+fn remaining_protocol_timeout(started: Instant, timeout: Duration) -> PyResult<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| PyRuntimeError::new_err("请求在协议降级前已超过timeout"))
+}
+
+fn http3_capability_key(
+    url: &str,
+    dns_override: bool,
+    dns_servers: &[String],
+    dns_timeout: Option<f64>,
+) -> PyResult<String> {
+    let parsed = Url::parse(url).map_err(to_py_error)?;
+    let route = if dns_override {
+        format!("{}|{dns_timeout:?}", dns_servers.join(","))
+    } else {
+        "session".to_string()
+    };
+    Ok(format!("{}|{route}", parsed.origin().ascii_serialization()))
+}
+
+fn cached_http3_capability(state: &SessionState, key: &str) -> PyResult<Option<bool>> {
+    let mut capabilities = state
+        .http3_capabilities
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("HTTP/3能力缓存锁已损坏"))?;
+    let cached = capabilities.get(key).copied();
+    if let Some(capability) = cached {
+        if capability.expires_at > Instant::now() {
+            return Ok(Some(capability.available));
+        }
+        capabilities.pop(key);
+    }
+    Ok(None)
+}
+
+fn store_http3_capability(state: &SessionState, key: String, available: bool) -> PyResult<()> {
+    let ttl = if available {
+        HTTP3_POSITIVE_CACHE_TTL
+    } else {
+        HTTP3_NEGATIVE_CACHE_TTL
+    };
+    state
+        .http3_capabilities
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("HTTP/3能力缓存锁已损坏"))?
+        .put(
+            key,
+            Http3Capability {
+                available,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    Ok(())
+}
+
+async fn probe_http3(
+    state: &SessionState,
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    capability_key: &str,
+) -> PyResult<bool> {
+    if let Some(available) = cached_http3_capability(state, capability_key)? {
+        return Ok(available);
+    }
+    let parsed = Url::parse(url).map_err(to_py_error)?;
+    if parsed.scheme() != "https" {
+        store_http3_capability(state, capability_key.to_string(), false)?;
+        return Ok(false);
+    }
+    let probe_url = format!("{}/", parsed.origin().ascii_serialization());
+    let available = client
+        .request(Method::HEAD, probe_url)
+        .version(Version::HTTP_3)
+        .timeout(timeout.min(HTTP3_PROBE_TIMEOUT))
+        .send()
+        .await
+        .map(|response| response.version() == Version::HTTP_3)
+        .unwrap_or(false);
+    store_http3_capability(state, capability_key.to_string(), available)?;
+    Ok(available)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_preferred_request(
+    permit: OwnedSemaphorePermit,
+    state: Arc<SessionState>,
+    index: usize,
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    read_timeout: Option<Duration>,
+    proxy_url: Option<String>,
+    proxy: Option<Proxy>,
+    allow_redirects: bool,
+    max_redirects: usize,
+    request_version: RequestHttpVersion,
+    fingerprint_id: String,
+    profile: String,
+    transfer_stats: bool,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    cache_route: bool,
+    proxy_generation: u64,
+) -> PyResult<RawNativeResponse> {
+    let protocol_started = Instant::now();
+    let mut permit = Some(permit);
+    let direct_http3 = request_version == RequestHttpVersion::Http3
+        && proxy_url.is_none()
+        && !transfer_stats
+        && url.starts_with("https://");
+    if direct_http3 {
+        let capability_key = http3_capability_key(&url, dns_override, &dns_servers, dns_timeout)?;
+        let cached_capability = cached_http3_capability(&state, &capability_key)?;
+        if cached_capability != Some(false) {
+            match selected_http3_client_async(
+                state.clone(),
+                dns_override,
+                dns_servers.clone(),
+                dns_timeout,
+                read_timeout,
+                cache_route,
+            )
+            .await
+            {
+                Ok(client) => {
+                    let safe_method = is_safe_http_method(&method);
+                    let can_use_http3 = if safe_method {
+                        true
+                    } else {
+                        probe_http3(
+                            &state,
+                            &client,
+                            &url,
+                            remaining_protocol_timeout(protocol_started, timeout)?,
+                            &capability_key,
+                        )
+                        .await?
+                    };
+                    if can_use_http3 {
+                        let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
+                        let attempt_timeout = if safe_method && cached_capability.is_none() {
+                            remaining.min(HTTP3_PROBE_TIMEOUT)
+                        } else {
+                            remaining
+                        };
+                        let result = execute_http3_request(
+                            permit.take().expect("request permit must be present"),
+                            state.clone(),
+                            client,
+                            method.clone(),
+                            url.clone(),
+                            headers.clone(),
+                            body.clone(),
+                            attempt_timeout,
+                            allow_redirects,
+                            max_redirects,
+                            fingerprint_id.clone(),
+                            profile.clone(),
+                            state.max_response_bytes,
+                        )
+                        .await;
+                        match result {
+                            Ok(response) => {
+                                store_http3_capability(&state, capability_key, true)?;
+                                return Ok(response);
+                            }
+                            Err(error) if error.response_received => {
+                                store_http3_capability(&state, capability_key, true)?;
+                                return Err(error.error);
+                            }
+                            Err(error) if !safe_method => {
+                                store_http3_capability(&state, capability_key, false)?;
+                                return Err(error.error);
+                            }
+                            Err(_) => {
+                                store_http3_capability(&state, capability_key, false)?;
+                                permit = Some(acquire_connection_slot(&state).await?);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    store_http3_capability(&state, capability_key, false)?;
+                }
+            }
+        }
+    }
+    let client = selected_request_client_async(
+        state.clone(),
+        index,
+        dns_override,
+        dns_servers,
+        dns_timeout,
+        cache_route,
+        proxy_generation,
+    )
+    .await?;
+    execute_request(
+        permit.expect("request permit must be present"),
+        client,
+        method,
+        url,
+        headers,
+        body,
+        if direct_http3 {
+            remaining_protocol_timeout(protocol_started, timeout)?
+        } else {
+            timeout
+        },
+        read_timeout,
+        proxy,
+        allow_redirects,
+        max_redirects,
+        request_version,
+        fingerprint_id,
+        profile,
+        transfer_stats,
+        proxy_url,
+        state.max_response_bytes,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_preferred_stream_request(
+    permit: OwnedSemaphorePermit,
+    state: Arc<SessionState>,
+    index: usize,
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    read_timeout: Option<Duration>,
+    proxy_url: Option<String>,
+    proxy: Option<Proxy>,
+    allow_redirects: bool,
+    max_redirects: usize,
+    request_version: RequestHttpVersion,
+    fingerprint_id: String,
+    profile: String,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    cache_route: bool,
+    proxy_generation: u64,
+) -> PyResult<NativeStreamResponse> {
+    let protocol_started = Instant::now();
+    let mut permit = Some(permit);
+    let direct_http3 = request_version == RequestHttpVersion::Http3
+        && proxy_url.is_none()
+        && url.starts_with("https://");
+    if direct_http3 {
+        let capability_key = http3_capability_key(&url, dns_override, &dns_servers, dns_timeout)?;
+        let cached_capability = cached_http3_capability(&state, &capability_key)?;
+        if cached_capability != Some(false) {
+            match selected_http3_client_async(
+                state.clone(),
+                dns_override,
+                dns_servers.clone(),
+                dns_timeout,
+                read_timeout,
+                cache_route,
+            )
+            .await
+            {
+                Ok(client) => {
+                    let safe_method = is_safe_http_method(&method);
+                    let can_use_http3 = if safe_method {
+                        true
+                    } else {
+                        probe_http3(
+                            &state,
+                            &client,
+                            &url,
+                            remaining_protocol_timeout(protocol_started, timeout)?,
+                            &capability_key,
+                        )
+                        .await?
+                    };
+                    if can_use_http3 {
+                        let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
+                        let attempt_timeout = if safe_method && cached_capability.is_none() {
+                            remaining.min(HTTP3_PROBE_TIMEOUT)
+                        } else {
+                            remaining
+                        };
+                        let result = execute_http3_stream_request(
+                            permit.take().expect("request permit must be present"),
+                            state.clone(),
+                            client,
+                            method.clone(),
+                            url.clone(),
+                            headers.clone(),
+                            body.clone(),
+                            attempt_timeout,
+                            allow_redirects,
+                            max_redirects,
+                            fingerprint_id.clone(),
+                            profile.clone(),
+                        )
+                        .await;
+                        match result {
+                            Ok(response) => {
+                                store_http3_capability(&state, capability_key, true)?;
+                                return Ok(response);
+                            }
+                            Err(error) if !safe_method => {
+                                store_http3_capability(&state, capability_key, false)?;
+                                return Err(error);
+                            }
+                            Err(_) => {
+                                store_http3_capability(&state, capability_key, false)?;
+                                permit = Some(acquire_connection_slot(&state).await?);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    store_http3_capability(&state, capability_key, false)?;
+                }
+            }
+        }
+    }
+    let client = selected_request_client_async(
+        state.clone(),
+        index,
+        dns_override,
+        dns_servers,
+        dns_timeout,
+        cache_route,
+        proxy_generation,
+    )
+    .await?;
+    execute_stream_request(
+        permit.expect("request permit must be present"),
+        client,
+        method,
+        url,
+        headers,
+        body,
+        if direct_http3 {
+            remaining_protocol_timeout(protocol_started, timeout)?
+        } else {
+            timeout
+        },
+        read_timeout,
+        proxy,
+        allow_redirects,
+        max_redirects,
+        request_version,
+        fingerprint_id,
+        profile,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2400,6 +3076,7 @@ async fn execute_multipart_request(
         profile,
         final_url,
         http_version,
+        "tls-http".to_string(),
         history,
         None,
     ))
@@ -2417,6 +3094,7 @@ fn into_native_response(
         profile,
         url,
         http_version,
+        fingerprint_scope,
         history,
         transfer_counters,
     ) = response;
@@ -2431,6 +3109,7 @@ fn into_native_response(
             fingerprint_id,
             impersonate: profile,
             http_version,
+            fingerprint_scope,
             history,
             transfer_stats: transfer_counters
                 .map(|counters| Py::new(py, NativeTransferStats { counters }))
@@ -2978,6 +3657,8 @@ struct NativeStreamResponse {
     #[pyo3(get)]
     http_version: String,
     #[pyo3(get)]
+    fingerprint_scope: String,
+    #[pyo3(get)]
     history: Vec<NativeHistoryEntry>,
     state: Arc<AsyncMutex<StreamState>>,
     closed: Arc<AtomicBool>,
@@ -3126,7 +3807,7 @@ fn parse_dns_overrides(
 impl NativeSession {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (impersonate, fingerprint_rotation=true, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3), resolve=Vec::new(), dns_servers=Vec::new(), dns_timeout=Some(5.0), fingerprint_pool=true, fingerprint_pool_size=100, max_cached_origins=4, max_response_bytes=67108864, max_websocket_message_bytes=16777216, cookie_store=true))]
+    #[pyo3(signature = (impersonate, fingerprint_rotation=true, proxy=None, verify=true, connect_timeout=None, fingerprints_path=None, default_headers=Vec::new(), max_connections=50, happy_eyeballs_timeout=Some(0.3), resolve=Vec::new(), dns_servers=Vec::new(), dns_timeout=Some(5.0), fingerprint_pool=true, fingerprint_pool_size=100, max_cached_origins=4, max_response_bytes=67108864, max_websocket_message_bytes=16777216, cookie_store=true, fingerprints_json=None))]
     fn new(
         py: Python<'_>,
         impersonate: String,
@@ -3147,6 +3828,7 @@ impl NativeSession {
         max_response_bytes: usize,
         max_websocket_message_bytes: usize,
         cookie_store: bool,
+        fingerprints_json: Option<String>,
     ) -> PyResult<Self> {
         if max_connections == 0 {
             return Err(PyRuntimeError::new_err("max_connections必须大于0"));
@@ -3171,9 +3853,10 @@ impl NativeSession {
         let happy_eyeballs_timeout =
             parse_optional_timeout("happy_eyeballs_timeout", happy_eyeballs_timeout)?;
         let impersonate_path = std::path::Path::new(&impersonate).is_file();
-        if impersonate_path && fingerprints_path.is_some() {
+        let inline_fingerprints = fingerprints_json.is_some();
+        if (impersonate_path || inline_fingerprints) && fingerprints_path.is_some() {
             return Err(PyRuntimeError::new_err(
-                "impersonate使用指纹文件路径时不能同时传fingerprints_path",
+                "impersonate使用指纹文件路径或捕获结果对象时不能同时传fingerprints_path",
             ));
         }
         let fingerprints_path = if impersonate_path {
@@ -3191,8 +3874,14 @@ impl NativeSession {
         // 指纹来源：传入路径时由本实例独立读取解析（提前单实例加载），
         // 指纹随SessionState的variants持有，不进入进程级全局缓存，多个实例可各读各的文件；
         // 不传路径时回退到编译进wheel的内置指纹（进程级全局缓存只服务内置数据）。
-        let (records, source_name) = match fingerprints_path {
-            Some(path) => {
+        let (records, source_name) = match (fingerprints_json, fingerprints_path) {
+            (Some(content), None) => {
+                let records = py
+                    .detach(move || parse_records(&content).context("内存捕获结果解析失败"))
+                    .map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))?;
+                (records, "捕获结果对象")
+            }
+            (None, Some(path)) => {
                 // 构造期文件I/O和JSON反序列化不占用GIL，避免并发创建实例彼此串行。
                 let records = py
                     .detach(move || {
@@ -3200,19 +3889,20 @@ impl NativeSession {
                             .with_context(|| format!("无法读取指纹文件 {path}"))?;
                         parse_records(&content).with_context(|| format!("指纹文件解析失败 {path}"))
                     })
-                    .map_err(to_py_error)?;
+                    .map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))?;
                 (records, "指纹文件")
             }
-            None => (embedded_records()?.clone(), "内置指纹"),
+            (None, None) => (embedded_records()?.clone(), "内置指纹"),
+            (Some(_), Some(_)) => unreachable!("上方已拒绝重复指纹来源"),
         };
-        let normalized = if impersonate_path {
+        let normalized = if impersonate_path || inline_fingerprints {
             let profiles: BTreeSet<_> = records
                 .iter()
                 .map(|record| normalize_profile(&record.profile))
                 .collect();
             if profiles.len() != 1 {
                 return Err(PyRuntimeError::new_err(format!(
-                    "impersonate指纹文件必须只包含一个profile，当前包含: {}",
+                    "impersonate指纹文件或捕获结果对象必须只包含一个profile，当前包含: {}",
                     profiles.into_iter().collect::<Vec<_>>().join(", ")
                 )));
             }
@@ -3280,6 +3970,7 @@ impl NativeSession {
             dns_resolver,
             dns_overrides: Arc::new(dns_overrides),
             http3_clients: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
+            http3_capabilities: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             cookie_jar: Arc::new(Jar::default()),
             cookie_store,
             selected_variant: AtomicUsize::new(selected_variant),
@@ -3289,6 +3980,11 @@ impl NativeSession {
             max_websocket_message_bytes,
         });
         Ok(Self { state })
+    }
+
+    #[getter]
+    fn impersonate(&self) -> String {
+        self.state.profile.clone()
     }
 
     #[getter]
@@ -3327,7 +4023,7 @@ impl NativeSession {
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request(
         &self,
         py: Python<'_>,
@@ -3359,16 +4055,6 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
-        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
-            ));
-        }
-        if request_version == RequestHttpVersion::Http3 && transfer_stats {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持transfer_stats TCP隧道计量",
-            ));
-        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let result = py.detach(move || {
@@ -3377,64 +4063,30 @@ impl NativeSession {
             let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
-            let result = if request_version == RequestHttpVersion::Http3 {
-                runtime.block_on(async {
-                    let client = selected_http3_client_async(
-                        state.clone(),
-                        dns_override,
-                        dns_servers,
-                        dns_timeout,
-                        read_timeout,
-                        cache_route,
-                    )
-                    .await?;
-                    execute_http3_request(
-                        permit,
-                        state.clone(),
-                        client,
-                        method,
-                        url,
-                        headers,
-                        body,
-                        timeout,
-                        allow_redirects,
-                        max_redirects,
-                        fingerprint_id,
-                        profile,
-                        state.max_response_bytes,
-                    )
-                    .await
-                })
-            } else {
-                let client = selected_request_client(
-                    &state,
-                    index,
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    cache_route,
-                    proxy_generation,
-                )?;
-                runtime.block_on(execute_request(
-                    permit,
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    read_timeout,
-                    proxy,
-                    allow_redirects,
-                    max_redirects,
-                    request_version,
-                    fingerprint_id,
-                    profile,
-                    transfer_stats,
-                    proxy_url,
-                    state.max_response_bytes,
-                ))
-            };
+            let result = runtime.block_on(execute_preferred_request(
+                permit,
+                state.clone(),
+                index,
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+                read_timeout,
+                proxy_url,
+                proxy,
+                allow_redirects,
+                max_redirects,
+                request_version,
+                fingerprint_id,
+                profile,
+                transfer_stats,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+                proxy_generation,
+            ));
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3444,7 +4096,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -3475,16 +4127,6 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
-        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
-            ));
-        }
-        if request_version == RequestHttpVersion::Http3 && transfer_stats {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持transfer_stats TCP隧道计量",
-            ));
-        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
@@ -3493,64 +4135,31 @@ impl NativeSession {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
-            let response = if request_version == RequestHttpVersion::Http3 {
-                let client = selected_http3_client_async(
-                    state.clone(),
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    read_timeout,
-                    cache_route,
-                )
-                .await?;
-                execute_http3_request(
-                    permit,
-                    state.clone(),
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    allow_redirects,
-                    max_redirects,
-                    fingerprint_id,
-                    profile,
-                    state.max_response_bytes,
-                )
-                .await?
-            } else {
-                let client = selected_request_client_async(
-                    state.clone(),
-                    index,
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    cache_route,
-                    proxy_generation,
-                )
-                .await?;
-                execute_request(
-                    permit,
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    read_timeout,
-                    proxy,
-                    allow_redirects,
-                    max_redirects,
-                    request_version,
-                    fingerprint_id,
-                    profile,
-                    transfer_stats,
-                    proxy_url,
-                    state.max_response_bytes,
-                )
-                .await?
-            };
+            let response = execute_preferred_request(
+                permit,
+                state.clone(),
+                index,
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+                read_timeout,
+                proxy_url,
+                proxy,
+                allow_redirects,
+                max_redirects,
+                request_version,
+                fingerprint_id,
+                profile,
+                transfer_stats,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+                proxy_generation,
+            )
+            .await?;
             reservation.commit();
             Python::attach(|py| into_native_response(py, response))
         })
@@ -3680,7 +4289,7 @@ impl NativeSession {
 
     // 流式入口与普通入口使用相同选项，确保两种响应模式语义一致。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream(
         &self,
         py: Python<'_>,
@@ -3711,11 +4320,6 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
-        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
-            ));
-        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         py.detach(move || {
@@ -3724,60 +4328,29 @@ impl NativeSession {
             let permit = runtime.block_on(acquire_connection_slot(&state))?;
             let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
-            let result = if request_version == RequestHttpVersion::Http3 {
-                runtime.block_on(async {
-                    let client = selected_http3_client_async(
-                        state.clone(),
-                        dns_override,
-                        dns_servers,
-                        dns_timeout,
-                        read_timeout,
-                        cache_route,
-                    )
-                    .await?;
-                    execute_http3_stream_request(
-                        permit,
-                        state.clone(),
-                        client,
-                        method,
-                        url,
-                        headers,
-                        body,
-                        timeout,
-                        allow_redirects,
-                        max_redirects,
-                        fingerprint_id,
-                        profile,
-                    )
-                    .await
-                })
-            } else {
-                let client = selected_request_client(
-                    &state,
-                    index,
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    cache_route,
-                    proxy_generation,
-                )?;
-                runtime.block_on(execute_stream_request(
-                    permit,
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    read_timeout,
-                    proxy,
-                    allow_redirects,
-                    max_redirects,
-                    request_version,
-                    fingerprint_id,
-                    profile,
-                ))
-            };
+            let result = runtime.block_on(execute_preferred_stream_request(
+                permit,
+                state.clone(),
+                index,
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+                read_timeout,
+                proxy_url,
+                proxy,
+                allow_redirects,
+                max_redirects,
+                request_version,
+                fingerprint_id,
+                profile,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+                proxy_generation,
+            ));
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3786,7 +4359,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream_async<'py>(
         &self,
         py: Python<'py>,
@@ -3815,11 +4388,6 @@ impl NativeSession {
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&self.state, proxy_override, proxy)?;
-        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
-            ));
-        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let state = self.state.clone();
@@ -3829,60 +4397,30 @@ impl NativeSession {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
-            let result = if request_version == RequestHttpVersion::Http3 {
-                let client = selected_http3_client_async(
-                    state.clone(),
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    read_timeout,
-                    cache_route,
-                )
-                .await?;
-                execute_http3_stream_request(
-                    permit,
-                    state.clone(),
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    allow_redirects,
-                    max_redirects,
-                    fingerprint_id,
-                    profile,
-                )
-                .await
-            } else {
-                let client = selected_request_client_async(
-                    state.clone(),
-                    index,
-                    dns_override,
-                    dns_servers,
-                    dns_timeout,
-                    cache_route,
-                    proxy_generation,
-                )
-                .await?;
-                execute_stream_request(
-                    permit,
-                    client,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    timeout,
-                    read_timeout,
-                    proxy,
-                    allow_redirects,
-                    max_redirects,
-                    request_version,
-                    fingerprint_id,
-                    profile,
-                )
-                .await
-            };
+            let result = execute_preferred_stream_request(
+                permit,
+                state.clone(),
+                index,
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+                read_timeout,
+                proxy_url,
+                proxy,
+                allow_redirects,
+                max_redirects,
+                request_version,
+                fingerprint_id,
+                profile,
+                dns_override,
+                dns_servers,
+                dns_timeout,
+                cache_route,
+                proxy_generation,
+            )
+            .await;
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3892,7 +4430,7 @@ impl NativeSession {
 
     // multipart文件由Tokio直接流式读取，Python只传路径和元数据。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart(
         &self,
         py: Python<'_>,
@@ -3917,11 +4455,6 @@ impl NativeSession {
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
         let request_version = parse_request_http_version(&http_version)?;
-        if request_version == RequestHttpVersion::Http3 {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持multipart文件上传",
-            ));
-        }
         let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
@@ -3974,7 +4507,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart_async<'py>(
         &self,
         py: Python<'py>,
@@ -3999,11 +4532,6 @@ impl NativeSession {
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
         let request_version = parse_request_http_version(&http_version)?;
-        if request_version == RequestHttpVersion::Http3 {
-            return Err(PyRuntimeError::new_err(
-                "HTTP/3模式暂不支持multipart文件上传",
-            ));
-        }
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
@@ -4081,6 +4609,7 @@ impl NativeSession {
         // 默认代理切换后不能复用旧 client 的连接池，否则存量代理隧道可能继续承载后续请求。
         // 清空只影响下一次按默认代理发包的懒初始化；正在执行的请求仍持有自己的 Client 快照。
         for variant in &self.state.variants {
+            variant.session_cache.clear();
             variant.client.store(None);
             variant
                 .dns_clients
@@ -4092,6 +4621,11 @@ impl NativeSession {
             .http3_clients
             .lock()
             .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .clear();
+        self.state
+            .http3_capabilities
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("HTTP/3能力缓存锁已损坏"))?
             .clear();
         self.state
             .fingerprint_pool_members
@@ -4201,6 +4735,7 @@ impl NativeSession {
         }
         self.state.connection_slots.close();
         for variant in &self.state.variants {
+            variant.session_cache.clear();
             variant.client.store(None);
             variant
                 .dns_clients
@@ -4212,6 +4747,11 @@ impl NativeSession {
             .http3_clients
             .lock()
             .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .clear();
+        self.state
+            .http3_capabilities
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("HTTP/3能力缓存锁已损坏"))?
             .clear();
         self.state
             .fingerprint_pool_members

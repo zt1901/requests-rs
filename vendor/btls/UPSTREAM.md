@@ -18,7 +18,7 @@
 
 加密实现原本已经存在，本地只按BoringSSL新上游实现注册TLS codepoint、算法能力和配置名称。Chrome 150回归已验证JA4、Signature Algorithms、ClientHello长度模式和扩展线级摘要，最终为41/41。
 
-Edge 152补充：`edge152`只保留一条本机Edge 152.0.4191.53火种记录。同一wreq Client复用匹配路由的连接；连接池自然新建TLS时扩展顺序重新随机，JA3可变而JA3N、JA4和火种ID稳定。该能力不需要新增BoringSSL补丁。
+Edge 152补充：`edge152`只保留一条本机Edge 152.0.4191.53火种记录。同一wreq Client复用匹配路由的连接；连接池自然新建TLS时扩展顺序重新随机。Edge 152还会在`signature_algorithms`首位发送GREASE：本地BoringSSL接受`grease`占位符并在每次握手替换为随机`0x?a?a`值，线级检测器在计算JA4前过滤该值。因此原始JA3可变，而JA3N、规范JA4和火种ID稳定。
 
 Firefox 151补充：
 

@@ -498,6 +498,62 @@ def main():
                 ),
                 encoding="utf-8",
             )
+            chrome记录 = [记录 for 记录 in 全部记录 if 记录["profile"] == 测试版本]
+            mcp捕获结果 = {
+                "schema_version": 1,
+                "path": str(chrome文件),
+                "count": len(chrome记录),
+                "offset": 0,
+                "limit": 20,
+                "next_offset": None,
+                "records": chrome记录,
+            }
+
+            # 捕获器MCP返回的dict envelope和裸记录list无需落盘即可构造Session。
+            with Session(impersonate=mcp捕获结果) as 对象指纹会话:
+                assert 对象指纹会话.impersonate == 测试版本
+                捕获头列表 = mcp捕获结果["records"][0]["http"]["headers"]
+                assert all(isinstance(item, list) for item in 捕获头列表)
+                assert (
+                    对象指纹会话.get(
+                        target_url + "/headers",
+                        headers=捕获头列表,
+                    ).impersonate
+                    == 测试版本
+                )
+            with Session(impersonate=chrome记录) as 列表指纹会话:
+                assert 列表指纹会话.impersonate == 测试版本
+            assert (
+                get(
+                    target_url + "/headers",
+                    impersonate=mcp捕获结果,
+                ).impersonate
+                == 测试版本
+            )
+
+            async def 验证异步对象指纹() -> None:
+                async with AsyncSession(impersonate=mcp捕获结果) as 对象指纹会话:
+                    响应 = await 对象指纹会话.get(target_url + "/headers")
+                    assert 响应.impersonate == 测试版本
+
+            asyncio.run(验证异步对象指纹())
+
+            try:
+                Session(impersonate=mcp捕获结果, fingerprints_path=chrome文件)
+            except TypeError as error:
+                assert "不能同时传fingerprints_path" in str(error)
+            else:
+                raise AssertionError("捕获结果对象与fingerprints_path冲突没有被拒绝")
+
+            try:
+                Session(
+                    impersonate=chrome记录
+                    + [记录 for 记录 in 全部记录 if 记录["profile"] == "firefox151"]
+                )
+            except RuntimeError as error:
+                assert "必须只包含一个profile" in str(error)
+            else:
+                raise AssertionError("多profile捕获结果对象没有被拒绝")
 
             # 同一进程两个实例各读各的指纹文件，互不干扰
             with Session(

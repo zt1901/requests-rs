@@ -4,7 +4,7 @@
 
 本项目采用两层模型，边界固定如下：
 
-1. 内置 `fingerprints.json`、`fingerprints_path` 或直接作为 `impersonate` 传入的单 profile 指纹文件，只提供浏览器传输画像和跨请求稳定声明。
+1. 内置 `fingerprints.json`、`fingerprints_path`，或直接作为 `impersonate` 传入的单profile指纹文件/记录Sequence/MCP Mapping，只提供浏览器传输画像和跨请求稳定声明。
 2. 用户在浏览器中人工完成真实操作后，通过 DevTools **Copy as cURL** 得到的请求，转换为 `requests_rust` 调用时，请求模板字段允许按网站和该动作原样固定。
 3. 库不猜测、不自动补齐、不覆盖业务请求模板中的上下文、认证和业务字段。
 4. 不能固定的 TLS/HTTP 连接运行态始终由 Rust、wreq、BTLS/BoringSSL 与当前 URL 生成。
@@ -15,7 +15,7 @@
 
 | 数据 | 来源 | 是否由指纹库自动配置 | 规则 |
 |---|---|---:|---|
-| TLS cipher suites、扩展顺序、Supported Groups、Signature Algorithms、KeyShare groups | 浏览器采集 JSON | 是 | 固定为 profile 的传输画像；实际随机字节不写入 JSON。 |
+| TLS cipher suites、扩展、Supported Groups、Signature Algorithms、KeyShare groups | 浏览器采集 JSON | 是 | 稳定算法固化为profile；GREASE只保存存在性，运行时生成新值；Chromium允许新连接重排扩展。 |
 | ALPN、ALPS、HTTP/2 SETTINGS、HPACK、伪 Header 顺序、初始优先级 | 浏览器采集 JSON | 是 | 固定为 profile 的连接画像。 |
 | `User-Agent`、`sec-ch-ua*`、`accept-language`、`accept-encoding`、`te` | 浏览器采集 JSON | 仅缺失时兜底 | 都是普通 HTTP Header。cURL/调用方的同名 Header 始终原样优先；仅未传时使用 profile 默认值。 |
 | SNI | 当前请求 URL | 是 | 每次 TLS 握手根据当前 URL host 生成；不读取采集 JSON 的历史 `server_name`。 |
@@ -102,7 +102,7 @@ with Session(
 
 ## 浏览器产品版本与 Profile 命名
 
-Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种，不是“自动指向官网最新版”的别名。Chrome/Edge的JA3变化来自BoringSSL在每条新TLS连接上的扩展排列，复用连接的HTTP请求不会产生新握手；Firefox完整握手保持固定扩展顺序，票据恢复握手仅自然增加PSK扩展41。不能复制随机连接或恢复握手记录伪装成多个Profile变体。
+Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版本和本库Profile是三层不同数据。当前内置`chrome146`、`chrome150`、`chrome152`、`edge152`、`firefox151`均只有一条火种，不是“自动指向官网最新版”的别名；其中`firefox151`是Juggler研发兼容快照，不是Mozilla官网Stable。Google Chrome 152.0.7977.64的Trust Anchor Identifiers扩展`0xca34`已按捕获payload完成线级回放并通过发布门禁。Chrome/Edge的JA3变化来自BoringSSL在每条新TLS连接上的扩展排列和GREASE，检测器过滤GREASE后计算规范JA4；复用连接的HTTP请求不会产生新握手。Firefox完整握手保持固定扩展顺序，票据恢复握手仅自然增加PSK扩展41。不能删除新扩展、复制随机连接或恢复握手记录伪装成受支持Profile。
 
 新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
 

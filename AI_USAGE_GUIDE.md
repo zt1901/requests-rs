@@ -2,7 +2,7 @@
 
 ## 定位
 
-`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3直连、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2及浏览器TLS指纹，通过Reqwest/Quinn/Rustls执行HTTP/3，通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
+`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3优先协议协商、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2及浏览器TLS指纹，通过Reqwest/Quinn/Rustls执行HTTP/3，通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
 
 当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Rustls、Quinn、Reqwest、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
 
@@ -30,7 +30,7 @@ from requests_rust import (
 )
 ```
 
-内置Profile：`chrome146`、`chrome150`、`edge152`、`firefox151`。这些名称是已采集并验证的固定快照，不代表官网当前Stable，也不会自动随浏览器升级。`edge152`的火种来自本机Edge 152.0.4191.53，UA为`Edg/152.0.0.0`。
+内置Profile：`chrome146`、`chrome150`、`chrome152`、`edge152`、`firefox151`。这些名称是已采集并验证的固定快照，不代表官网当前Stable，也不会自动随浏览器升级。`chrome152`来自Google Chrome 152.0.7977.64官方正式版，Trust Anchor Identifiers扩展`0xca34`已完成线级回放；`edge152`来自Microsoft Edge 152.0.4191.53系统稳定版；`firefox151`来自playwright_rust Juggler，只是研发兼容快照，不代表Mozilla官网Stable。
 
 ```python
 print(available_profiles())
@@ -65,15 +65,17 @@ Session(
 )
 ```
 
-`fingerprints_path`传入指纹JSON文件路径时，该实例在构造时独立读取并解析文件（提前单实例加载），指纹只属于这个实例，不进入进程级全局缓存；多个实例可同时各读各的文件，互不干扰。文件格式与内置 `fingerprints.json` 一致（`id`、`profile`、`tls`、`http` 字段的指纹记录列表）。不传时回退到编译进wheel的内置指纹。文件不存在或解析失败在构造时直接抛错；实例选择的版本在该文件中不存在时，错误信息会列出该文件里的可用版本。
+`fingerprints_path`传入指纹JSON文件路径时，该实例在构造时独立读取并解析文件（提前单实例加载），指纹只属于这个实例，不进入进程级全局缓存；多个实例可同时各读各的文件，互不干扰。可传内置格式的裸记录数组，也可传捕获器MCP返回的`{schema_version, records}` envelope。不传时回退到编译进wheel的内置指纹。未知schema、未知非GREASE TLS/H2 ID、重复ID、Header顺序冲突或损坏的`extension_wire`会在Session构造时fail-closed，不会静默降真。
 
-`impersonate`也可直接传上述指纹JSON路径。该快捷形式要求文件中只有一个profile，但允许该profile包含多个变体；Session自动识别profile，不需要再传`fingerprints_path`。若文件中混有多个profile，或同时传入两种路径参数，构造时会直接报错，避免选错浏览器指纹。
+`impersonate`也可直接传上述指纹JSON路径、Python记录Sequence，或捕获器MCP `read_fingerprint_result`返回的完整Mapping。快捷形式要求只有一个profile，但允许该profile包含多个变体；Session自动识别profile，不需要再传`fingerprints_path`。对象输入在内存中交给Rust解析，不创建临时文件。若混有多个profile或同时指定`fingerprints_path`，构造时直接报错。JSON中的二维Header list也可直接传给`headers=`，API会保持顺序并规范化为字符串二元组。
 
 `max_connections`是Session内HTTP、HTTPS、HTTP代理、SOCKS5、流和WebSocket共同使用的Rust/Tokio原生上限。`happy_eyeballs_timeout`默认0.3秒；双栈域名首选地址族未及时连接时，Rust连接器并行尝试另一个地址族，设为`None`可关闭该回退。
 
 `fingerprint_pool`和`fingerprint_pool_size`保留给调用方自定义的多记录Profile。当前所有内置版本各一条火种；所有Profile都缓存Client，并按Origin和完整代理身份隔离可复用路由。Session关闭和`set_proxy()`会释放全部共享状态。
 
 Chrome和Edge与`curl_cffi`一致：同一Client可复用已有TCP、CONNECT、TLS和HTTP/2连接，复用连接的请求不会重新发送ClientHello；连接池确实新建TLS连接时，BoringSSL随机排列允许变化的扩展并产生新的原始JA3。业务Session、Cookie Jar、DNS配置、TLS Session Cache和Rust连接许可持续复用。
+
+Edge 152的`signature_algorithms`包含每次握手随机的GREASE项。JSON中的任意`0x?a?a`值会映射为内部`grease`占位符，BoringSSL在编码ClientHello时生成新的合法值；JA4检测必须先过滤该项。规范JA4、JA3N、稳定算法列表和ClientHello 32字节长度桶保持一致，原始GREASE值和JA3扩展顺序不要求逐次相等。
 
 `firefox151`也只保留一条火种，不启用BoringSSL扩展乱序。五次独立完整握手的JA3、JA4、ClientHello长度、扩展顺序和HTTP/2参数全部一致；Firefox复用Client与连接，必须新建连接时允许TLS票据恢复自然增加PSK扩展41，因此最多出现固定完整握手JA3和固定恢复握手JA3两种结构。
 
@@ -104,7 +106,7 @@ Chrome/Edge连接复用避免了每请求重复CONNECT、TLS和HTTP/2握手；�
 
 DNS性能测试必须固定服务、任务模型和连接状态，并同时记录成功率与资源峰值。千级冷连接一次起跑主要测量Socket、accept和临时端口容量，不能把连接拒绝归因于DNS覆盖本身。
 
-profile 默认 Header 只在调用方没有传同名 Header 时兜底。浏览器 Copy as cURL 或业务代码传入的所有 Header，包括 `User-Agent` 与 `sec-ch-ua*`，均原样优先，库不接管或替换。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie 与认证 Header 都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化；调用方应按实际请求传入。
+profile默认Header只在调用方没有传同名Header时兜底。值allowlist仅包含`user-agent`、`sec-ch-ua*`、`accept-encoding`、`accept-language`、`dnt`、`sec-gpc`和`te`。浏览器Copy as cURL或业务代码传入的所有Header均原样优先，库不接管或替换。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`、Cookie与认证Header都取决于当前请求上下文，不会从一次浏览器导航采集记录中固化值；profile仍保留这些Header的捕获名称顺序，因此调用方补入完整导航Header后可按浏览器顺序发送。
 
 同步示例：
 
@@ -142,7 +144,7 @@ with Session(impersonate="chrome150") as session:
 | `files` | 文件路径Mapping；由Rust Tokio文件流读取 |
 | `timeout` | 请求总超时，必须是有限正数 |
 | `read_timeout` | Body读取超时，必须是有限正数 |
-| `http_version` | `auto`、`http1`、`http2`或`http3`；Session默认和单请求覆盖均支持 |
+| `http_version` | 唯一协议参数，默认`http2`：`http3`按H3→H2→H1.1，`http2`按H2→H1.1，`http1.1`固定H1.1；`auto`仅作为兼容别名保留 |
 | `stream` | `True`时不预读完整Body |
 | `proxy` | 单请求代理覆盖；`None`表示该请求直连；省略表示使用Session代理 |
 | `proxies` | curl_cffi 风格代理映射，如 `{"http": "http://...", "https": "http://..."}`；按目标 URL 协议选择，也接受 `http://`、`https://`、`all://`、`all` 键；不能与 `proxy` 同时传入 |
@@ -178,11 +180,11 @@ asyncio.run(main())
 
 ## HTTP/3
 
-`http_version="v3"`、`"v3only"`、`"http3"`或`"h3"`进入Reqwest/Quinn/Rustls后端，只发送UDP/QUIC HTTP/3，不执行`Alt-Svc`探测或HTTP/2回退。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
+`http_version="http3"`表示H3优先。直连HTTPS先进入Reqwest/Quinn/Rustls后端；H3不可用时进入wreq/BoringSSL并按H2、H1.1协商。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
 
-HTTP/3只支持直连`https://`。当前HTTP CONNECT、SOCKS5、multipart、WebSocket和`transfer_stats`都是TCP语义，与HTTP/3组合时必须明确报错。代理失败时仍只轮换代理session ID并复用业务Session；不得为了绕过该限制在库内重建Session。
+安全方法可在H3传输失败后降级重试。未知origin的首次H3尝试或探测上限为1.5秒，H3与后续降级共享请求总超时。非安全方法首次访问时先用无业务Body的HEAD探测QUIC，并按origin和DNS路由缓存能力，不能在可能已经提交业务Body后盲目重放。正缓存10分钟、负缓存30秒。HTTP CONNECT、SOCKS5、multipart和`transfer_stats`当前不能承载QUIC，使用`http3`时直接从H2/H1.1开始且绝不绕过代理。
 
-HTTP/3后端不读取wreq的BoringSSL TLS配置。Profile默认Header仍生效，`fingerprint_id`仍表示所选记录，但HTTP/3的Rustls ClientHello、QUIC Transport Parameters、连接ID及QPACK状态不等同于真实Chrome/Edge，不能宣称浏览器QUIC指纹对撞。
+HTTP/3后端不读取wreq的BoringSSL TLS配置。Profile默认Header仍生效，`fingerprint_id`仍表示所选记录，但响应的`fingerprint_scope`为`headers-only`；HTTP/3的Rustls ClientHello、QUIC Transport Parameters、连接ID及QPACK状态不等同于真实Chrome/Edge，不能宣称浏览器QUIC指纹对撞。若H3失败后实际降级到wreq HTTP/2/1.1，scope则为`tls-http`。
 
 ## WebSocket
 
@@ -285,6 +287,8 @@ url: str
 history: list[Response]
 fingerprint_id: str
 impersonate: str
+http_version: str
+fingerprint_scope: str
 ok: bool
 json() -> Any
 raise_for_status() -> None
@@ -295,6 +299,8 @@ aclose() -> Awaitable[None]
 ```
 
 `Headers`大小写不敏感。`headers.get_list(name)`返回重复值列表；`headers.raw`保留完整二元组序列。
+
+`fingerprint_scope == "tls-http"`表示实际请求使用了profile的TLS与HTTP/1.1/2画像；`fingerprint_scope == "headers-only"`表示实际请求走通用HTTP/3后端，只应用稳定Header，不能将`fingerprint_id`解释为浏览器QUIC指纹等价。
 
 ## Cookie与代理
 
@@ -389,9 +395,9 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 业务代码禁止添加`Connection: close`或`Connection: keep-alive`。连接池按协议和服务端生命周期自然复用或新建连接，HTTP/2不接受这类hop-by-hop Header。
 
-当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。依赖服务端既有 TLS ticket 的 PSK 恢复握手记录不会作为新代理会话的首个随机指纹。
+当该 Python 发包对象调用 `set_proxy()` 将代理会话从 A 切换到 B 时，会清空旧代理的连接链路和每个变体的TLS Session Cache，并在同一 Profile 中重新随机选择一个变体；重复设置同一个代理会话不会改变当前指纹。旧代理路径签发的TLS ticket不会用于新代理路径。
 
-当前内置`chrome146`、`chrome150`、`edge152`、`firefox151`均只有一条火种。所有Profile缓存单一Client；Chrome/Edge的新TLS连接随机扩展顺序，Firefox完整握手JA3固定且票据恢复仅因扩展41形成固定恢复JA3。同一业务Session共享Cookie、代理配置、DNS、TLS Session Cache和连接许可。
+当前内置`chrome146`、`chrome150`、`chrome152`、`edge152`、`firefox151`均只有一条火种。所有Profile缓存单一Client；Chrome/Edge的新TLS连接随机扩展顺序，Firefox完整握手JA3固定且票据恢复仅因扩展41形成固定恢复JA3。同一业务Session共享Cookie、代理配置、DNS和连接许可；TLS Session Cache在同一代理身份内复用，切换默认代理或关闭Session时清空。
 
 ## GIL模型
 
@@ -408,15 +414,17 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 ## 错误边界
 
 - `timeout`、`connect_timeout`、`read_timeout`和非空`happy_eyeballs_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
-- 无效方法、Header、代理、URL、重定向、连接、TLS、QUIC和Body错误转换为Python异常；HTTP/3不允许代理、明文URL、multipart、WebSocket或TCP传输计量。
+- 无效方法、Header、代理、URL、重定向、连接、TLS、QUIC和Body错误转换为Python异常；协议偏好会在能力允许的范围内降级，最终协议见`response.http_version`。
 - `raise_for_status()`在状态码不属于200至399时抛出 `RuntimeError`。
 - `Response.ok`定义为 `200 <= status_code < 400`。
 
 ## 已验证范围
 
-- Chrome 150真实浏览器与requests_rust：41/41，100%。
+- Chrome 150真实浏览器与requests_rust历史基线：41/41，100%。
+- Edge 152捕获JSON直载回放：源记录ID命中；规范JA4、归一化签名GREASE/扩展结构、ClientHello长度桶、完整Header顺序、HTTP/2 SETTINGS、优先级和Akamai共25/25一致。HPACK原始摘要因测试端口对应的`:authority`不同而不作为相等项。
+- Chrome 152官方记录已内置；外部样本和wheel内置profile分别捕获真实ClientHello，`0xca34` payload均为206字节且SHA-256为`c9378c...ee01`，与源样本完全相同。非法Base64、长度错误和未来schema在Session构造期拒绝。
 - Firefox 151五次独立完整握手的核心TLS/HTTP2字段全部一致，已收敛为一条火种；同路由50请求只出现固定完整握手JA3及增加PSK扩展41的恢复JA3，`fingerprint_id`始终唯一。
-- Chrome/Edge在本地keep-alive代理上连续请求只建立1条物理连接；指纹捕获器主动关闭连接后50次自然重连得到50个不同JA3，强制20条新TLS连接时JA3N、JA4和`fingerprint_id`保持唯一。Firefox保持固定完整握手与PSK恢复结构。
+- Chrome/Edge在本地keep-alive代理上连续请求只建立1条物理连接；自然新建连接时原始JA3允许变化，过滤签名GREASE后的规范JA4、JA3N和`fingerprint_id`保持稳定。Firefox保持固定完整握手与PSK恢复结构。
 - 本地真实UDP/QUIC服务验证HTTP/3同步/异步GET与POST、同连接并发、静态DNS覆盖、重定向、Set-Cookie、Body上限、普通/流式Body、版本字段、取消和拒绝边界；公网证书验证直连`cloudflare-quic.com`返回`HTTP/3`响应。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
@@ -428,7 +436,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 - 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
 - 当前manylinux目标依赖glibc，不代表Alpine musl支持。
-- HTTP/3使用Reqwest/Quinn/Rustls直连，不支持当前TCP代理、multipart、WebSocket和`transfer_stats`，也不复现wreq/BoringSSL浏览器TLS或QUIC指纹。
+- HTTP/3使用Reqwest/Quinn/Rustls直连；当前TCP代理、multipart和`transfer_stats`在`http3`偏好下从H2开始，WebSocket单独配置，也不复现wreq/BoringSSL浏览器TLS或QUIC指纹。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
 - TCP字段来自浏览器和requests_rust共享的Windows内核网络栈，不代表能在其他系统伪造Windows TCP SYN。
 - 普通响应Body最终需要复制为Python `bytes`；Rust内部直接保留wreq返回的 `Bytes`，已去掉中间 `Bytes -> Vec<u8>`完整拷贝。大文件仍应使用流式接口降低峰值内存。

@@ -1,15 +1,15 @@
 # requests_rust 使用与 API 手册
 
-`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、HTTP/3直连、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
+`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、HTTP/3优先与自动降级、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
 
 高频 API 命名接近 `curl_cffi.requests`，但未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
 ## 安装
 
-从私有 `requests_rust` 发布仓库的 Release 下载与系统、CPU 架构匹配的 wheel，再安装：
+从 [GitHub Releases](https://github.com/zt1901/requests_rust-source/releases) 下载与系统、CPU架构匹配的wheel，再安装：
 
 ```bash
-pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
+python -m pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ```
 
 wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
@@ -25,6 +25,18 @@ wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
 | macOS Apple Silicon | `macosx_11_0_arm64` |
 
 wheel 必须与操作系统和 CPU 架构匹配。Windows ARM64、Linux x64、Linux ARM64 和 macOS Apple Silicon wheel 已在对应原生 GitHub runner 完成构建、pip 安装、原生模块导入、profile 读取和 Session 构造冒烟。当前 Windows x64 已完成本文所列完整协议回归；其他平台的安装冒烟不等同于同等级全协议验证。Alpine musl 当前不在发布矩阵中。
+
+Release尚未提供目标平台wheel时，可以从源码构建：
+
+```bash
+git clone https://github.com/zt1901/requests_rust-source.git
+cd requests_rust-source
+python -m pip install "maturin>=1.9,<2"
+maturin build --release --out dist
+python -m pip install --force-reinstall dist/requests_rust-*.whl
+```
+
+源码构建还需要Rust stable、CMake、Clang/libclang和当前平台的C/C++工具链。Windows开发者也可右键运行`build_and_install.py`，它会同步指纹、构建wheel并安装到当前Python。
 
 ## 导入与内置指纹
 
@@ -46,7 +58,64 @@ from requests_rust import (
 print(available_profiles())
 ```
 
-当前内置 profile 为 `chrome146`、`chrome150`、`edge152` 和 `firefox151`。它们是已采集并验证的固定浏览器大版本快照，不代表官网当前 Stable，也不会自动跟随浏览器升级。`edge152`来自本机Edge 152.0.4191.53，产品UA为`Edg/152.0.0.0`。profile 决定 TLS/HTTP2 指纹行为，不应当用它保存业务 Cookie、认证 Header、CSRF、签名、`Referer`、`Origin`、时间戳或 nonce。
+当前内置profile如下。名称表示真实采集并验证的快照，不代表官网当前Stable，也不会自动跟随浏览器升级。
+
+| Profile | 真实来源 | 发布状态 |
+|---|---|---|
+| `chrome146` | Google Chrome历史采集 | 已验证历史快照 |
+| `chrome150` | Google Chrome历史采集 | 已验证历史快照 |
+| `chrome152` | Google Chrome `152.0.7977.64`官方正式版 | 已完成`0xca34`线级回放并内置 |
+| `edge152` | Microsoft Edge `152.0.4191.53`系统稳定版 | 当前正式版基线 |
+| `firefox151` | playwright_rust Firefox Juggler | 研发兼容快照，不代表Mozilla官网Stable |
+
+Google Chrome `152.0.7977.64`的记录ID为`66e05a9d467e4b54b2c2b71f12ced6f7`。内置profile的真实ClientHello已确认完整发送Trust Anchor Identifiers扩展`0xca34`；206字节payload与捕获样本完全相同。新增profile仍必须来自真实正式版二进制与TLS/HTTP2采集，并完整回放新扩展；不能只修改名称、UA或Client Hints。
+
+profile决定TLS/HTTP2传输画像，不应保存业务Cookie、认证Header、CSRF、签名、`Referer`、`Origin`、时间戳或nonce。
+
+捕获记录中的Header名称顺序会完整保留，但只有跨请求稳定的浏览器/平台字段会成为profile默认值：`user-agent`、`sec-ch-ua*`、`accept-encoding`、`accept-language`、`dnt`、`sec-gpc`和`te`。`accept`、`origin`、`referer`、`upgrade-insecure-requests`、`sec-fetch-*`、`priority`及所有业务/认证Header只保留其相对顺序，值必须由当前真实请求传入。调用方显式Header始终优先。
+
+## 五分钟实战
+
+### 选择入口
+
+| 需求 | 推荐入口 |
+|---|---|
+| 一次简单请求 | 模块级`get/post` |
+| 顺序业务或已有同步代码 | `Session` |
+| 并发采集、代理池或长任务 | 长期复用一个`AsyncSession` |
+| 大文件下载 | `stream=True`与分块读取 |
+| 双向长连接 | `Session.websocket()`或`AsyncSession.websocket()` |
+| 捕获器导出的单profile JSON | `Session(impersonate=指纹文件)` |
+
+### 第一个可运行脚本
+
+```python
+from requests_rust import Session
+
+
+# 【可调参数】先使用公开测试页面跑通，再换成自己的业务地址。
+目标地址 = "https://example.com/"
+指纹版本 = "edge152"
+
+
+with Session(impersonate=指纹版本, timeout=30) as 会话:
+    响应 = 会话.get(
+        目标地址,
+        headers={"accept": "text/html,application/xhtml+xml"},
+    )
+    响应.raise_for_status()
+    print("状态码:", 响应.status_code)
+    print("实际协议:", 响应.http_version)
+    print("指纹编号:", 响应.fingerprint_id)
+```
+
+输出状态码后，先确认`response.fingerprint_id`非空，再把URL、Header、Cookie和Body替换为浏览器真实业务请求。不要为了“像浏览器”自行猜测`Origin`、`Referer`、`Sec-Fetch-*`或认证字段；应从该业务动作的DevTools请求或Copy as cURL得到。
+
+仓库内三个脚本可以直接右键运行：
+
+- [`examples/basic_sync.py`](examples/basic_sync.py)：同步请求。
+- [`examples/async_concurrency.py`](examples/async_concurrency.py)：一个Session并发多请求。
+- [`examples/custom_fingerprint.py`](examples/custom_fingerprint.py)：加载捕获器JSON。
 
 ## 同步请求
 
@@ -73,7 +142,7 @@ with Session(
 
 | 参数 | 含义 |
 |---|---|
-| `impersonate` | 必填，内置/自定义指纹中的 profile 名称，或直接传指纹 JSON 文件路径。 |
+| `impersonate` | 必填：内置profile名称、单profile JSON路径、记录Sequence，或捕获器MCP `read_fingerprint_result`返回的Mapping。 |
 | `fingerprint_rotation` | 默认为`True`，按请求自然轮换并复用已建立的指纹池；需要单一固定指纹时显式设为`False`。 |
 | `headers` | Session 默认 Header，支持 `dict` 或二元组序列。序列可保留重复 Header 和顺序。 |
 | `proxy` | Session 默认代理 URL。 |
@@ -82,7 +151,7 @@ with Session(
 | `timeout` | 请求总超时秒数，默认为 `30`。 |
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
-| `http_version` | 默认`"auto"`；可选`"http1"`、`"http2"`、`"http3"`，并兼容curl_cffi风格`"v3"`与`"v3only"`。单次请求可覆盖。 |
+| `http_version` | 唯一的协议选择参数。默认`"http2"`，按HTTP/2→HTTP/1.1降级；`"http3"`按HTTP/3→HTTP/2→HTTP/1.1降级，`"http1.1"`固定HTTP/1.1。单次请求可覆盖；`auto`等旧别名继续兼容。 |
 | `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
 | `resolve` | 可选域名到IPv4/IPv6列表的Session级静态映射，保留原URL、Host、SNI和证书域名。 |
 | `dns_servers` | 可选本机DNS服务器列表，支持`IP`或`IP:端口`，使用UDP并在失败时回退TCP。 |
@@ -96,7 +165,7 @@ with Session(
 | `max_websocket_message_bytes` | 单条WebSocket消息和帧的最大字节数，默认`16MiB`；超过后协议层终止连接。 |
 | `cookie_store` | 是否自动接收响应`Set-Cookie`并写入Session Jar，默认`True`；并发匿名爬虫可设为`False`并显式传请求Cookie。 |
 
-`impersonate` 直接传路径时，文件必须只包含一个 `profile`，但可以包含该 profile 的多个指纹变体。Session 会自动识别 profile，并继续遵循固定或轮换变体策略。此时不能再同时传 `fingerprints_path`。
+`impersonate`直接传路径、记录Sequence或MCP Mapping时必须只包含一个`profile`，但可以包含该profile的多个指纹变体。Session自动识别profile，并继续遵循固定或轮换变体策略；这些快捷形式不能再同时传`fingerprints_path`。Mapping和Sequence会序列化到内存并在Rust构造阶段解析，不创建临时文件。
 
 ```python
 async with AsyncSession(
@@ -163,7 +232,7 @@ async with AsyncSession(
 
 HTTP代理CONNECT目标强制本机解析尚未公开，因为必须同时分离CONNECT地址与原始TLS SNI、证书域名和HTTP Host；不能通过把URL改成IP或关闭证书验证伪实现。
 
-HTTP/3使用UDP/QUIC直连，不经过当前HTTP CONNECT或SOCKS5 TCP代理栈。Session配置了代理或单次请求传入代理时，`http_version="http3"`会明确报错，不会降级为HTTP/2。
+HTTP/3使用UDP/QUIC，当前HTTP CONNECT和SOCKS5代理链不能承载QUIC。配置这些代理时，`http_version="http3"`会直接在代理隧道内优先协商HTTP/2、必要时降级HTTP/1.1；不会绕过代理直连目标。未来只有支持SOCKS5 UDP ASSOCIATE或MASQUE CONNECT-UDP的代理路径才可能代理QUIC。
 
 DNS性能应按业务实际任务模型测试。仓库的`benchmark_dns_performance.py`一次创建1000个独立`get()`任务并设置`max_connections=1000`，只限制任务总数，不再增加Worker并发层；结果用于比较系统DNS、Session指定DNS和单get指定DNS，不作为公网吞吐承诺。
 
@@ -195,7 +264,7 @@ Session级默认：
 ```python
 with Session(
     impersonate="chrome150",
-    http_version="v3",
+    http_version="http3",
 ) as session:
     response = session.get("https://example.com/")
     assert response.http_version == "HTTP/3"
@@ -207,21 +276,21 @@ with Session(
 async with AsyncSession(impersonate="chrome150") as session:
     response = await session.get(
         "https://example.com/",
-        http_version="v3only",
+        http_version="http3",
         stream=True,
     )
     body = await response.aread()
 ```
 
-HTTP/3是prior-knowledge严格模式；`http3`、`h3`、`v3`和`v3only`含义相同，只接受`https://`，不会先发HTTP/1.1请求探测`Alt-Svc`，也不会失败后静默回退。它使用Reqwest、Quinn和Rustls，与HTTP/1.1/2的wreq、BoringSSL后端分离。`impersonate`在HTTP/3模式中仍提供默认Header和公开元数据，但不复现Chrome/Edge的BoringSSL ClientHello、QUIC Transport Parameters或QPACK指纹。
+`http3`表示协议优先级而不是强制only模式。直连HTTPS先使用Reqwest/Quinn/Rustls尝试HTTP/3；不可用时进入wreq/BoringSSL连接池并按HTTP/2、HTTP/1.1顺序协商。未知origin的首次H3尝试或探测最多占用1.5秒，并与后续降级共享原请求总超时。安全方法可在H3失败后重试；POST等非安全方法会先发送不含业务Body的HEAD传输探测并按origin和DNS路由缓存能力，避免为了降级而重复提交业务请求。成功能力缓存10分钟，失败能力缓存30秒；响应的`http_version`始终是最终实际协议。
 
-当前HTTP/3支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。不支持HTTP/SOCKS代理、multipart、WebSocket及基于TCP隧道的`transfer_stats`；这些组合会在调用边界明确失败。
+QUIC后端支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。multipart、`transfer_stats`和普通HTTP/SOCKS代理不能使用当前QUIC后端，因此在同一个`http3`偏好下直接使用H2/H1.1；WebSocket仍单独使用`version`参数。
 
 同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
 
 所有当前内置浏览器版本都只保存一条火种。`fingerprint_pool`和`fingerprint_pool_size`仅对调用方提供的多记录自定义Profile保留变体选择与Client缓存语义。
 
-Chrome和Edge与`curl_cffi`采用相同连接模型：同一wreq Client复用匹配Origin和代理身份的TCP、HTTP代理CONNECT、TLS及HTTP/2连接；复用连接不会产生新ClientHello。连接池自然新建TLS连接时，BoringSSL重新随机排列允许变化的扩展，因此原始JA3可变，JA3N和JA4保持对应浏览器版本语义。
+Chrome和Edge与`curl_cffi`采用相同连接模型：同一wreq Client复用匹配Origin和代理身份的TCP、HTTP代理CONNECT、TLS及HTTP/2连接；复用连接不会产生新ClientHello。连接池自然新建TLS连接时，BoringSSL重新随机排列允许变化的扩展，因此原始JA3可变。签名算法GREASE同样每次随机；检测器过滤GREASE后，JA3N和规范JA4保持对应浏览器版本语义。
 
 `firefox151`同样只保存一条火种，五次真实完整握手均保持同一JA3和扩展顺序，因此继续缓存并复用Firefox Client与TLS/H2连接。需要新连接时，首次完整握手使用固定NSS JA3；命中共享TLS票据缓存后，恢复握手会自然增加PSK扩展41并形成对应的第二个JA3，这不是第二条Profile火种。
 
@@ -390,8 +459,12 @@ response.json()
 response.history
 response.fingerprint_id
 response.impersonate
+response.http_version
+response.fingerprint_scope
 response.raise_for_status()
 ```
+
+`fingerprint_scope`说明本次响应实际覆盖的指纹边界：HTTP/1.1/2的wreq/BoringSSL路径返回`tls-http`；通用HTTP/3的Reqwest/Quinn/Rustls路径返回`headers-only`。后者仍使用所选profile的稳定Header和`fingerprint_id`做来源审计，但不表示浏览器ClientHello、QUIC Transport Parameters或QPACK已经对撞。
 
 ## TLS 传输层统计
 
@@ -469,22 +542,115 @@ files = {"document": r"C:\data\report.bin"}
 
 文件由 Rust 异步文件流读取，不需要先将整个文件加载为 Python `bytes`。
 
-HTTP/3模式暂不支持multipart；文件上传继续使用`auto`、`http1`或`http2`模式。
+multipart可继续传同一个`http_version`参数；选择`http3`时自动从HTTP/2开始协商，因为当前QUIC后端尚未实现multipart上传。
 
 ## 自定义指纹文件
 
+指纹捕获器导出的单profile JSON可以直接交给`impersonate`。先确认文件内每条记录的`profile`相同，并检查`collector_browser.product`与`collector_browser.version`确实属于目标正式浏览器。
+
+捕获器MCP结果可以原对象直传：
+
 ```python
-session = Session(
-    impersonate=r"D:\fingerprints\firefox151.json",
+# read_fingerprint_result返回的完整dict，包含schema_version和records。
+捕获结果 = await mcp_client.call_tool(
+    "read_fingerprint_result",
+    {"task_id": 任务ID},
+)
+记录 = 捕获结果["records"][0]
+
+with Session(impersonate=捕获结果, fingerprint_rotation=False) as 会话:
+    响应 = 会话.get(
+        "https://example.com/",
+        headers=记录["http"]["headers"],
+    )
+```
+
+`http.headers`从JSON解析后是二维list；API会把每项规范化为字符串二元组并保持顺序。Cookie、认证、CSRF、`Origin`、`Referer`和站点签名仍属于具体业务上下文，不应因为对象可直传就无条件复用其历史值。
+
+```python
+from pathlib import Path
+
+from requests_rust import Session
+
+
+# 【可调参数】替换为捕获器生成的真实文件和业务地址。
+指纹文件 = Path(r"C:\fingerprints\edge152.json")
+目标地址 = "https://example.com/"
+
+# 二元组序列可以表达浏览器Header名称顺序和重复Header。
+浏览器请求头 = [
+    ("upgrade-insecure-requests", "1"),
+    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-user", "?1"),
+    ("sec-fetch-dest", "document"),
+]
+
+with Session(
+    impersonate=指纹文件,
+    fingerprint_rotation=False,
+    headers=浏览器请求头,
+    timeout=30,
+) as 会话:
+    print("文件内指纹数量:", 会话.fingerprint_count)
+    响应 = 会话.get(目标地址)
+    响应.raise_for_status()
+    print("源记录ID:", 响应.fingerprint_id)
+```
+
+路径和对象快捷形式有以下契约：
+
+1. 文件必须只包含一个`profile`，但允许该profile有多个变体。
+2. Session自动识别profile；不能同时再传`fingerprints_path`。
+3. 文件只影响当前Session，不进入进程级内置缓存。
+4. `response.fingerprint_id`是本次实际选择的源记录`id`，可用于审计和对撞。
+5. 捕获器的裸数组、Python记录Sequence和完整MCP `{schema_version, records, ...}` Mapping都可直接加载；对象输入不落盘。
+6. 文件不存在、JSON损坏、混有多个profile、未知schema或缺少TLS字段时，构造期直接报错。
+7. 未知非GREASE cipher/group/key-share/signature/extension、未支持HTTP/2 SETTINGS、重复ID、`header_order`冲突，以及`extension_wire`的Base64、长度或顺序错误都会fail-closed；不会“请求成功但静默漏指纹”。
+
+需要从多profile文件中显式选择时，使用完整形式：
+
+```python
+会话 = Session(
+    impersonate="edge152",
+    fingerprints_path=r"C:\fingerprints\all_profiles.json",
 )
 ```
 
-路径形式要求文件只包含一个 profile，可包含该 profile 的多个变体；Session 自动识别 profile。需要从多 profile 文件中显式选择时，继续使用 `impersonate="profile名称", fingerprints_path=路径`。自定义文件只影响该实例。文件记录应只包含 TLS/HTTP2 指纹数据；SNI、TLS Random、KeyShare、ticket、PSK binder、Host、Content-Length、业务 Header、Cookie、认证态和签名参数都是运行态数据。
+自定义记录只保存TLS/HTTP2传输画像和跨请求稳定Header。SNI、TLS Random、KeyShare公钥、ticket、PSK binder、Host、Content-Length、Cookie、认证、CSRF和业务签名必须由运行时或业务代码生成。
+
+Chromium会在自然新建TLS连接时随机排列允许变化的扩展，并为GREASE生成新值。线级验证应归一化GREASE和允许乱序的扩展，不能要求每次原始JA3哈希、扩展位置或随机载荷摘要完全相同。
+
+真实闭环验收（2026-09-02，Google Chrome 152.0.7977.64）：捕获器正式输出经MCP形状dict直接构造Session，源记录ID`0edd239e7a79413bbdc407d48562617f`；源与回放ClientHello均为1914字节，规范JA4均为`t13i1516h2_8daaf6152771_cb7bf5808d99`，Trust Anchor Identifiers `0xca34`的206字节payload完全一致，HTTP/2 Akamai参数均为`1:65536;2:0;4:6291456;6:262144|15663105|1:1:0:256|m,a,s,p`。
+
+## 常见问题排查
+
+### `内置指纹中没有 <路径>`
+
+传入的路径不存在时，库会把字符串按profile名称处理。优先使用`Path`或绝对路径，并先检查`指纹文件.is_file()`。
+
+### `无法构建wreq Client`
+
+通常表示捕获JSON中的TLS算法无法映射到当前BoringSSL。不要回退成旧profile名称掩盖问题；保留源JSON、浏览器完整版本和错误信息，提交Issue。
+
+### 请求成功但Header不对
+
+profile不会固化`accept`、`origin`、`referer`、`sec-fetch-*`、`priority`、Cookie或认证字段。把浏览器真实请求Header按二元组序列传入，名称顺序由profile的捕获顺序参与线级发送。
+
+### 使用新浏览器版本但profile名称没变
+
+profile不会自动升级。必须重新采集、线级对撞并新增对应大版本；禁止把旧TLS记录改名后冒充最新版。
+
+### 异步任务越来越多
+
+长期复用一个`AsyncSession`并设置合理的`max_connections`。不要为每条请求创建Session，也不要再叠一层无界Python任务或业务batch。
 
 ## 重要边界
 
-- HTTP/3为显式QUIC直连模式，不支持当前TCP代理、multipart、WebSocket或`transfer_stats`，也不宣称复现浏览器QUIC指纹。
+- `http3`是H3→H2→H1.1偏好；当前TCP代理、multipart和`transfer_stats`从H2开始，WebSocket继续使用自己的`version`参数。QUIC后端不宣称复现浏览器QUIC指纹。
 - 不同指纹变体使用独立 Client、连接池和 TLS session cache，这是指纹隔离要求。
+- 切换Session默认代理或关闭Session会清空TLS session cache，避免旧代理身份签发的ticket用于新代理路径。
 - 调用方传入的 `User-Agent`、`sec-ch-ua*` 与其他同名 Header 优先，库不会覆盖。
 - `Accept`、`Origin`、`Referer`、`Sec-Fetch-*`、Cookie、Authorization、CSRF 和业务签名必须根据当前业务请求传入。
 - `verify=False` 只应用于受控测试；生产 HTTPS 请求应保持证书验证。

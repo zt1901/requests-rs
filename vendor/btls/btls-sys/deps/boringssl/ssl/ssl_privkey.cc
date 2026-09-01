@@ -477,6 +477,7 @@ struct SignatureAlgorithmName {
 // This was "constexpr" rather than "const", but that triggered a bug in MSVC
 // where it didn't pad the strings to the correct length.
 static const SignatureAlgorithmName kSignatureAlgorithmNames[] = {
+    {0x0a0a, "grease"},
     {SSL_SIGN_RSA_PKCS1_MD5_SHA1, "rsa_pkcs1_md5_sha1"},
     {SSL_SIGN_RSA_PKCS1_SHA1, "rsa_pkcs1_sha1"},
     {SSL_SIGN_RSA_PKCS1_SHA256, "rsa_pkcs1_sha256"},
@@ -586,7 +587,7 @@ static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs) {
       // abstraction.
       continue;
     }
-    if (get_signature_algorithm(pref) == nullptr) {
+    if (pref != 0x0a0a && get_signature_algorithm(pref) == nullptr) {
       OPENSSL_PUT_ERROR(SSL, SSL_R_INVALID_SIGNATURE_ALGORITHM);
       return false;
     }

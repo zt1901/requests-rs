@@ -120,6 +120,17 @@ def main():
             print("默认代理会话粘性:", first.fingerprint_id)
 
         records = json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
+        direct_records = [record for record in records if record["profile"] == 测试版本]
+        direct_envelope = {
+            "schema_version": 1,
+            "count": len(direct_records),
+            "records": direct_records,
+        }
+        with Session(impersonate=direct_envelope, verify=False) as direct_session:
+            direct_response = direct_session.get(测试地址)
+            assert direct_session.impersonate == 测试版本
+            assert direct_response.impersonate == 测试版本
+            print("捕获结果对象直传验证通过")
         with tempfile.TemporaryDirectory() as temp_dir:
             chrome_records = [record for record in records if record["profile"] == "chrome150"]
             firefox_records = [record for record in records if record["profile"] == "firefox151"]

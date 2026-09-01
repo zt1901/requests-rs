@@ -10,6 +10,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 测试版本 = "edge152"
 预期指纹数量 = 1
 
+# 【可调参数】完整导航Header用于验证捕获顺序能穿过Python和Rust请求层。
+浏览器导航请求头 = [
+    ("sec-ch-ua", '"Chromium";v="152", "Not?A_Brand";v="24", "Microsoft Edge";v="152"'),
+    ("sec-ch-ua-mobile", "?0"),
+    ("sec-ch-ua-platform", '"Windows"'),
+    ("upgrade-insecure-requests", "1"),
+    ("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"),
+    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-user", "?1"),
+    ("sec-fetch-dest", "document"),
+    ("accept-encoding", "gzip, deflate, br, zstd"),
+    ("accept-language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"),
+    ("priority", "u=0, i"),
+]
+
 
 class 请求头处理器(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -24,6 +41,9 @@ class 请求头处理器(BaseHTTPRequestHandler):
                 "sec_ch_ua": self.headers.get("sec-ch-ua", ""),
                 "sec_ch_ua_mobile": self.headers.get("sec-ch-ua-mobile", ""),
                 "sec_ch_ua_platform": self.headers.get("sec-ch-ua-platform", ""),
+                "header_order": [
+                    name.lower() for name, _ in self.headers.items() if name.lower() != "host"
+                ],
             }
         ).encode()
         self.send_response(200)
@@ -73,6 +93,15 @@ def main() -> None:
 
         with Session(
             impersonate=测试版本,
+            fingerprint_rotation=False,
+            headers=浏览器导航请求头,
+        ) as 顺序会话:
+            顺序响应 = 顺序会话.get(目标地址 + "/ordered")
+            顺序结果 = 顺序响应.json()
+            assert 顺序结果["header_order"] == [名称 for 名称, _ in 浏览器导航请求头], 顺序结果
+
+        with Session(
+            impersonate=测试版本,
             fingerprint_rotation=True,
             fingerprint_pool=True,
             fingerprint_pool_size=预期指纹数量,
@@ -86,7 +115,7 @@ def main() -> None:
             assert 轮换会话.fingerprint_pool_count == 1
 
         asyncio.run(验证异步请求(目标地址))
-        print("Edge 152单火种Profile、默认请求头和请求级新Client验证通过")
+        print("Edge 152单火种Profile、默认请求头、完整Header顺序和请求级新Client验证通过")
     finally:
         服务.shutdown()
         服务.server_close()

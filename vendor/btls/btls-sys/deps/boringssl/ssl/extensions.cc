@@ -314,6 +314,9 @@ static Span<const uint16_t> tls12_get_verify_sigalgs(const SSL_HANDSHAKE *hs) {
 
 bool tls12_add_verify_sigalgs(const SSL_HANDSHAKE *hs, CBB *out) {
   for (uint16_t sigalg : tls12_get_verify_sigalgs(hs)) {
+    if (sigalg == 0x0a0a) {
+      sigalg = ssl_get_grease_value(hs, ssl_grease_signature_algorithm);
+    }
     if (!CBB_add_u16(out, sigalg)) {
       return false;
     }

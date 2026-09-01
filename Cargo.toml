@@ -2,7 +2,9 @@
 name = "requests_rust"
 version = "0.3.0"
 edition = "2024"
-license = "Proprietary"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zt1901/requests_rust-source"
+readme = "README.md"
 
 [lib]
 name = "_native"
@@ -45,4 +47,6 @@ strip = true
 
 [patch.crates-io]
 http2 = { path = "vendor/http2" }
+btls = { path = "vendor/btls-wrapper" }
 btls-sys = { path = "vendor/btls/btls-sys" }
+wreq = { path = "vendor/wreq" }

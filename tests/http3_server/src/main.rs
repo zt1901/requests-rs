@@ -4,6 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
 };
+use std::fs;
 
 use bytes::{Buf, Bytes};
 use http::{Request, Response, StatusCode, header};
@@ -119,6 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "localhost".to_string(),
         "127.0.0.1".to_string(),
     ])?;
+    if let Ok(path) = env::var("HTTP3_TEST_CERT") {
+        fs::write(path, cert.pem())?;
+    }
+    if let Ok(path) = env::var("HTTP3_TEST_KEY") {
+        fs::write(path, signing_key.serialize_pem())?;
+    }
     let certs = vec![cert.der().clone()];
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
     let mut tls = rustls::ServerConfig::builder()
