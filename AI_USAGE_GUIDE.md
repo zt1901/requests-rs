@@ -178,7 +178,7 @@ asyncio.run(main())
 
 ## HTTP/3
 
-`http_version="http3"`或`"h3"`进入Reqwest/Quinn/Rustls后端，只发送UDP/QUIC HTTP/3，不执行`Alt-Svc`探测或HTTP/2回退。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
+`http_version="v3"`、`"v3only"`、`"http3"`或`"h3"`进入Reqwest/Quinn/Rustls后端，只发送UDP/QUIC HTTP/3，不执行`Alt-Svc`探测或HTTP/2回退。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
 
 HTTP/3只支持直连`https://`。当前HTTP CONNECT、SOCKS5、multipart、WebSocket和`transfer_stats`都是TCP语义，与HTTP/3组合时必须明确报错。代理失败时仍只轮换代理session ID并复用业务Session；不得为了绕过该限制在库内重建Session。
 

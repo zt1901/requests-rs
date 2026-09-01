@@ -82,7 +82,7 @@ with Session(
 | `timeout` | 请求总超时秒数，默认为 `30`。 |
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
-| `http_version` | 默认`"auto"`；可选`"http1"`、`"http2"`或`"http3"`。单次请求可用同名参数覆盖。 |
+| `http_version` | 默认`"auto"`；可选`"http1"`、`"http2"`、`"http3"`，并兼容curl_cffi风格`"v3"`与`"v3only"`。单次请求可覆盖。 |
 | `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
 | `resolve` | 可选域名到IPv4/IPv6列表的Session级静态映射，保留原URL、Host、SNI和证书域名。 |
 | `dns_servers` | 可选本机DNS服务器列表，支持`IP`或`IP:端口`，使用UDP并在失败时回退TCP。 |
@@ -195,7 +195,7 @@ Session级默认：
 ```python
 with Session(
     impersonate="chrome150",
-    http_version="http3",
+    http_version="v3",
 ) as session:
     response = session.get("https://example.com/")
     assert response.http_version == "HTTP/3"
@@ -207,13 +207,13 @@ with Session(
 async with AsyncSession(impersonate="chrome150") as session:
     response = await session.get(
         "https://example.com/",
-        http_version="h3",
+        http_version="v3only",
         stream=True,
     )
     body = await response.aread()
 ```
 
-HTTP/3是prior-knowledge模式，只接受`https://`，不会先发HTTP/1.1请求探测`Alt-Svc`，也不会失败后静默回退。它使用Reqwest、Quinn和Rustls，与HTTP/1.1/2的wreq、BoringSSL后端分离。`impersonate`在HTTP/3模式中仍提供默认Header和公开元数据，但不复现Chrome/Edge的BoringSSL ClientHello、QUIC Transport Parameters或QPACK指纹。
+HTTP/3是prior-knowledge严格模式；`http3`、`h3`、`v3`和`v3only`含义相同，只接受`https://`，不会先发HTTP/1.1请求探测`Alt-Svc`，也不会失败后静默回退。它使用Reqwest、Quinn和Rustls，与HTTP/1.1/2的wreq、BoringSSL后端分离。`impersonate`在HTTP/3模式中仍提供默认Header和公开元数据，但不复现Chrome/Edge的BoringSSL ClientHello、QUIC Transport Parameters或QPACK指纹。
 
 当前HTTP/3支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。不支持HTTP/SOCKS代理、multipart、WebSocket及基于TCP隧道的`transfer_stats`；这些组合会在调用边界明确失败。
 

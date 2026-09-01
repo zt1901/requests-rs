@@ -81,7 +81,7 @@ def 验证同步(url: str) -> None:
     with Session(
         impersonate=测试版本,
         verify=False,
-        http_version="http3",
+        http_version="v3only",
         max_connections=20,
     ) as session:
         first = session.get(
@@ -115,7 +115,7 @@ def 验证同步(url: str) -> None:
         streamed.close()
 
     with Session(impersonate=测试版本, verify=False) as session:
-        overridden = session.get(url + "/echo", http_version="h3")
+        overridden = session.get(url + "/echo", http_version="v3")
         assert overridden.http_version == "HTTP/3"
 
     port = urlsplit(url).port
@@ -193,7 +193,7 @@ async def 验证异步(url: str) -> None:
     async with AsyncSession(
         impersonate=测试版本,
         verify=False,
-        http_version="http3",
+        http_version="v3",
         max_connections=20,
     ) as session:
         responses = await asyncio.gather(

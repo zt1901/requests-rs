@@ -176,6 +176,8 @@ def _normalize_http_version(value: str) -> str:
         "http3": "http3",
         "h3": "http3",
         "http/3": "http3",
+        "v3": "http3",
+        "v3only": "http3",
     }
     try:
         return aliases[value.lower()]

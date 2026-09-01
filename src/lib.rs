@@ -1791,7 +1791,7 @@ fn parse_request_http_version(version: &str) -> PyResult<RequestHttpVersion> {
         "auto" | "default" => Ok(RequestHttpVersion::Auto),
         "http1" | "http1.1" | "http/1.1" => Ok(RequestHttpVersion::Http1),
         "http2" | "h2" | "http/2" => Ok(RequestHttpVersion::Http2),
-        "http3" | "h3" | "http/3" => Ok(RequestHttpVersion::Http3),
+        "http3" | "h3" | "http/3" | "v3" | "v3only" => Ok(RequestHttpVersion::Http3),
         _ => Err(PyRuntimeError::new_err(
             "http_version必须是auto、http1、http2或http3",
         )),
