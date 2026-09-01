@@ -184,12 +184,6 @@ HTTP/3只支持直连`https://`。当前HTTP CONNECT、SOCKS5、multipart、WebS
 
 HTTP/3后端不读取wreq的BoringSSL TLS配置。Profile默认Header仍生效，`fingerprint_id`仍表示所选记录，但HTTP/3的Rustls ClientHello、QUIC Transport Parameters、连接ID及QPACK状态不等同于真实Chrome/Edge，不能宣称浏览器QUIC指纹对撞。
 
-## 本地HTTP/3出口网关
-
-`http3_local_gateway.py`提供回环HTTP/1.1代理入口。CONNECT成功后由本地CA终止客户端TLS，解析出的GET/POST等请求通过每条入站连接独有的长期HTTP/3 Session直连目标；连续请求复用同一QUIC连接。网关返回`X-Local-HTTP3-Gateway: 1`和`X-Upstream-HTTP-Version: HTTP/3`用于核验。
-
-该工具是显式MITM协议转换器，不是MASQUE或透明UDP代理。必须保护`.http3_gateway_ca`中的CA私钥；默认禁止非回环监听。当前完整缓冲Body，仅支持入站HTTP/1.1和出站HTTPS，不支持WebSocket、HTTP/2入站、代理认证、流式上传或匿名出口。请求失败返回502，不因失败重建出站Session。
-
 ## WebSocket
 
 同步入口为`Session.websocket()`，异步入口为`await AsyncSession.websocket()`。支持`ws://`、`wss://`、HTTP/1.1 Upgrade、RFC 8441 Extended CONNECT、文本、二进制、Ping、Pong、Close、子协议、Cookie、请求Header、HTTP代理Basic预认证和SOCKS5用户名密码认证。

@@ -217,44 +217,6 @@ HTTP/3是prior-knowledge模式，只接受`https://`，不会先发HTTP/1.1请�
 
 当前HTTP/3支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。不支持HTTP/SOCKS代理、multipart、WebSocket及基于TCP隧道的`transfer_stats`；这些组合会在调用边界明确失败。
 
-## 本地CONNECT转HTTP/3网关
-
-`http3_local_gateway.py`把本机标准HTTP/1.1代理入口转换为HTTP/3直连出口。HTTPS客户端先向`127.0.0.1`发送CONNECT，网关用本地CA动态签发目标证书并终止TLS，解析出的HTTP请求再通过长期`Session(http_version="http3")`发往目标；同一CONNECT内的请求复用同一个QUIC连接池。
-
-```bash
-python -m pip install cryptography
-python http3_local_gateway.py --port 18083
-```
-
-启动后输出：
-
-```text
-本地HTTP/3网关: http://127.0.0.1:18083
-本地CA证书: .http3_gateway_ca/local-http3-gateway-ca.pem
-```
-
-标准客户端用法：
-
-```bash
-curl --proxy http://127.0.0.1:18083 \
-  --cacert .http3_gateway_ca/local-http3-gateway-ca.pem \
-  https://cloudflare-quic.com/b/
-```
-
-受控测试也可让`requests_rust`作为入站客户端：
-
-```python
-with Session(
-    impersonate="chrome150",
-    proxy="http://127.0.0.1:18083",
-    verify=False,
-) as client:
-    response = client.get("https://cloudflare-quic.com/b/")
-    assert response.headers["x-upstream-http-version"] == "HTTP/3"
-```
-
-这是本机TLS终止网关，不是透明隧道或MASQUE。默认只监听回环地址；CA私钥必须保留在本机且不得分发。当前入站只解析HTTP/1.1，完整缓冲请求体和响应Body，不支持WebSocket、HTTP/2入站、流式上传、代理认证或远程多用户部署。出站使用本机公网IP，不提供匿名或住宅代理出口。
-
 同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
 
 所有当前内置浏览器版本都只保存一条火种。`fingerprint_pool`和`fingerprint_pool_size`仅对调用方提供的多记录自定义Profile保留变体选择与Client缓存语义。
