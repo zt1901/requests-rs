@@ -70,6 +70,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
 - HTTP/1.1、HTTP/2及显式HTTP/3直连，支持重定向、总超时与Body读取超时
+- 本地HTTP/1.1 CONNECT转HTTP/3出口网关，支持动态本地CA和同连接QUIC复用
 - IPv4、IPv6 和 RFC 6555 Happy Eyeballs
 - Session 级静态 `resolve` 映射，以及 Session/请求级 Rust Hickory 自定义 DNS 服务器
 - 固定 profile 或按请求轮换 profile
