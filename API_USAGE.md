@@ -1,6 +1,6 @@
 # requests_rust 使用与 API 手册
 
-`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
+`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、HTTP/3直连、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
 
 高频 API 命名接近 `curl_cffi.requests`，但未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
@@ -82,6 +82,7 @@ with Session(
 | `timeout` | 请求总超时秒数，默认为 `30`。 |
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
+| `http_version` | 默认`"auto"`；可选`"http1"`、`"http2"`或`"http3"`。单次请求可用同名参数覆盖。 |
 | `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
 | `resolve` | 可选域名到IPv4/IPv6列表的Session级静态映射，保留原URL、Host、SNI和证书域名。 |
 | `dns_servers` | 可选本机DNS服务器列表，支持`IP`或`IP:端口`，使用UDP并在失败时回退TCP。 |
@@ -162,6 +163,8 @@ async with AsyncSession(
 
 HTTP代理CONNECT目标强制本机解析尚未公开，因为必须同时分离CONNECT地址与原始TLS SNI、证书域名和HTTP Host；不能通过把URL改成IP或关闭证书验证伪实现。
 
+HTTP/3使用UDP/QUIC直连，不经过当前HTTP CONNECT或SOCKS5 TCP代理栈。Session配置了代理或单次请求传入代理时，`http_version="http3"`会明确报错，不会降级为HTTP/2。
+
 DNS性能应按业务实际任务模型测试。仓库的`benchmark_dns_performance.py`一次创建1000个独立`get()`任务并设置`max_connections=1000`，只限制任务总数，不再增加Worker并发层；结果用于比较系统DNS、Session指定DNS和单get指定DNS，不作为公网吞吐承诺。
 
 ```python
@@ -184,6 +187,35 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## HTTP/3模式
+
+Session级默认：
+
+```python
+with Session(
+    impersonate="chrome150",
+    http_version="http3",
+) as session:
+    response = session.get("https://example.com/")
+    assert response.http_version == "HTTP/3"
+```
+
+单次覆盖与异步流：
+
+```python
+async with AsyncSession(impersonate="chrome150") as session:
+    response = await session.get(
+        "https://example.com/",
+        http_version="h3",
+        stream=True,
+    )
+    body = await response.aread()
+```
+
+HTTP/3是prior-knowledge模式，只接受`https://`，不会先发HTTP/1.1请求探测`Alt-Svc`，也不会失败后静默回退。它使用Reqwest、Quinn和Rustls，与HTTP/1.1/2的wreq、BoringSSL后端分离。`impersonate`在HTTP/3模式中仍提供默认Header和公开元数据，但不复现Chrome/Edge的BoringSSL ClientHello、QUIC Transport Parameters或QPACK指纹。
+
+当前HTTP/3支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。不支持HTTP/SOCKS代理、multipart、WebSocket及基于TCP隧道的`transfer_stats`；这些组合会在调用边界明确失败。
 
 同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
 
@@ -437,6 +469,8 @@ files = {"document": r"C:\data\report.bin"}
 
 文件由 Rust 异步文件流读取，不需要先将整个文件加载为 Python `bytes`。
 
+HTTP/3模式暂不支持multipart；文件上传继续使用`auto`、`http1`或`http2`模式。
+
 ## 自定义指纹文件
 
 ```python
@@ -449,7 +483,7 @@ session = Session(
 
 ## 重要边界
 
-- 当前不发送 HTTP/3。
+- HTTP/3为显式QUIC直连模式，不支持当前TCP代理、multipart、WebSocket或`transfer_stats`，也不宣称复现浏览器QUIC指纹。
 - 不同指纹变体使用独立 Client、连接池和 TLS session cache，这是指纹隔离要求。
 - 调用方传入的 `User-Agent`、`sec-ch-ua*` 与其他同名 Header 优先，库不会覆盖。
 - `Accept`、`Origin`、`Referer`、`Sec-Fetch-*`、Cookie、Authorization、CSRF 和业务签名必须根据当前业务请求传入。

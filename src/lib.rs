@@ -46,7 +46,10 @@ use wreq::{
     Client, Emulation, Method, Proxy, Uri, Version,
     cookie::{CookieStore, Cookies as RequestCookies, Jar},
     dns::{Addrs as DnsAddrs, Name as DnsName, Resolve as DnsResolve, Resolving},
-    header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap},
+    header::{
+        AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderName,
+        HeaderValue, LOCATION, OrigHeaderMap, PROXY_AUTHORIZATION, SET_COOKIE,
+    },
     http2::{
         Http2Options, Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder,
         StreamDependency, StreamId,
@@ -75,6 +78,23 @@ impl DnsResolve for CustomDnsResolver {
         Box::pin(async move {
             let lookup = resolver.lookup_ip(name.as_str()).await?;
             let addrs: DnsAddrs = Box::new(
+                lookup
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            Ok(addrs)
+        })
+    }
+}
+
+impl reqwest::dns::Resolve for CustomDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let lookup = resolver.lookup_ip(name.as_str()).await?;
+            let addrs: reqwest::dns::Addrs = Box::new(
                 lookup
                     .iter()
                     .map(|ip| SocketAddr::new(ip, 0))
@@ -263,7 +283,7 @@ fn native_headers_from_map(headers: &HeaderMap) -> NativeHeaders {
 fn build_response_headers(headers: Vec<(String, String)>) -> NativeHeaders {
     native_headers(headers)
 }
-type NativeBodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send>>;
+type NativeBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
 
 static 共享运行时: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
 static 指纹记录缓存: OnceLock<Result<Vec<Arc<Record>>, String>> = OnceLock::new();
@@ -925,6 +945,8 @@ struct SessionState {
     happy_eyeballs_timeout: Option<Duration>,
     dns_resolver: Option<CustomDnsResolver>,
     dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
+    // HTTP/3使用独立QUIC连接池；键包含DNS与读取超时，避免配置串用。
+    http3_clients: Mutex<LruCache<String, Arc<OnceCell<reqwest::Client>>>>,
     cookie_jar: Arc<Jar>,
     cookie_store: bool,
     closed: AtomicBool,
@@ -1261,6 +1283,102 @@ async fn selected_request_client_async(
     })
     .await
     .map_err(|error| PyRuntimeError::new_err(format!("请求级DNS Client构建任务失败: {error}")))?
+}
+
+fn build_http3_client(
+    state: &SessionState,
+    resolver: Option<CustomDnsResolver>,
+    read_timeout: Option<Duration>,
+) -> PyResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .http3_prior_knowledge()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(!state.verify)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(state.client_pool_max_size)
+        .http3_max_idle_timeout(Duration::from_secs(30));
+    if let Some(timeout) = state.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    if let Some(timeout) = read_timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    if let Some(resolver) = resolver {
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
+    for (domain, addrs) in state.dns_overrides.iter() {
+        builder = builder.resolve_to_addrs(domain, addrs);
+    }
+    builder
+        .build()
+        .map_err(|error| PyRuntimeError::new_err(format!("无法构建HTTP/3 Client: {error:?}")))
+}
+
+fn selected_http3_client(
+    state: &SessionState,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    read_timeout: Option<Duration>,
+    cache_route: bool,
+) -> PyResult<reqwest::Client> {
+    let normalized = dns_servers
+        .iter()
+        .map(|value| {
+            parse_dns_server(value).map(|(ip, port)| SocketAddr::new(ip, port).to_string())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let key = format!(
+        "{}|{dns_timeout:?}|{read_timeout:?}",
+        if dns_override {
+            normalized.join(",")
+        } else {
+            "session".to_string()
+        }
+    );
+    let resolver = if dns_override {
+        build_custom_dns_resolver(normalized, dns_timeout)?
+    } else {
+        state.dns_resolver.clone()
+    };
+    if !cache_route || !state.fingerprint_pool {
+        return build_http3_client(state, resolver, read_timeout);
+    }
+    let cell = {
+        let mut clients = state
+            .http3_clients
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?;
+        if let Some(cell) = clients.get(&key) {
+            cell.clone()
+        } else {
+            let cell = Arc::new(OnceCell::new());
+            clients.put(key, cell.clone());
+            cell
+        }
+    };
+    cell.get_or_try_init(|| build_http3_client(state, resolver, read_timeout))
+        .cloned()
+}
+
+async fn selected_http3_client_async(
+    state: Arc<SessionState>,
+    dns_override: bool,
+    dns_servers: Vec<String>,
+    dns_timeout: Option<f64>,
+    read_timeout: Option<Duration>,
+    cache_route: bool,
+) -> PyResult<reqwest::Client> {
+    selected_http3_client(
+        &state,
+        dns_override,
+        dns_servers,
+        dns_timeout,
+        read_timeout,
+        cache_route,
+    )
 }
 
 fn random_variant(count: usize) -> usize {
@@ -1660,6 +1778,38 @@ fn parse_method(method: &str) -> PyResult<Method> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestHttpVersion {
+    Auto,
+    Http1,
+    Http2,
+    Http3,
+}
+
+fn parse_request_http_version(version: &str) -> PyResult<RequestHttpVersion> {
+    match version.to_ascii_lowercase().as_str() {
+        "auto" | "default" => Ok(RequestHttpVersion::Auto),
+        "http1" | "http1.1" | "http/1.1" => Ok(RequestHttpVersion::Http1),
+        "http2" | "h2" | "http/2" => Ok(RequestHttpVersion::Http2),
+        "http3" | "h3" | "http/3" => Ok(RequestHttpVersion::Http3),
+        _ => Err(PyRuntimeError::new_err(
+            "http_version必须是auto、http1、http2或http3",
+        )),
+    }
+}
+
+fn apply_wreq_request_version(
+    request: wreq::RequestBuilder,
+    version: RequestHttpVersion,
+) -> wreq::RequestBuilder {
+    match version {
+        RequestHttpVersion::Auto => request,
+        RequestHttpVersion::Http1 => request.version(Version::HTTP_11),
+        RequestHttpVersion::Http2 => request.version(Version::HTTP_2),
+        RequestHttpVersion::Http3 => unreachable!("HTTP/3请求必须走QUIC后端"),
+    }
+}
+
 fn parse_websocket_version(version: &str) -> PyResult<Version> {
     match version.to_ascii_lowercase().as_str() {
         "http1" | "http1.1" | "http/1.1" => Ok(Version::HTTP_11),
@@ -1794,6 +1944,221 @@ fn prepare_headers(
     Ok(headers)
 }
 
+fn http3_headers_for_url(
+    state: &SessionState,
+    url: &str,
+    base_headers: &HeaderMap,
+) -> PyResult<HeaderMap> {
+    let mut headers = base_headers.clone();
+    if headers.contains_key(COOKIE) {
+        return Ok(headers);
+    }
+    let values = cookie_pairs(&state.cookie_jar, url)?;
+    if !values.is_empty() {
+        let cookie = values
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        headers.insert(COOKIE, HeaderValue::from_str(&cookie).map_err(to_py_error)?);
+    }
+    Ok(headers)
+}
+
+fn store_http3_response_cookies(state: &SessionState, url: &str, headers: &HeaderMap) {
+    if !state.cookie_store {
+        return;
+    }
+    for value in headers.get_all(SET_COOKIE) {
+        if let Ok(value) = value.to_str() {
+            state.cookie_jar.add(value, url);
+        }
+    }
+}
+
+fn same_origin(first: &Url, second: &Url) -> bool {
+    first.scheme() == second.scheme()
+        && first.host_str() == second.host_str()
+        && first.port_or_known_default() == second.port_or_known_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_http3_request(
+    state: &SessionState,
+    client: &reqwest::Client,
+    mut method: Method,
+    mut url: String,
+    mut headers: HeaderMap,
+    mut body: Option<Vec<u8>>,
+    timeout: Duration,
+    allow_redirects: bool,
+    max_redirects: usize,
+) -> PyResult<(reqwest::Response, Vec<NativeHistoryEntry>, String)> {
+    let parsed = Url::parse(&url).map_err(to_py_error)?;
+    if parsed.scheme() != "https" {
+        return Err(PyRuntimeError::new_err("HTTP/3模式只支持https:// URL"));
+    }
+    let mut history = Vec::new();
+    let mut redirect_count = 0usize;
+    loop {
+        let request_headers = http3_headers_for_url(state, &url, &headers)?;
+        let mut request = client
+            .request(method.clone(), &url)
+            .version(Version::HTTP_3)
+            .headers(request_headers)
+            .timeout(timeout);
+        if let Some(value) = body.clone() {
+            request = request.body(value);
+        }
+        let response = request.send().await.map_err(to_py_error)?;
+        if response.version() != Version::HTTP_3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "HTTP/3服务器返回了非HTTP/3响应: {:?}",
+                response.version()
+            )));
+        }
+        store_http3_response_cookies(state, &url, response.headers());
+        let status = response.status().as_u16();
+        let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308);
+        let location = response.headers().get(LOCATION).cloned();
+        if !allow_redirects || !is_redirect || location.is_none() {
+            return Ok((response, history, url));
+        }
+        if redirect_count >= max_redirects {
+            return Err(PyRuntimeError::new_err(format!(
+                "重定向次数超过max_redirects限制: {max_redirects}"
+            )));
+        }
+        let current = Url::parse(&url).map_err(to_py_error)?;
+        let location = location
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .ok_or_else(|| PyRuntimeError::new_err("HTTP/3重定向Location不是有效文本"))?;
+        let target = current.join(&location).map_err(to_py_error)?;
+        if target.scheme() != "https" {
+            return Err(PyRuntimeError::new_err("HTTP/3重定向目标必须使用https://"));
+        }
+        history.push((
+            status,
+            url.clone(),
+            target.to_string(),
+            native_headers_from_map(response.headers()).raw,
+        ));
+        if !same_origin(&current, &target) {
+            headers.remove(AUTHORIZATION);
+            headers.remove(PROXY_AUTHORIZATION);
+            headers.remove(COOKIE);
+            headers.remove(HOST);
+        }
+        if status == 303 || ((status == 301 || status == 302) && method == Method::POST) {
+            method = Method::GET;
+            body = None;
+            headers.remove(CONTENT_LENGTH);
+            headers.remove(CONTENT_TYPE);
+        }
+        url = target.into();
+        redirect_count += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_http3_request(
+    _permit: OwnedSemaphorePermit,
+    state: Arc<SessionState>,
+    client: reqwest::Client,
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    allow_redirects: bool,
+    max_redirects: usize,
+    fingerprint_id: String,
+    profile: String,
+    max_response_bytes: usize,
+) -> PyResult<RawNativeResponse> {
+    let (response, history, final_url) = send_http3_request(
+        &state,
+        &client,
+        method,
+        url,
+        headers,
+        body,
+        timeout,
+        allow_redirects,
+        max_redirects,
+    )
+    .await?;
+    let status = response.status().as_u16();
+    let response_headers = native_headers_from_map(response.headers());
+    let content = collect_response_body(response.bytes_stream(), max_response_bytes).await?;
+    Ok((
+        status,
+        response_headers,
+        content,
+        fingerprint_id,
+        profile,
+        final_url,
+        "HTTP/3".to_string(),
+        history,
+        None,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_http3_stream_request(
+    permit: OwnedSemaphorePermit,
+    state: Arc<SessionState>,
+    client: reqwest::Client,
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    allow_redirects: bool,
+    max_redirects: usize,
+    fingerprint_id: String,
+    profile: String,
+) -> PyResult<NativeStreamResponse> {
+    let (response, history, final_url) = send_http3_request(
+        &state,
+        &client,
+        method,
+        url,
+        headers,
+        body,
+        timeout,
+        allow_redirects,
+        max_redirects,
+    )
+    .await?;
+    let status_code = response.status().as_u16();
+    let headers = native_headers_from_map(response.headers()).raw;
+    let stream: NativeBodyStream = Box::pin(
+        response
+            .bytes_stream()
+            .map(|result| result.map_err(|error| error.to_string())),
+    );
+    Ok(NativeStreamResponse {
+        status_code,
+        headers,
+        url: final_url,
+        fingerprint_id,
+        impersonate: profile,
+        http_version: "HTTP/3".to_string(),
+        history,
+        state: Arc::new(AsyncMutex::new(StreamState {
+            stream: Some(stream),
+            buffered: Vec::new(),
+            offset: 0,
+            terminal_error: None,
+        })),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_notify: Arc::new(Notify::new()),
+        read_active: Arc::new(AtomicBool::new(false)),
+        permit: Arc::new(Mutex::new(Some(permit))),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_request(
     _permit: OwnedSemaphorePermit,
@@ -1807,6 +2172,7 @@ async fn execute_request(
     proxy: Option<Proxy>,
     allow_redirects: bool,
     max_redirects: usize,
+    request_version: RequestHttpVersion,
     fingerprint_id: String,
     profile: String,
     transfer_stats: bool,
@@ -1823,8 +2189,7 @@ async fn execute_request(
     } else {
         None
     };
-    let mut request = client
-        .request(method, &url)
+    let mut request = apply_wreq_request_version(client.request(method, &url), request_version)
         .timeout(timeout)
         .redirect(if allow_redirects {
             redirect::Policy::limited(max_redirects)
@@ -1902,11 +2267,11 @@ async fn execute_stream_request(
     proxy: Option<Proxy>,
     allow_redirects: bool,
     max_redirects: usize,
+    request_version: RequestHttpVersion,
     fingerprint_id: String,
     profile: String,
 ) -> PyResult<NativeStreamResponse> {
-    let mut request = client
-        .request(method, &url)
+    let mut request = apply_wreq_request_version(client.request(method, &url), request_version)
         .timeout(timeout)
         .redirect(if allow_redirects {
             redirect::Policy::limited(max_redirects)
@@ -1941,13 +2306,19 @@ async fn execute_stream_request(
         })
         .collect();
     let final_url = response.uri().to_string();
-    let stream: NativeBodyStream = Box::pin(response.bytes_stream());
+    let http_version = http_version_name(response.version()).to_string();
+    let stream: NativeBodyStream = Box::pin(
+        response
+            .bytes_stream()
+            .map(|result| result.map_err(|error| error.to_string())),
+    );
     Ok(NativeStreamResponse {
         status_code,
         headers: response_headers,
         url: final_url,
         fingerprint_id,
         impersonate: profile,
+        http_version,
         history,
         state: Arc::new(AsyncMutex::new(StreamState {
             stream: Some(stream),
@@ -1976,6 +2347,7 @@ async fn execute_multipart_request(
     proxy: Option<Proxy>,
     allow_redirects: bool,
     max_redirects: usize,
+    request_version: RequestHttpVersion,
     fingerprint_id: String,
     profile: String,
     max_response_bytes: usize,
@@ -1994,8 +2366,7 @@ async fn execute_multipart_request(
         }
         form = form.part(name, part);
     }
-    let mut request = client
-        .request(method, &url)
+    let mut request = apply_wreq_request_version(client.request(method, &url), request_version)
         .timeout(timeout)
         .redirect(if allow_redirects {
             redirect::Policy::limited(max_redirects)
@@ -2605,6 +2976,8 @@ struct NativeStreamResponse {
     #[pyo3(get)]
     impersonate: String,
     #[pyo3(get)]
+    http_version: String,
+    #[pyo3(get)]
     history: Vec<NativeHistoryEntry>,
     state: Arc<AsyncMutex<StreamState>>,
     closed: Arc<AtomicBool>,
@@ -2906,6 +3279,7 @@ impl NativeSession {
             happy_eyeballs_timeout,
             dns_resolver,
             dns_overrides: Arc::new(dns_overrides),
+            http3_clients: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
             cookie_jar: Arc::new(Jar::default()),
             cookie_store,
             selected_variant: AtomicUsize::new(selected_variant),
@@ -2953,7 +3327,7 @@ impl NativeSession {
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request(
         &self,
         py: Python<'_>,
@@ -2966,6 +3340,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         transfer_stats: bool,
@@ -2976,6 +3351,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
         let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
@@ -2983,42 +3359,82 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
+            ));
+        }
+        if request_version == RequestHttpVersion::Http3 && transfer_stats {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持transfer_stats TCP隧道计量",
+            ));
+        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let result = py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = runtime.block_on(acquire_connection_slot(&state))?;
-            let variant = &state.variants[index];
-            let client = selected_request_client(
-                &state,
-                index,
-                dns_override,
-                dns_servers,
-                dns_timeout,
-                cache_route,
-                proxy_generation,
-            )?;
-            let fingerprint_id = variant.record.id.clone();
+            let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
-            let result = runtime.block_on(execute_request(
-                permit,
-                client,
-                method,
-                url,
-                headers,
-                body,
-                timeout,
-                read_timeout,
-                proxy,
-                allow_redirects,
-                max_redirects,
-                fingerprint_id,
-                profile,
-                transfer_stats,
-                proxy_url,
-                state.max_response_bytes,
-            ));
+            let result = if request_version == RequestHttpVersion::Http3 {
+                runtime.block_on(async {
+                    let client = selected_http3_client_async(
+                        state.clone(),
+                        dns_override,
+                        dns_servers,
+                        dns_timeout,
+                        read_timeout,
+                        cache_route,
+                    )
+                    .await?;
+                    execute_http3_request(
+                        permit,
+                        state.clone(),
+                        client,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        timeout,
+                        allow_redirects,
+                        max_redirects,
+                        fingerprint_id,
+                        profile,
+                        state.max_response_bytes,
+                    )
+                    .await
+                })
+            } else {
+                let client = selected_request_client(
+                    &state,
+                    index,
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    cache_route,
+                    proxy_generation,
+                )?;
+                runtime.block_on(execute_request(
+                    permit,
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    read_timeout,
+                    proxy,
+                    allow_redirects,
+                    max_redirects,
+                    request_version,
+                    fingerprint_id,
+                    profile,
+                    transfer_stats,
+                    proxy_url,
+                    state.max_response_bytes,
+                ))
+            };
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3028,7 +3444,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -3041,6 +3457,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         transfer_stats: bool,
@@ -3051,12 +3468,23 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
         let index = request_variant(&self.state);
         let state = self.state.clone();
         let method = parse_method(&method)?;
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
+            ));
+        }
+        if request_version == RequestHttpVersion::Http3 && transfer_stats {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持transfer_stats TCP隧道计量",
+            ));
+        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
@@ -3065,35 +3493,64 @@ impl NativeSession {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
-            let client = selected_request_client_async(
-                state.clone(),
-                index,
-                dns_override,
-                dns_servers,
-                dns_timeout,
-                cache_route,
-                proxy_generation,
-            )
-            .await?;
-            let response = execute_request(
-                permit,
-                client,
-                method,
-                url,
-                headers,
-                body,
-                timeout,
-                read_timeout,
-                proxy,
-                allow_redirects,
-                max_redirects,
-                fingerprint_id,
-                profile,
-                transfer_stats,
-                proxy_url,
-                state.max_response_bytes,
-            )
-            .await?;
+            let response = if request_version == RequestHttpVersion::Http3 {
+                let client = selected_http3_client_async(
+                    state.clone(),
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    read_timeout,
+                    cache_route,
+                )
+                .await?;
+                execute_http3_request(
+                    permit,
+                    state.clone(),
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    allow_redirects,
+                    max_redirects,
+                    fingerprint_id,
+                    profile,
+                    state.max_response_bytes,
+                )
+                .await?
+            } else {
+                let client = selected_request_client_async(
+                    state.clone(),
+                    index,
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    cache_route,
+                    proxy_generation,
+                )
+                .await?;
+                execute_request(
+                    permit,
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    read_timeout,
+                    proxy,
+                    allow_redirects,
+                    max_redirects,
+                    request_version,
+                    fingerprint_id,
+                    profile,
+                    transfer_stats,
+                    proxy_url,
+                    state.max_response_bytes,
+                )
+                .await?
+            };
             reservation.commit();
             Python::attach(|py| into_native_response(py, response))
         })
@@ -3223,7 +3680,7 @@ impl NativeSession {
 
     // 流式入口与普通入口使用相同选项，确保两种响应模式语义一致。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream(
         &self,
         py: Python<'_>,
@@ -3236,6 +3693,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         dns_override: bool,
@@ -3245,6 +3703,7 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
         let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
@@ -3252,39 +3711,73 @@ impl NativeSession {
         let headers = prepare_headers(&state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&state, proxy_override, proxy)?;
+        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
+            ));
+        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = runtime.block_on(acquire_connection_slot(&state))?;
-            let variant = &state.variants[index];
-            let client = selected_request_client(
-                &state,
-                index,
-                dns_override,
-                dns_servers,
-                dns_timeout,
-                cache_route,
-                proxy_generation,
-            )?;
-            let fingerprint_id = variant.record.id.clone();
+            let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
-            let result = runtime.block_on(execute_stream_request(
-                permit,
-                client,
-                method,
-                url,
-                headers,
-                body,
-                timeout,
-                read_timeout,
-                proxy,
-                allow_redirects,
-                max_redirects,
-                fingerprint_id,
-                profile,
-            ));
+            let result = if request_version == RequestHttpVersion::Http3 {
+                runtime.block_on(async {
+                    let client = selected_http3_client_async(
+                        state.clone(),
+                        dns_override,
+                        dns_servers,
+                        dns_timeout,
+                        read_timeout,
+                        cache_route,
+                    )
+                    .await?;
+                    execute_http3_stream_request(
+                        permit,
+                        state.clone(),
+                        client,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        timeout,
+                        allow_redirects,
+                        max_redirects,
+                        fingerprint_id,
+                        profile,
+                    )
+                    .await
+                })
+            } else {
+                let client = selected_request_client(
+                    &state,
+                    index,
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    cache_route,
+                    proxy_generation,
+                )?;
+                runtime.block_on(execute_stream_request(
+                    permit,
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    read_timeout,
+                    proxy,
+                    allow_redirects,
+                    max_redirects,
+                    request_version,
+                    fingerprint_id,
+                    profile,
+                ))
+            };
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3293,7 +3786,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_stream_async<'py>(
         &self,
         py: Python<'py>,
@@ -3306,6 +3799,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         dns_override: bool,
@@ -3315,11 +3809,17 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
         let (proxy_url, proxy, proxy_generation) =
             selected_proxy_snapshot(&self.state, proxy_override, proxy)?;
+        if request_version == RequestHttpVersion::Http3 && proxy_url.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输",
+            ));
+        }
         let (cache_route, cached_origin_reservation) =
             cache_route_allowed(&self.state, &url, proxy_url.as_deref())?;
         let state = self.state.clone();
@@ -3329,32 +3829,60 @@ impl NativeSession {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
             let permit = acquire_connection_slot(&state).await?;
-            let client = selected_request_client_async(
-                state.clone(),
-                index,
-                dns_override,
-                dns_servers,
-                dns_timeout,
-                cache_route,
-                proxy_generation,
-            )
-            .await?;
-            let result = execute_stream_request(
-                permit,
-                client,
-                method,
-                url,
-                headers,
-                body,
-                timeout,
-                read_timeout,
-                proxy,
-                allow_redirects,
-                max_redirects,
-                fingerprint_id,
-                profile,
-            )
-            .await;
+            let result = if request_version == RequestHttpVersion::Http3 {
+                let client = selected_http3_client_async(
+                    state.clone(),
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    read_timeout,
+                    cache_route,
+                )
+                .await?;
+                execute_http3_stream_request(
+                    permit,
+                    state.clone(),
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    allow_redirects,
+                    max_redirects,
+                    fingerprint_id,
+                    profile,
+                )
+                .await
+            } else {
+                let client = selected_request_client_async(
+                    state.clone(),
+                    index,
+                    dns_override,
+                    dns_servers,
+                    dns_timeout,
+                    cache_route,
+                    proxy_generation,
+                )
+                .await?;
+                execute_stream_request(
+                    permit,
+                    client,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                    read_timeout,
+                    proxy,
+                    allow_redirects,
+                    max_redirects,
+                    request_version,
+                    fingerprint_id,
+                    profile,
+                )
+                .await
+            };
             if result.is_ok() {
                 reservation.commit();
             }
@@ -3364,7 +3892,7 @@ impl NativeSession {
 
     // multipart文件由Tokio直接流式读取，Python只传路径和元数据。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart(
         &self,
         py: Python<'_>,
@@ -3378,6 +3906,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         dns_override: bool,
@@ -3387,6 +3916,12 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
+        if request_version == RequestHttpVersion::Http3 {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持multipart文件上传",
+            ));
+        }
         let index = request_variant(&self.state);
         let state = self.state.clone();
         let runtime = shared_runtime()?;
@@ -3425,6 +3960,7 @@ impl NativeSession {
                 proxy,
                 allow_redirects,
                 max_redirects,
+                request_version,
                 fingerprint_id,
                 profile,
                 state.max_response_bytes,
@@ -3438,7 +3974,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("auto"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
     fn request_multipart_async<'py>(
         &self,
         py: Python<'py>,
@@ -3452,6 +3988,7 @@ impl NativeSession {
         proxy_override: bool,
         proxy: Option<String>,
         cookies: Option<Vec<(String, String)>>,
+        http_version: String,
         allow_redirects: bool,
         max_redirects: usize,
         dns_override: bool,
@@ -3461,6 +3998,12 @@ impl NativeSession {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
         let read_timeout = parse_optional_timeout("read_timeout", read_timeout)?;
+        let request_version = parse_request_http_version(&http_version)?;
+        if request_version == RequestHttpVersion::Http3 {
+            return Err(PyRuntimeError::new_err(
+                "HTTP/3模式暂不支持multipart文件上传",
+            ));
+        }
         let index = request_variant(&self.state);
         let method = parse_method(&method)?;
         let headers = prepare_headers(&self.state, &url, headers, cookies)?;
@@ -3498,6 +4041,7 @@ impl NativeSession {
                 proxy,
                 allow_redirects,
                 max_redirects,
+                request_version,
                 fingerprint_id,
                 profile,
                 state.max_response_bytes,
@@ -3544,6 +4088,11 @@ impl NativeSession {
                 .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?
                 .clear();
         }
+        self.state
+            .http3_clients
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .clear();
         self.state
             .fingerprint_pool_members
             .store(Arc::new(Vec::new()));
@@ -3659,6 +4208,11 @@ impl NativeSession {
                 .map_err(|_| PyRuntimeError::new_err("请求级DNS Client缓存锁已损坏"))?
                 .clear();
         }
+        self.state
+            .http3_clients
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .clear();
         self.state
             .fingerprint_pool_members
             .store(Arc::new(Vec::new()));

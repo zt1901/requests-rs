@@ -822,6 +822,7 @@ def main():
                         False,
                         None,
                         None,
+                        "auto",
                         True,
                         10,
                     )

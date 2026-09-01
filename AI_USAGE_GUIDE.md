@@ -2,9 +2,9 @@
 
 ## 定位
 
-`requests_rust`是Python 3.10+的浏览器指纹HTTP、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust负责DNS、IPv4/IPv6、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、WebSocket、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径直接使用进程级Tokio Runtime，不经过 `asyncio.to_thread`。
+`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3直连、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2及浏览器TLS指纹，通过Reqwest/Quinn/Rustls执行HTTP/3，通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
 
-当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel已在对应原生GitHub runner完成构建和安装冒烟；必须安装与平台、CPU匹配的wheel，安装冒烟不替代完整协议回归。
+当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Rustls、Quinn、Reqwest、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
 
 ## 导入
 
@@ -142,6 +142,7 @@ with Session(impersonate="chrome150") as session:
 | `files` | 文件路径Mapping；由Rust Tokio文件流读取 |
 | `timeout` | 请求总超时，必须是有限正数 |
 | `read_timeout` | Body读取超时，必须是有限正数 |
+| `http_version` | `auto`、`http1`、`http2`或`http3`；Session默认和单请求覆盖均支持 |
 | `stream` | `True`时不预读完整Body |
 | `proxy` | 单请求代理覆盖；`None`表示该请求直连；省略表示使用Session代理 |
 | `proxies` | curl_cffi 风格代理映射，如 `{"http": "http://...", "https": "http://..."}`；按目标 URL 协议选择，也接受 `http://`、`https://`、`all://`、`all` 键；不能与 `proxy` 同时传入 |
@@ -174,6 +175,14 @@ asyncio.run(main())
 ```
 
 取消Python awaitable会丢弃对应Rust Future。已经发出的网络数据不能撤回，但不会占用Python工作线程。
+
+## HTTP/3
+
+`http_version="http3"`或`"h3"`进入Reqwest/Quinn/Rustls后端，只发送UDP/QUIC HTTP/3，不执行`Alt-Svc`探测或HTTP/2回退。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
+
+HTTP/3只支持直连`https://`。当前HTTP CONNECT、SOCKS5、multipart、WebSocket和`transfer_stats`都是TCP语义，与HTTP/3组合时必须明确报错。代理失败时仍只轮换代理session ID并复用业务Session；不得为了绕过该限制在库内重建Session。
+
+HTTP/3后端不读取wreq的BoringSSL TLS配置。Profile默认Header仍生效，`fingerprint_id`仍表示所选记录，但HTTP/3的Rustls ClientHello、QUIC Transport Parameters、连接ID及QPACK状态不等同于真实Chrome/Edge，不能宣称浏览器QUIC指纹对撞。
 
 ## WebSocket
 
@@ -388,18 +397,18 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 需要GIL的阶段：解析Python参数、Python JSON编码、创建Python awaitable、把Rust结果转换为Python对象、执行用户Python代码。
 
-不持有GIL的阶段：DNS、TCP、代理握手、TLS、HTTP、连接池、重定向、Body读写、multipart文件读取、Cookie更新、超时和指纹轮换。
+不持有GIL的阶段：DNS、TCP、UDP/QUIC、代理握手、TLS、HTTP、连接池、重定向、Body读写、multipart文件读取、Cookie更新、超时和指纹轮换。
 
 同步请求等待期间通过PyO3释放GIL。异步请求不使用Python线程池。冷Client构建仍在Tokio `spawn_blocking`中执行，进程级Tokio Runtime将该阻塞池上限固定为32；Python Future结果由一条进程级专用线程取得GIL并用每次调用捕获的事件循环执行`call_soon_threadsafe`，不再与冷Client构建争抢阻塞池。用户回调仍由对应Python事件循环执行，不在完成线程中执行。
 
 ## 关闭语义
 
-`Session.close()`和 `await AsyncSession.close()`禁止新请求并释放缓存的空闲Client。关闭前已经接受的请求持有独立Client引用，可以继续完成。关闭后请求、代理修改和Cookie操作统一失败。
+`Session.close()`和 `await AsyncSession.close()`禁止新请求并释放缓存的wreq与Reqwest Client、TCP和QUIC连接。关闭前已经接受的请求持有独立Client引用，可以继续完成。关闭后请求、代理修改和Cookie操作统一失败。
 
 ## 错误边界
 
 - `timeout`、`connect_timeout`、`read_timeout`和非空`happy_eyeballs_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
-- 无效方法、Header、代理、URL、重定向、连接、TLS和Body错误转换为Python异常。
+- 无效方法、Header、代理、URL、重定向、连接、TLS、QUIC和Body错误转换为Python异常；HTTP/3不允许代理、明文URL、multipart、WebSocket或TCP传输计量。
 - `raise_for_status()`在状态码不属于200至399时抛出 `RuntimeError`。
 - `Response.ok`定义为 `200 <= status_code < 400`。
 
@@ -408,6 +417,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 - Chrome 150真实浏览器与requests_rust：41/41，100%。
 - Firefox 151五次独立完整握手的核心TLS/HTTP2字段全部一致，已收敛为一条火种；同路由50请求只出现固定完整握手JA3及增加PSK扩展41的恢复JA3，`fingerprint_id`始终唯一。
 - Chrome/Edge在本地keep-alive代理上连续请求只建立1条物理连接；指纹捕获器主动关闭连接后50次自然重连得到50个不同JA3，强制20条新TLS连接时JA3N、JA4和`fingerprint_id`保持唯一。Firefox保持固定完整握手与PSK恢复结构。
+- 本地真实UDP/QUIC服务验证HTTP/3同步/异步GET与POST、同连接并发、静态DNS覆盖、重定向、Set-Cookie、Body上限、普通/流式Body、版本字段、取消和拒绝边界；公网证书验证直连`cloudflare-quic.com`返回`HTTP/3`响应。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
 - WebSocket覆盖同步/异步、WS/WSS、HTTP代理、WSS CONNECT预认证、SOCKS5、服务端Close、控制帧边界、50条不同代理身份和25 WS + 15 HTTP + 10 SOCKS5混合上限。
@@ -418,7 +428,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 - 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
 - 当前manylinux目标依赖glibc，不代表Alpine musl支持。
-- 当前不实现HTTP/3发送。
+- HTTP/3使用Reqwest/Quinn/Rustls直连，不支持当前TCP代理、multipart、WebSocket和`transfer_stats`，也不复现wreq/BoringSSL浏览器TLS或QUIC指纹。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
 - TCP字段来自浏览器和requests_rust共享的Windows内核网络栈，不代表能在其他系统伪造Windows TCP SYN。
 - 普通响应Body最终需要复制为Python `bytes`；Rust内部直接保留wreq返回的 `Bytes`，已去掉中间 `Bytes -> Vec<u8>`完整拷贝。大文件仍应使用流式接口降低峰值内存。

@@ -106,6 +106,8 @@ Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版�
 
 新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
 
+HTTP/3必须作为独立传输指纹边界管理：当前实现使用Reqwest/Quinn/Rustls，不读取wreq/BoringSSL的Chrome、Edge或Firefox TLS参数。Profile Header和业务模板仍可复用，但Rustls ClientHello、QUIC Transport Parameters、Connection ID、QPACK动态表与浏览器真值未对撞前，不得将`response.http_version == "HTTP/3"`解释为浏览器HTTP/3指纹一致。
+
 ## 已证伪路线：Rust原生batch与同tick隐式合批
 
 本项目明确不新增`session.batch()`、`submit_many()`、Rust常驻业务Worker队列或其他把一批业务请求整体搬进Rust调度的接口。

@@ -1,6 +1,6 @@
 # requests_rust
 
-`requests_rust` 是一个面向浏览器指纹 HTTP、代理和 WebSocket 的 Python 原生扩展。Python 负责请求参数和结果消费，Rust 负责 DNS、TCP、代理、BoringSSL TLS、HTTP/1.1、HTTP/2、WebSocket、连接池和并发调度；公开接口保持接近 `curl_cffi.requests` 的同步和异步调用习惯。
+`requests_rust` 是一个面向浏览器指纹 HTTP、HTTP/3直连、代理和 WebSocket 的 Python 原生扩展。Python 负责请求参数和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过Reqwest/Quinn/Rustls执行HTTP/3，公开接口保持接近`curl_cffi.requests`的同步和异步调用习惯。
 
 ## API 命名兼容
 
@@ -10,7 +10,7 @@
 
 ## 优点
 
-- **Rust 网络路径**：DNS、代理、TLS、HTTP/1.1/2、WebSocket、连接池、Cookie、超时、流式 Body 和 multipart 均由 Rust/Tokio 执行。同步请求等待及自定义指纹文件读取、解析不占用 GIL。
+- **Rust 网络路径**：DNS、代理、BoringSSL HTTP/1.1/2、Rustls/Quinn HTTP/3、WebSocket、连接池、Cookie、超时、流式 Body 和 multipart 均由Rust/Tokio执行。同步请求等待及自定义指纹文件读取、解析不占用GIL。
 - **浏览器基准指纹**：TLS、HTTP/2、HPACK、请求头和优先级数据由真实浏览器采集后固化为 profile。当前内置 `chrome146`、`chrome150`、`edge152`、`firefox151`；这些名称代表已采集并验证的固定快照，不等同于官网当前 Stable，也不会自动随浏览器更新。
 - **实例级指纹隔离**：每个 `Session` 可在构造时从不同 JSON 文件独立加载 profile，不修改进程全局指纹数据，也不影响其他实例。
 - **长期并发状态**：一个`AsyncSession`持续复用Cookie Jar、DNS配置、Client和匹配路由的连接池；Chrome/Edge只在自然新建TLS连接时随机ClientHello扩展顺序。代理、请求头与请求级Cookie仍可逐条独立传入。
@@ -69,7 +69,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 ## 核心能力
 
 - 同步与原生 asyncio API：`Session`、`AsyncSession`、`get/post/put/patch/delete`
-- HTTP/1.1、HTTP/2、重定向、总超时与 Body 读取超时
+- HTTP/1.1、HTTP/2及显式HTTP/3直连，支持重定向、总超时与Body读取超时
 - IPv4、IPv6 和 RFC 6555 Happy Eyeballs
 - Session 级静态 `resolve` 映射，以及 Session/请求级 Rust Hickory 自定义 DNS 服务器
 - 固定 profile 或按请求轮换 profile
@@ -84,7 +84,7 @@ profile 默认 Header 仅在调用方未传同名 Header 时兜底。浏览器 C
 
 ## 限制
 
-- 当前不发送 HTTP/3。
+- HTTP/3使用Reqwest/Quinn/Rustls，仅支持直连HTTPS普通/流式请求；不支持当前TCP代理、multipart、WebSocket、`transfer_stats`或浏览器QUIC指纹模拟。
 - 原生 wheel 必须与操作系统和 CPU 架构匹配；当前五个平台目标均已有构建产物，其中四个云端平台通过原生安装冒烟，完整协议回归以 Windows x64 为准。
 - Linux 构建目标为 glibc manylinux，不等同于 Alpine musl 支持。
 - 不同 profile 不共享 TLS/HTTP/2 连接池，这是指纹隔离的必要限制。

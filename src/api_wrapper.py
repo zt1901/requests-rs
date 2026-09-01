@@ -161,6 +161,27 @@ def _validate_timeout(name: str, value: float | None, *, optional: bool = False)
         raise ValueError(f"{name}必须是有限正数")
 
 
+def _normalize_http_version(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("http_version必须是字符串")
+    aliases = {
+        "auto": "auto",
+        "default": "auto",
+        "http1": "http1",
+        "http1.1": "http1",
+        "http/1.1": "http1",
+        "http2": "http2",
+        "h2": "http2",
+        "http/2": "http2",
+        "http3": "http3",
+        "h3": "http3",
+        "http/3": "http3",
+    }
+    try:
+        return aliases[value.lower()]
+    except KeyError as error:
+        raise ValueError("http_version必须是auto、http1、http2或http3") from error
+
 class Response:
     def __init__(
         self,
@@ -519,6 +540,7 @@ class Session:
         max_response_bytes: int = 64 * 1024 * 1024,
         max_websocket_message_bytes: int = 16 * 1024 * 1024,
         cookie_store: bool = True,
+        http_version: str = "auto",
     ) -> None:
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
@@ -557,6 +579,7 @@ class Session:
             raise ValueError("max_websocket_message_bytes必须是正整数")
         if not isinstance(cookie_store, bool):
             raise TypeError("cookie_store必须是bool")
+        http_version = _normalize_http_version(http_version)
         if proxy is not None and proxies is not None:
             raise TypeError("proxy和proxies不能同时传入")
         if proxies is not None and not isinstance(proxies, Mapping):
@@ -596,6 +619,7 @@ class Session:
         self.max_response_bytes = max_response_bytes
         self.max_websocket_message_bytes = max_websocket_message_bytes
         self.cookie_store = cookie_store
+        self.http_version = http_version
         self._native = NativeSession(
             impersonate,
             fingerprint_rotation,
@@ -654,6 +678,7 @@ class Session:
         proxy: str | None | object,
         proxies: ProxyInput | None,
         max_redirects: int,
+        http_version: str | None,
     ):
         request_timeout = self.timeout if timeout is None else timeout
         _validate_timeout("timeout", request_timeout)
@@ -688,6 +713,12 @@ class Session:
         else:
             proxy_override = False
             request_proxy = None
+        request_http_version = (
+            self.http_version if http_version is None else _normalize_http_version(http_version)
+        )
+        effective_proxy = request_proxy if proxy_override else self.proxy
+        if request_http_version == "http3" and effective_proxy is not None:
+            raise ValueError("HTTP/3模式暂不支持HTTP或SOCKS代理；QUIC需要UDP传输")
         if data is not None and json is not None:
             raise ValueError("data和json不能同时传入")
         if json is not None:
@@ -719,6 +750,7 @@ class Session:
             proxy_override,
             request_proxy,
             request_cookies,
+            request_http_version,
         )
 
     def _prepare_websocket(
@@ -821,6 +853,7 @@ class Session:
         transfer_stats: bool = False,
         dns_servers: Sequence[str] | None = None,
         dns_timeout: float | None = None,
+        http_version: str | None = None,
     ) -> Response:
         if files is not None and json is not None:
             raise ValueError("files不能和json同时使用")
@@ -850,6 +883,7 @@ class Session:
             proxy=proxy,
             proxies=proxies,
             max_redirects=max_redirects,
+            http_version=http_version,
         )
         (
             method,
@@ -861,7 +895,12 @@ class Session:
             proxy_override,
             request_proxy,
             request_cookies,
+            request_http_version,
         ) = prepared
+        if request_http_version == "http3" and files is not None:
+            raise ValueError("HTTP/3模式暂不支持multipart文件上传")
+        if request_http_version == "http3" and transfer_stats:
+            raise ValueError("HTTP/3模式暂不支持transfer_stats TCP隧道计量")
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -888,6 +927,7 @@ class Session:
                 proxy_override,
                 request_proxy,
                 request_cookies,
+                request_http_version,
                 allow_redirects,
                 max_redirects,
                 dns_override,
@@ -906,6 +946,7 @@ class Session:
                 proxy_override,
                 request_proxy,
                 request_cookies,
+                request_http_version,
                 allow_redirects,
                 max_redirects,
                 dns_override,
@@ -920,6 +961,7 @@ class Session:
                 fingerprint_id=native.fingerprint_id,
                 impersonate=native.impersonate,
                 stream=native,
+                http_version=native.http_version,
                 history=history,
             )
 
@@ -933,6 +975,7 @@ class Session:
             proxy_override,
             request_proxy,
             request_cookies,
+            request_http_version,
             allow_redirects,
             max_redirects,
             transfer_stats,
@@ -1007,6 +1050,7 @@ class AsyncSession:
         transfer_stats = kwargs.pop("transfer_stats", False)
         dns_servers = kwargs.pop("dns_servers", None)
         dns_timeout = kwargs.pop("dns_timeout", None)
+        http_version = kwargs.pop("http_version", None)
         data = kwargs.pop("data", None)
         json = kwargs.pop("json", None)
         if files is not None and json is not None:
@@ -1037,10 +1081,16 @@ class AsyncSession:
             proxy=kwargs.pop("proxy", _UNSET),
             proxies=kwargs.pop("proxies", None),
             max_redirects=max_redirects,
+            http_version=http_version,
         )
         if kwargs:
             unexpected = next(iter(kwargs))
             raise TypeError(f"request() got an unexpected keyword argument {unexpected!r}")
+        request_http_version = prepared[-1]
+        if request_http_version == "http3" and files is not None:
+            raise ValueError("HTTP/3模式暂不支持multipart文件上传")
+        if request_http_version == "http3" and transfer_stats:
+            raise ValueError("HTTP/3模式暂不支持transfer_stats TCP隧道计量")
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -1056,7 +1106,18 @@ class AsyncSession:
                     native_files.append((name, os.fspath(path), filename, content_type))
                 else:
                     native_files.append((name, os.fspath(file_value), None, None))
-            method, url, headers, _body, timeout, read_timeout, proxy_override, proxy, request_cookies = prepared
+            (
+                method,
+                url,
+                headers,
+                _body,
+                timeout,
+                read_timeout,
+                proxy_override,
+                proxy,
+                request_cookies,
+                request_http_version,
+            ) = prepared
             result = await self._session._native.request_multipart_async(
                 method,
                 url,
@@ -1068,6 +1129,7 @@ class AsyncSession:
                 proxy_override,
                 proxy,
                 request_cookies,
+                request_http_version,
                 allow_redirects,
                 max_redirects,
                 dns_override,
@@ -1212,6 +1274,7 @@ def _response_from_stream(native: Any, *, async_stream: bool = False) -> Respons
         fingerprint_id=native.fingerprint_id,
         impersonate=native.impersonate,
         stream=native,
+        http_version=native.http_version,
         history=_build_history(native.history, native.fingerprint_id, native.impersonate),
     )
     response._async_stream = async_stream
