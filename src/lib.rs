@@ -1,3 +1,5 @@
+mod profile_http3;
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
@@ -48,7 +50,7 @@ use wreq::{
     dns::{Addrs as DnsAddrs, Name as DnsName, Resolve as DnsResolve, Resolving},
     header::{
         AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderName,
-        HeaderValue, LOCATION, OrigHeaderMap, PROXY_AUTHORIZATION, SET_COOKIE,
+        HeaderValue, OrigHeaderMap, PROXY_AUTHORIZATION,
     },
     http2::{
         Http2Options, Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder,
@@ -89,23 +91,6 @@ impl DnsResolve for CustomDnsResolver {
     }
 }
 
-impl reqwest::dns::Resolve for CustomDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let resolver = self.resolver.clone();
-        Box::pin(async move {
-            let lookup = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: reqwest::dns::Addrs = Box::new(
-                lookup
-                    .iter()
-                    .map(|ip| SocketAddr::new(ip, 0))
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            );
-            Ok(addrs)
-        })
-    }
-}
-
 const 内置指纹: &str = include_str!("../fingerprints.json");
 const 版权说明: &str = include_str!("../NOTICE.txt");
 // 公开 API 包装作为资源编译进原生扩展，分发 wheel 不再包含明文 requests.py。
@@ -117,7 +102,6 @@ type RawNativeResponse = (
     u16,
     NativeHeaders,
     Bytes,
-    String,
     String,
     String,
     String,
@@ -207,8 +191,6 @@ struct NativeResponse {
     impersonate: String,
     #[pyo3(get)]
     http_version: String,
-    #[pyo3(get)]
-    fingerprint_scope: String,
     #[pyo3(get)]
     transfer_stats: Option<Py<NativeTransferStats>>,
     history: Vec<NativeHistoryEntry>,
@@ -410,6 +392,13 @@ fn parse_records(source: &str) -> Result<Vec<Arc<Record>>> {
             records,
         } => {
             validate_schema_version(schema_version, "捕获结果")?;
+            if let Some(schema_version) = schema_version
+                && records
+                    .iter()
+                    .any(|record| record.schema_version != Some(schema_version))
+            {
+                bail!("捕获结果schema_version={schema_version}与内部指纹记录不一致")
+            }
             records
         }
     };
@@ -437,6 +426,8 @@ struct Record {
     profile: String,
     tls: TlsCapture,
     http: HttpCapture,
+    #[serde(default)]
+    http3: Option<profile_http3::ProfileHttp3>,
     #[serde(skip)]
     emulation: OnceLock<Result<Emulation, String>>,
 }
@@ -513,9 +504,9 @@ struct Http2Priority {
 
 fn validate_schema_version(version: Option<u32>, scope: &str) -> Result<()> {
     if let Some(version) = version
-        && version != 1
+        && !matches!(version, 1 | 2)
     {
-        bail!("{scope}使用不支持的schema_version={version}，当前仅支持1")
+        bail!("{scope}使用不支持的schema_version={version}，当前仅支持1和2")
     }
     Ok(())
 }
@@ -536,6 +527,12 @@ fn ensure_unique_ids(values: &[u16], scope: &str) -> Result<()> {
 
 fn validate_record(record: &Record) -> Result<()> {
     validate_schema_version(record.schema_version, &format!("指纹{}", record.id))?;
+    match (record.schema_version, record.http3.as_ref()) {
+        (Some(2), Some(http3)) => profile_http3::validate(http3)?,
+        (Some(2), None) => bail!("schema_version=2的指纹必须包含完整http3模板"),
+        (_, Some(_)) => bail!("http3模板只能出现在schema_version=2指纹中"),
+        _ => {}
+    }
     if record.id.trim().is_empty() || record.profile.trim().is_empty() {
         bail!("指纹id和profile不能为空")
     }
@@ -1227,8 +1224,8 @@ struct SessionState {
     happy_eyeballs_timeout: Option<Duration>,
     dns_resolver: Option<CustomDnsResolver>,
     dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
-    // HTTP/3使用独立QUIC连接池；键包含DNS与读取超时，避免配置串用。
-    http3_clients: Mutex<LruCache<String, Arc<OnceCell<reqwest::Client>>>>,
+    // schema 2模板连接按指纹变体和origin隔离，并在Session生命周期内复用。
+    profile_http3_clients: Mutex<LruCache<String, Arc<Mutex<Option<profile_http3::H3Client>>>>>,
     // QUIC能力按origin和请求级DNS路由缓存；短期负缓存避免每次都等待UDP超时。
     http3_capabilities: Mutex<LruCache<String, Http3Capability>>,
     cookie_jar: Arc<Jar>,
@@ -1567,102 +1564,6 @@ async fn selected_request_client_async(
     })
     .await
     .map_err(|error| PyRuntimeError::new_err(format!("请求级DNS Client构建任务失败: {error}")))?
-}
-
-fn build_http3_client(
-    state: &SessionState,
-    resolver: Option<CustomDnsResolver>,
-    read_timeout: Option<Duration>,
-) -> PyResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .http3_prior_knowledge()
-        .https_only(true)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(!state.verify)
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(state.client_pool_max_size)
-        .http3_max_idle_timeout(Duration::from_secs(30));
-    if let Some(timeout) = state.connect_timeout {
-        builder = builder.connect_timeout(timeout);
-    }
-    if let Some(timeout) = read_timeout {
-        builder = builder.read_timeout(timeout);
-    }
-    if let Some(resolver) = resolver {
-        builder = builder.dns_resolver(Arc::new(resolver));
-    }
-    for (domain, addrs) in state.dns_overrides.iter() {
-        builder = builder.resolve_to_addrs(domain, addrs);
-    }
-    builder
-        .build()
-        .map_err(|error| PyRuntimeError::new_err(format!("无法构建HTTP/3 Client: {error:?}")))
-}
-
-fn selected_http3_client(
-    state: &SessionState,
-    dns_override: bool,
-    dns_servers: Vec<String>,
-    dns_timeout: Option<f64>,
-    read_timeout: Option<Duration>,
-    cache_route: bool,
-) -> PyResult<reqwest::Client> {
-    let normalized = dns_servers
-        .iter()
-        .map(|value| {
-            parse_dns_server(value).map(|(ip, port)| SocketAddr::new(ip, port).to_string())
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    let key = format!(
-        "{}|{dns_timeout:?}|{read_timeout:?}",
-        if dns_override {
-            normalized.join(",")
-        } else {
-            "session".to_string()
-        }
-    );
-    let resolver = if dns_override {
-        build_custom_dns_resolver(normalized, dns_timeout)?
-    } else {
-        state.dns_resolver.clone()
-    };
-    if !cache_route || !state.fingerprint_pool {
-        return build_http3_client(state, resolver, read_timeout);
-    }
-    let cell = {
-        let mut clients = state
-            .http3_clients
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?;
-        if let Some(cell) = clients.get(&key) {
-            cell.clone()
-        } else {
-            let cell = Arc::new(OnceCell::new());
-            clients.put(key, cell.clone());
-            cell
-        }
-    };
-    cell.get_or_try_init(|| build_http3_client(state, resolver, read_timeout))
-        .cloned()
-}
-
-async fn selected_http3_client_async(
-    state: Arc<SessionState>,
-    dns_override: bool,
-    dns_servers: Vec<String>,
-    dns_timeout: Option<f64>,
-    read_timeout: Option<Duration>,
-    cache_route: bool,
-) -> PyResult<reqwest::Client> {
-    selected_http3_client(
-        &state,
-        dns_override,
-        dns_servers,
-        dns_timeout,
-        read_timeout,
-        cache_route,
-    )
 }
 
 fn random_variant(count: usize) -> usize {
@@ -2249,99 +2150,10 @@ fn http3_headers_for_url(
     Ok(headers)
 }
 
-fn store_http3_response_cookies(state: &SessionState, url: &str, headers: &HeaderMap) {
-    if !state.cookie_store {
-        return;
-    }
-    for value in headers.get_all(SET_COOKIE) {
-        if let Ok(value) = value.to_str() {
-            state.cookie_jar.add(value, url);
-        }
-    }
-}
-
 fn same_origin(first: &Url, second: &Url) -> bool {
     first.scheme() == second.scheme()
         && first.host_str() == second.host_str()
         && first.port_or_known_default() == second.port_or_known_default()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_http3_request(
-    state: &SessionState,
-    client: &reqwest::Client,
-    mut method: Method,
-    mut url: String,
-    mut headers: HeaderMap,
-    mut body: Option<Vec<u8>>,
-    timeout: Duration,
-    allow_redirects: bool,
-    max_redirects: usize,
-) -> PyResult<(reqwest::Response, Vec<NativeHistoryEntry>, String)> {
-    let parsed = Url::parse(&url).map_err(to_py_error)?;
-    if parsed.scheme() != "https" {
-        return Err(PyRuntimeError::new_err("HTTP/3模式只支持https:// URL"));
-    }
-    let mut history = Vec::new();
-    let mut redirect_count = 0usize;
-    loop {
-        let request_headers = http3_headers_for_url(state, &url, &headers)?;
-        let mut request = client
-            .request(method.clone(), &url)
-            .version(Version::HTTP_3)
-            .headers(request_headers)
-            .timeout(timeout);
-        if let Some(value) = body.clone() {
-            request = request.body(value);
-        }
-        let response = request.send().await.map_err(to_py_error)?;
-        if response.version() != Version::HTTP_3 {
-            return Err(PyRuntimeError::new_err(format!(
-                "HTTP/3服务器返回了非HTTP/3响应: {:?}",
-                response.version()
-            )));
-        }
-        store_http3_response_cookies(state, &url, response.headers());
-        let status = response.status().as_u16();
-        let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308);
-        let location = response.headers().get(LOCATION).cloned();
-        if !allow_redirects || !is_redirect || location.is_none() {
-            return Ok((response, history, url));
-        }
-        if redirect_count >= max_redirects {
-            return Err(PyRuntimeError::new_err(format!(
-                "重定向次数超过max_redirects限制: {max_redirects}"
-            )));
-        }
-        let current = Url::parse(&url).map_err(to_py_error)?;
-        let location = location
-            .and_then(|value| value.to_str().ok().map(str::to_string))
-            .ok_or_else(|| PyRuntimeError::new_err("HTTP/3重定向Location不是有效文本"))?;
-        let target = current.join(&location).map_err(to_py_error)?;
-        if target.scheme() != "https" {
-            return Err(PyRuntimeError::new_err("HTTP/3重定向目标必须使用https://"));
-        }
-        history.push((
-            status,
-            url.clone(),
-            target.to_string(),
-            native_headers_from_map(response.headers()).raw,
-        ));
-        if !same_origin(&current, &target) {
-            headers.remove(AUTHORIZATION);
-            headers.remove(PROXY_AUTHORIZATION);
-            headers.remove(COOKIE);
-            headers.remove(HOST);
-        }
-        if status == 303 || ((status == 301 || status == 302) && method == Method::POST) {
-            method = Method::GET;
-            body = None;
-            headers.remove(CONTENT_LENGTH);
-            headers.remove(CONTENT_TYPE);
-        }
-        url = target.into();
-        redirect_count += 1;
-    }
 }
 
 struct Http3AttemptError {
@@ -2349,11 +2161,136 @@ struct Http3AttemptError {
     response_received: bool,
 }
 
+fn http3_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn profile_http3_peer(state: &SessionState, url: &str) -> Option<SocketAddr> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    state
+        .dns_overrides
+        .iter()
+        .find(|(domain, _)| domain.eq_ignore_ascii_case(host))
+        .and_then(|(_, addrs)| addrs.first().copied())
+        .map(|mut address| {
+            address.set_port(port);
+            address
+        })
+}
+
+fn profile_http3_cache_key(index: usize, url: &str, peer: Option<SocketAddr>) -> PyResult<String> {
+    let parsed = Url::parse(url).map_err(to_py_error)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| PyRuntimeError::new_err("HTTP/3 URL缺少host"))?;
+    Ok(format!(
+        "{index}|{}://{}:{}|{}",
+        parsed.scheme(),
+        host.to_ascii_lowercase(),
+        parsed.port_or_known_default().unwrap_or(443),
+        peer.map_or_else(|| "dns".to_string(), |value| value.to_string())
+    ))
+}
+
+async fn profile_http3_roundtrip(
+    state: Arc<SessionState>,
+    index: usize,
+    request: profile_http3::H3Request,
+) -> std::result::Result<profile_http3::H3Response, Http3AttemptError> {
+    let template = state.variants[index]
+        .record
+        .http3
+        .clone()
+        .ok_or_else(|| Http3AttemptError {
+            error: PyRuntimeError::new_err("当前指纹没有schema 2 HTTP/3模板"),
+            response_received: false,
+        })?;
+    let key = profile_http3_cache_key(index, &request.url, request.peer).map_err(|error| {
+        Http3AttemptError {
+            error,
+            response_received: false,
+        }
+    })?;
+    let slot = {
+        let mut clients = state
+            .profile_http3_clients
+            .lock()
+            .map_err(|_| Http3AttemptError {
+                error: PyRuntimeError::new_err("模板HTTP/3 Client缓存锁已损坏"),
+                response_received: false,
+            })?;
+        if let Some(client) = clients.get(&key) {
+            client.clone()
+        } else {
+            let client = Arc::new(Mutex::new(None));
+            clients.put(key.clone(), client.clone());
+            client
+        }
+    };
+    let task_slot = slot.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut client = task_slot
+            .lock()
+            .map_err(|_| profile_http3::H3RequestError {
+                error: anyhow::anyhow!("模板HTTP/3连接锁已损坏"),
+                response_received: false,
+            })?;
+        if client.as_ref().is_some_and(|client| !client.is_reusable()) {
+            *client = None;
+        }
+        if client.is_none() {
+            *client = Some(
+                profile_http3::H3Client::connect(template, &request).map_err(|error| {
+                    profile_http3::H3RequestError {
+                        error,
+                        response_received: false,
+                    }
+                })?,
+            );
+        }
+        client
+            .as_mut()
+            .expect("HTTP/3 client initialized")
+            .roundtrip(request)
+    })
+    .await
+    .map_err(|error| Http3AttemptError {
+        error: PyRuntimeError::new_err(format!("HTTP/3工作线程失败: {error}")),
+        response_received: false,
+    })?;
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Ok(mut clients) = state.profile_http3_clients.lock()
+                && clients
+                    .peek(&key)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &slot))
+            {
+                clients.pop(&key);
+            }
+            Err(Http3AttemptError {
+                error: PyRuntimeError::new_err(format!("HTTP/3模板回放失败: {error}")),
+                response_received: error.response_received,
+            })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn execute_http3_request(
+async fn execute_profile_http3_request(
     _permit: OwnedSemaphorePermit,
     state: Arc<SessionState>,
-    client: reqwest::Client,
+    index: usize,
     method: Method,
     url: String,
     headers: HeaderMap,
@@ -2365,49 +2302,115 @@ async fn execute_http3_request(
     profile: String,
     max_response_bytes: usize,
 ) -> std::result::Result<RawNativeResponse, Http3AttemptError> {
-    let (response, history, final_url) = send_http3_request(
-        &state,
-        &client,
-        method,
-        url,
-        headers,
-        body,
-        timeout,
-        allow_redirects,
-        max_redirects,
-    )
-    .await
-    .map_err(|error| Http3AttemptError {
-        error,
-        response_received: false,
-    })?;
-    let status = response.status().as_u16();
-    let response_headers = native_headers_from_map(response.headers());
-    let content = collect_response_body(response.bytes_stream(), max_response_bytes)
-        .await
-        .map_err(|error| Http3AttemptError {
-            error,
+    let started = Instant::now();
+    let mut method = method;
+    let mut url = url;
+    let mut headers = headers;
+    let mut body = body;
+    let mut history = Vec::new();
+    let mut redirect_count = 0usize;
+    loop {
+        let request_headers =
+            http3_headers_for_url(&state, &url, &headers).map_err(|error| Http3AttemptError {
+                error,
+                response_received: false,
+            })?;
+        let request = profile_http3::H3Request {
+            method: method.as_str().to_string(),
+            url: url.clone(),
+            headers: http3_header_pairs(&request_headers),
+            body: body.clone(),
+            timeout: remaining_protocol_timeout(started, timeout).map_err(|error| {
+                Http3AttemptError {
+                    error,
+                    response_received: false,
+                }
+            })?,
+            verify: state.verify,
+            max_response_bytes,
+            peer: profile_http3_peer(&state, &url),
+        };
+        let response = profile_http3_roundtrip(state.clone(), index, request).await?;
+        if state.cookie_store {
+            for (name, value) in &response.headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    state.cookie_jar.add(value.as_str(), &url);
+                }
+            }
+        }
+        let location = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.clone());
+        let is_redirect = matches!(response.status, 301 | 302 | 303 | 307 | 308);
+        if !allow_redirects || !is_redirect || location.is_none() {
+            return Ok((
+                response.status,
+                native_headers(response.headers),
+                Bytes::from(response.body),
+                fingerprint_id,
+                profile,
+                url,
+                "HTTP/3".to_string(),
+                history,
+                None,
+            ));
+        }
+        if redirect_count >= max_redirects {
+            return Err(Http3AttemptError {
+                error: PyRuntimeError::new_err(format!(
+                    "重定向次数超过max_redirects限制: {max_redirects}"
+                )),
+                response_received: true,
+            });
+        }
+        let current = Url::parse(&url).map_err(|error| Http3AttemptError {
+            error: to_py_error(error),
             response_received: true,
         })?;
-    Ok((
-        status,
-        response_headers,
-        content,
-        fingerprint_id,
-        profile,
-        final_url,
-        "HTTP/3".to_string(),
-        "headers-only".to_string(),
-        history,
-        None,
-    ))
+        let target = current
+            .join(location.as_deref().expect("redirect location exists"))
+            .map_err(|error| Http3AttemptError {
+                error: to_py_error(error),
+                response_received: true,
+            })?;
+        if target.scheme() != "https" {
+            return Err(Http3AttemptError {
+                error: PyRuntimeError::new_err("HTTP/3重定向目标必须使用https://"),
+                response_received: true,
+            });
+        }
+        history.push((
+            response.status,
+            url.clone(),
+            target.to_string(),
+            response.headers.clone(),
+        ));
+        if !same_origin(&current, &target) {
+            headers.remove(AUTHORIZATION);
+            headers.remove(PROXY_AUTHORIZATION);
+            headers.remove(COOKIE);
+            headers.remove(HOST);
+        }
+        if response.status == 303
+            || ((response.status == 301 || response.status == 302) && method == Method::POST)
+        {
+            method = Method::GET;
+            body = None;
+            headers.remove(CONTENT_LENGTH);
+            headers.remove(CONTENT_TYPE);
+        }
+        url = target.into();
+        redirect_count += 1;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_http3_stream_request(
+async fn execute_profile_http3_stream_request(
     permit: OwnedSemaphorePermit,
     state: Arc<SessionState>,
-    client: reqwest::Client,
+    index: usize,
     method: Method,
     url: String,
     headers: HeaderMap,
@@ -2417,10 +2420,12 @@ async fn execute_http3_stream_request(
     max_redirects: usize,
     fingerprint_id: String,
     profile: String,
-) -> PyResult<NativeStreamResponse> {
-    let (response, history, final_url) = send_http3_request(
-        &state,
-        &client,
+) -> std::result::Result<NativeStreamResponse, Http3AttemptError> {
+    let max_response_bytes = state.max_response_bytes;
+    let response = execute_profile_http3_request(
+        permit,
+        state,
+        index,
         method,
         url,
         headers,
@@ -2428,23 +2433,21 @@ async fn execute_http3_stream_request(
         timeout,
         allow_redirects,
         max_redirects,
+        fingerprint_id,
+        profile,
+        max_response_bytes,
     )
     .await?;
-    let status_code = response.status().as_u16();
-    let headers = native_headers_from_map(response.headers()).raw;
-    let stream: NativeBodyStream = Box::pin(
-        response
-            .bytes_stream()
-            .map(|result| result.map_err(|error| error.to_string())),
-    );
+    let (status_code, headers, body, fingerprint_id, impersonate, url, http_version, history, _) =
+        response;
+    let stream: NativeBodyStream = Box::pin(futures_util::stream::once(async move { Ok(body) }));
     Ok(NativeStreamResponse {
         status_code,
-        headers,
-        url: final_url,
+        headers: headers.raw,
+        url,
         fingerprint_id,
-        impersonate: profile,
-        http_version: "HTTP/3".to_string(),
-        fingerprint_scope: "headers-only".to_string(),
+        impersonate,
+        http_version,
         history,
         state: Arc::new(AsyncMutex::new(StreamState {
             stream: Some(stream),
@@ -2455,7 +2458,7 @@ async fn execute_http3_stream_request(
         closed: Arc::new(AtomicBool::new(false)),
         close_notify: Arc::new(Notify::new()),
         read_active: Arc::new(AtomicBool::new(false)),
-        permit: Arc::new(Mutex::new(Some(permit))),
+        permit: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -2531,7 +2534,6 @@ async fn execute_request(
         profile,
         final_url,
         http_version,
-        "tls-http".to_string(),
         history,
         transfer_counters,
     ))
@@ -2620,7 +2622,6 @@ async fn execute_stream_request(
         fingerprint_id,
         impersonate: profile,
         http_version,
-        fingerprint_scope: "tls-http".to_string(),
         history,
         state: Arc::new(AsyncMutex::new(StreamState {
             stream: Some(stream),
@@ -2703,31 +2704,35 @@ fn store_http3_capability(state: &SessionState, key: String, available: bool) ->
     Ok(())
 }
 
-async fn probe_http3(
-    state: &SessionState,
-    client: &reqwest::Client,
+async fn probe_profile_http3(
+    state: Arc<SessionState>,
+    index: usize,
     url: &str,
+    headers: &HeaderMap,
     timeout: Duration,
     capability_key: &str,
 ) -> PyResult<bool> {
-    if let Some(available) = cached_http3_capability(state, capability_key)? {
+    if let Some(available) = cached_http3_capability(&state, capability_key)? {
         return Ok(available);
     }
-    let parsed = Url::parse(url).map_err(to_py_error)?;
-    if parsed.scheme() != "https" {
-        store_http3_capability(state, capability_key.to_string(), false)?;
+    if state.variants[index].record.http3.is_none() {
         return Ok(false);
     }
-    let probe_url = format!("{}/", parsed.origin().ascii_serialization());
-    let available = client
-        .request(Method::HEAD, probe_url)
-        .version(Version::HTTP_3)
-        .timeout(timeout.min(HTTP3_PROBE_TIMEOUT))
-        .send()
+    let request_headers = http3_headers_for_url(&state, url, headers)?;
+    let request = profile_http3::H3Request {
+        method: "HEAD".to_string(),
+        url: url.to_string(),
+        headers: http3_header_pairs(&request_headers),
+        body: None,
+        timeout: timeout.min(HTTP3_PROBE_TIMEOUT),
+        verify: state.verify,
+        max_response_bytes: 0,
+        peer: profile_http3_peer(&state, url),
+    };
+    let available = profile_http3_roundtrip(state.clone(), index, request)
         .await
-        .map(|response| response.version() == Version::HTTP_3)
-        .unwrap_or(false);
-    store_http3_capability(state, capability_key.to_string(), available)?;
+        .is_ok();
+    store_http3_capability(&state, capability_key.to_string(), available)?;
     Ok(available)
 }
 
@@ -2761,80 +2766,67 @@ async fn execute_preferred_request(
     let direct_http3 = request_version == RequestHttpVersion::Http3
         && proxy_url.is_none()
         && !transfer_stats
-        && url.starts_with("https://");
+        && !dns_override
+        && url.starts_with("https://")
+        && state.variants[index].record.http3.is_some();
     if direct_http3 {
         let capability_key = http3_capability_key(&url, dns_override, &dns_servers, dns_timeout)?;
         let cached_capability = cached_http3_capability(&state, &capability_key)?;
         if cached_capability != Some(false) {
-            match selected_http3_client_async(
-                state.clone(),
-                dns_override,
-                dns_servers.clone(),
-                dns_timeout,
-                read_timeout,
-                cache_route,
-            )
-            .await
-            {
-                Ok(client) => {
-                    let safe_method = is_safe_http_method(&method);
-                    let can_use_http3 = if safe_method {
-                        true
-                    } else {
-                        probe_http3(
-                            &state,
-                            &client,
-                            &url,
-                            remaining_protocol_timeout(protocol_started, timeout)?,
-                            &capability_key,
-                        )
-                        .await?
-                    };
-                    if can_use_http3 {
-                        let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
-                        let attempt_timeout = if safe_method && cached_capability.is_none() {
-                            remaining.min(HTTP3_PROBE_TIMEOUT)
-                        } else {
-                            remaining
-                        };
-                        let result = execute_http3_request(
-                            permit.take().expect("request permit must be present"),
-                            state.clone(),
-                            client,
-                            method.clone(),
-                            url.clone(),
-                            headers.clone(),
-                            body.clone(),
-                            attempt_timeout,
-                            allow_redirects,
-                            max_redirects,
-                            fingerprint_id.clone(),
-                            profile.clone(),
-                            state.max_response_bytes,
-                        )
-                        .await;
-                        match result {
-                            Ok(response) => {
-                                store_http3_capability(&state, capability_key, true)?;
-                                return Ok(response);
-                            }
-                            Err(error) if error.response_received => {
-                                store_http3_capability(&state, capability_key, true)?;
-                                return Err(error.error);
-                            }
-                            Err(error) if !safe_method => {
-                                store_http3_capability(&state, capability_key, false)?;
-                                return Err(error.error);
-                            }
-                            Err(_) => {
-                                store_http3_capability(&state, capability_key, false)?;
-                                permit = Some(acquire_connection_slot(&state).await?);
-                            }
-                        }
+            let safe_method = is_safe_http_method(&method);
+            let can_use_http3 = if safe_method {
+                true
+            } else {
+                probe_profile_http3(
+                    state.clone(),
+                    index,
+                    &url,
+                    &headers,
+                    remaining_protocol_timeout(protocol_started, timeout)?,
+                    &capability_key,
+                )
+                .await?
+            };
+            if can_use_http3 {
+                let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
+                let attempt_timeout = if safe_method && cached_capability.is_none() {
+                    remaining.min(HTTP3_PROBE_TIMEOUT)
+                } else {
+                    remaining
+                };
+                let result = execute_profile_http3_request(
+                    permit.take().expect("request permit must be present"),
+                    state.clone(),
+                    index,
+                    method.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    body.clone(),
+                    attempt_timeout,
+                    allow_redirects,
+                    max_redirects,
+                    fingerprint_id.clone(),
+                    profile.clone(),
+                    state.max_response_bytes,
+                )
+                .await;
+                match result {
+                    Ok(response) => {
+                        store_http3_capability(&state, capability_key, true)?;
+                        return Ok(response);
                     }
-                }
-                Err(_) => {
-                    store_http3_capability(&state, capability_key, false)?;
+                    Err(error) if error.response_received => {
+                        store_http3_capability(&state, capability_key, true)?;
+                        return Err(error.error);
+                    }
+                    Err(error) if !safe_method => {
+                        store_http3_capability(&state, capability_key, false)?;
+                        return Err(error.error);
+                    }
+                    Err(_) => {
+                        store_http3_capability(&state, capability_key, false)?;
+                        permit = Some(acquire_connection_slot(&state).await?);
+                    }
                 }
             }
         }
@@ -2903,75 +2895,66 @@ async fn execute_preferred_stream_request(
     let mut permit = Some(permit);
     let direct_http3 = request_version == RequestHttpVersion::Http3
         && proxy_url.is_none()
-        && url.starts_with("https://");
+        && !dns_override
+        && url.starts_with("https://")
+        && state.variants[index].record.http3.is_some();
     if direct_http3 {
         let capability_key = http3_capability_key(&url, dns_override, &dns_servers, dns_timeout)?;
         let cached_capability = cached_http3_capability(&state, &capability_key)?;
         if cached_capability != Some(false) {
-            match selected_http3_client_async(
-                state.clone(),
-                dns_override,
-                dns_servers.clone(),
-                dns_timeout,
-                read_timeout,
-                cache_route,
-            )
-            .await
-            {
-                Ok(client) => {
-                    let safe_method = is_safe_http_method(&method);
-                    let can_use_http3 = if safe_method {
-                        true
-                    } else {
-                        probe_http3(
-                            &state,
-                            &client,
-                            &url,
-                            remaining_protocol_timeout(protocol_started, timeout)?,
-                            &capability_key,
-                        )
-                        .await?
-                    };
-                    if can_use_http3 {
-                        let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
-                        let attempt_timeout = if safe_method && cached_capability.is_none() {
-                            remaining.min(HTTP3_PROBE_TIMEOUT)
-                        } else {
-                            remaining
-                        };
-                        let result = execute_http3_stream_request(
-                            permit.take().expect("request permit must be present"),
-                            state.clone(),
-                            client,
-                            method.clone(),
-                            url.clone(),
-                            headers.clone(),
-                            body.clone(),
-                            attempt_timeout,
-                            allow_redirects,
-                            max_redirects,
-                            fingerprint_id.clone(),
-                            profile.clone(),
-                        )
-                        .await;
-                        match result {
-                            Ok(response) => {
-                                store_http3_capability(&state, capability_key, true)?;
-                                return Ok(response);
-                            }
-                            Err(error) if !safe_method => {
-                                store_http3_capability(&state, capability_key, false)?;
-                                return Err(error);
-                            }
-                            Err(_) => {
-                                store_http3_capability(&state, capability_key, false)?;
-                                permit = Some(acquire_connection_slot(&state).await?);
-                            }
-                        }
+            let safe_method = is_safe_http_method(&method);
+            let can_use_http3 = if safe_method {
+                true
+            } else {
+                probe_profile_http3(
+                    state.clone(),
+                    index,
+                    &url,
+                    &headers,
+                    remaining_protocol_timeout(protocol_started, timeout)?,
+                    &capability_key,
+                )
+                .await?
+            };
+            if can_use_http3 {
+                let remaining = remaining_protocol_timeout(protocol_started, timeout)?;
+                let attempt_timeout = if safe_method && cached_capability.is_none() {
+                    remaining.min(HTTP3_PROBE_TIMEOUT)
+                } else {
+                    remaining
+                };
+                let result = execute_profile_http3_stream_request(
+                    permit.take().expect("request permit must be present"),
+                    state.clone(),
+                    index,
+                    method.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    body.clone(),
+                    attempt_timeout,
+                    allow_redirects,
+                    max_redirects,
+                    fingerprint_id.clone(),
+                    profile.clone(),
+                )
+                .await;
+                match result {
+                    Ok(response) => {
+                        store_http3_capability(&state, capability_key, true)?;
+                        return Ok(response);
                     }
-                }
-                Err(_) => {
-                    store_http3_capability(&state, capability_key, false)?;
+                    Err(error) if error.response_received => {
+                        store_http3_capability(&state, capability_key, true)?;
+                        return Err(error.error);
+                    }
+                    Err(error) if !safe_method => {
+                        store_http3_capability(&state, capability_key, false)?;
+                        return Err(error.error);
+                    }
+                    Err(_) => {
+                        store_http3_capability(&state, capability_key, false)?;
+                        permit = Some(acquire_connection_slot(&state).await?);
+                    }
                 }
             }
         }
@@ -3076,7 +3059,6 @@ async fn execute_multipart_request(
         profile,
         final_url,
         http_version,
-        "tls-http".to_string(),
         history,
         None,
     ))
@@ -3094,7 +3076,6 @@ fn into_native_response(
         profile,
         url,
         http_version,
-        fingerprint_scope,
         history,
         transfer_counters,
     ) = response;
@@ -3109,7 +3090,6 @@ fn into_native_response(
             fingerprint_id,
             impersonate: profile,
             http_version,
-            fingerprint_scope,
             history,
             transfer_stats: transfer_counters
                 .map(|counters| Py::new(py, NativeTransferStats { counters }))
@@ -3657,8 +3637,6 @@ struct NativeStreamResponse {
     #[pyo3(get)]
     http_version: String,
     #[pyo3(get)]
-    fingerprint_scope: String,
-    #[pyo3(get)]
     history: Vec<NativeHistoryEntry>,
     state: Arc<AsyncMutex<StreamState>>,
     closed: Arc<AtomicBool>,
@@ -3969,7 +3947,9 @@ impl NativeSession {
             happy_eyeballs_timeout,
             dns_resolver,
             dns_overrides: Arc::new(dns_overrides),
-            http3_clients: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
+            profile_http3_clients: Mutex::new(LruCache::new(
+                NonZeroUsize::new(max_cached_origins.max(1)).unwrap(),
+            )),
             http3_capabilities: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             cookie_jar: Arc::new(Jar::default()),
             cookie_store,
@@ -4618,9 +4598,9 @@ impl NativeSession {
                 .clear();
         }
         self.state
-            .http3_clients
+            .profile_http3_clients
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .map_err(|_| PyRuntimeError::new_err("模板HTTP/3 Client缓存锁已损坏"))?
             .clear();
         self.state
             .http3_capabilities
@@ -4744,9 +4724,9 @@ impl NativeSession {
                 .clear();
         }
         self.state
-            .http3_clients
+            .profile_http3_clients
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("HTTP/3 Client缓存锁已损坏"))?
+            .map_err(|_| PyRuntimeError::new_err("模板HTTP/3 Client缓存锁已损坏"))?
             .clear();
         self.state
             .http3_capabilities

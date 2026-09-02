@@ -12,7 +12,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green">
 </p>
 
-`requests_rust` 为 Python 提供接近 `curl_cffi.requests` 使用习惯的同步和原生异步 API。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行；HTTP/3 优先路径由 Reqwest、Quinn 与 Rustls 执行。
+`requests_rust` 为 Python 提供接近 `curl_cffi.requests` 使用习惯的同步和原生异步 API。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行。schema 2 指纹包含完整 QUIC/H3 模板时，`http3` 会真实回放该模板；schema 1 或代理场景自动使用 H2/H1.1。
 
 适合需要长期 Session、真实连接复用、代理身份隔离和可审计浏览器传输画像的采集、自动化与网络研究项目。
 
@@ -133,8 +133,7 @@ with Session(
 
 - 单 profile 文件允许包含一个或多个变体。
 - Session 自动识别 profile 名称。
-- `response.fingerprint_id` 返回本次实际选择的源记录 ID。
-- `response.fingerprint_scope`在wreq/BoringSSL的HTTP/1.1/2路径为`tls-http`，在通用Rustls/Quinn HTTP/3路径为`headers-only`。
+- `response.fingerprint_id`只在所选模板确实应用到实际传输时返回源记录 ID。
 - 文件只属于当前实例，不进入内置指纹全局缓存。
 - `fingerprints_path=` 仍可用于从多 profile 文件中显式选择名称。
 - 裸记录数组、Python记录序列和捕获器MCP的完整`{schema_version, records, ...}` dict envelope都可直接加载；未知schema、未知非GREASE TLS/H2 ID、损坏的扩展payload或顺序冲突会在Session构造期失败。
@@ -149,13 +148,11 @@ flowchart LR
     A[Python Session / AsyncSession] --> B[PyO3 API]
     B --> C[Tokio Runtime]
     C --> D[wreq + BoringSSL]
-    C --> E[Reqwest + Quinn + Rustls]
     D --> F[HTTP/1.1 · HTTP/2 · WebSocket]
-    E --> G[HTTP/3 优先路径]
     C --> H[DNS · Proxy · Cookie · Stream · Multipart]
 ```
 
-`http_version="http2"` 默认按 HTTP/2 → HTTP/1.1 协商。`http_version="http3"` 表示 HTTP/3 优先，并在允许安全降级时进入 HTTP/2/1.1 路径。当前 QUIC 后端不宣称复现 Chrome、Edge 或 Firefox 的 QUIC 指纹。
+`http_version="http2"`默认按HTTP/2 → HTTP/1.1协商。`http_version="http3"`在直连 HTTPS 且所选指纹为 schema 2 时，按模板应用 BoringSSL ClientHello、QUIC Transport Parameters、HTTP/3 SETTINGS、Header 顺序与 QPACK 策略；失败再降级 H2/H1.1。schema 1、普通 HTTP/SOCKS 代理、multipart 和传输统计场景直接使用 H2/H1.1，不会以半指纹 H3 冒充成功。
 
 ## Profile 状态
 
@@ -188,7 +185,7 @@ Alpine musl 和 macOS Intel 当前不在发布矩阵中。原生安装冒烟不�
 ## 功能边界
 
 - `requests_rust` 兼容 `curl_cffi.requests` 的高频命名，不承诺兼容全部专有参数；未知关键字会明确报错。
-- HTTP/3 使用独立 Rustls/Quinn 指纹边界，响应明确标记`fingerprint_scope="headers-only"`；不能把成功协商 HTTP/3 解释为浏览器 QUIC 指纹一致。
+- schema 2 模板统一覆盖 H1/H2/H3；schema 1 只覆盖 H1/H2，选择`http3`时安全降级，不会执行半指纹 H3 请求。
 - `verify=False` 只适用于受控本地自签名测试。
 - 不同 profile 不共享 TLS/HTTP2 连接池，这是指纹隔离要求。
 - `set_proxy()`和Session关闭会同时清空连接池与每个变体的TLS session ticket cache，避免旧代理身份通过恢复握手关联到新代理。

@@ -106,7 +106,7 @@ Firefox、Chrome和Edge官网安装器的完整产品版本、降熵后的UA版�
 
 新增 Profile 必须以对应正式浏览器构建的真实 TLS/HTTP2 采集和回归为依据。不能只根据官网版本列表改名称、替换 UA，或让旧指纹冒充新版本；产品补丁号和 Build ID 属于采集元数据，公共 Profile 名称按已验证的浏览器大版本管理。
 
-HTTP/3必须作为独立传输指纹边界管理：当前实现使用Reqwest/Quinn/Rustls，不读取wreq/BoringSSL的Chrome、Edge或Firefox TLS参数。Profile Header和业务模板仍可复用，但Rustls ClientHello、QUIC Transport Parameters、Connection ID、QPACK动态表与浏览器真值未对撞前，不得将`response.http_version == "HTTP/3"`解释为浏览器HTTP/3指纹一致。
+HTTP/3必须作为独立传输指纹边界管理。通用Reqwest/Quinn/Rustls不能读取wreq/BoringSSL的Chrome、Edge或Firefox TLS参数，因此已从模板请求路径移除。schema 2记录只有在BoringSSL ClientHello、QUIC Transport Parameters、HTTP/3 SETTINGS、Header顺序与QPACK均可严格解析和应用时才能进入quiche H3；schema 1以及代理等不支持完整H3回放的场景直接使用H2/H1.1。
 
 ## 已证伪路线：Rust原生batch与同tick隐式合批
 
@@ -140,6 +140,6 @@ HTTP/3必须作为独立传输指纹边界管理：当前实现使用Reqwest/Qui
 | 稳定移动，150ms，0.2%丢包，20Mbps | 376.4 / 420.4 | 186.2 / 200.9 | 81.9 / 64.2 | 4.84 / 6.89 |
 | 高丢包移动，150ms，1%丢包，20Mbps | 390.0 / 394.2 | 192.9 / 195.6 | 78.0 / 51.9 | 1.00 / 0.98 |
 
-该模型支持的预测边界：无0-RTT恢复时，冷连接首请求约为本机15毫秒加`2.4-3.1 × RTT`及服务端处理时间；复用QUIC连接的顺序小请求约为本机15毫秒加`1.1-1.6 × RTT`及服务端处理时间。真实代理还需叠加代理到目标的RTT、出口拥塞、认证和业务响应时间。若UDP被封锁，当前显式HTTP/3模式会失败且不会降级。
+该模型支持的预测边界：无0-RTT恢复时，冷连接首请求约为本机15毫秒加`2.4-3.1 × RTT`及服务端处理时间；复用QUIC连接的顺序小请求约为本机15毫秒加`1.1-1.6 × RTT`及服务端处理时间。真实代理还需叠加代理到目标的RTT、出口拥塞、认证和业务响应时间。这是早期通用H3后端的历史实验数据；当前公开H3路径已替换为由schema 2捕获模板驱动的quiche+BoringSSL实现，不能把旧数据直接当作新路径性能结论。
 
 该中继不是MASQUE、CONNECT-UDP或供应商认证代理；丢包是独立随机而非突发，未模拟NAT重绑定、跨流量竞争和运营商队列。Python中继线程与客户端在同一进程，因此CPU列不是纯客户端CPU；逐包调度也使批量Mbps只适合两库相对比较，不能外推为线路带宽。该测试比较两种HTTP/3实现，不等同于HTTP/3对HTTP/2的协议收益测试。

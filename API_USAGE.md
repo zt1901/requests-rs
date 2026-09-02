@@ -1,6 +1,6 @@
 # requests_rust 使用与 API 手册
 
-`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2 指纹、HTTP/1.1、HTTP/2、HTTP/3优先与自动降级、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。
+`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2/QUIC/HTTP3 指纹、HTTP/1.1、HTTP/2、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。schema 2 模板可直接真实回放 H3；旧 schema 自动使用 H2/H1.1。
 
 高频 API 命名接近 `curl_cffi.requests`，但未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
@@ -151,7 +151,7 @@ with Session(
 | `timeout` | 请求总超时秒数，默认为 `30`。 |
 | `connect_timeout` | 可选连接超时秒数。 |
 | `read_timeout` | 可选响应 Body 读取超时秒数。 |
-| `http_version` | 唯一的协议选择参数。默认`"http2"`，按HTTP/2→HTTP/1.1降级；`"http3"`按HTTP/3→HTTP/2→HTTP/1.1降级，`"http1.1"`固定HTTP/1.1。单次请求可覆盖；`auto`等旧别名继续兼容。 |
+| `http_version` | 唯一的协议选择参数。默认`"http2"`，按HTTP/2→HTTP/1.1降级；`"http3"`在schema 2完整模板和直连HTTPS时优先H3并失败降H2→H1.1，schema 1或不支持H3的场景直接H2→H1.1；`"http1.1"`固定HTTP/1.1。单次请求可覆盖；`auto`等旧别名继续兼容。 |
 | `happy_eyeballs_timeout` | IPv4/IPv6 Happy Eyeballs回退延迟，默认 `0.3` 秒；设为 `None` 关闭并行地址族回退。 |
 | `resolve` | 可选域名到IPv4/IPv6列表的Session级静态映射，保留原URL、Host、SNI和证书域名。 |
 | `dns_servers` | 可选本机DNS服务器列表，支持`IP`或`IP:端口`，使用UDP并在失败时回退TCP。 |
@@ -263,17 +263,17 @@ Session级默认：
 
 ```python
 with Session(
-    impersonate="chrome150",
+    impersonate="chrome152",
     http_version="http3",
 ) as session:
     response = session.get("https://example.com/")
-    assert response.http_version == "HTTP/3"
+    assert response.http_version in {"HTTP/3", "HTTP/2", "HTTP/1.1"}
 ```
 
 单次覆盖与异步流：
 
 ```python
-async with AsyncSession(impersonate="chrome150") as session:
+async with AsyncSession(impersonate="chrome152") as session:
     response = await session.get(
         "https://example.com/",
         http_version="http3",
@@ -282,9 +282,9 @@ async with AsyncSession(impersonate="chrome150") as session:
     body = await response.aread()
 ```
 
-`http3`表示协议优先级而不是强制only模式。直连HTTPS先使用Reqwest/Quinn/Rustls尝试HTTP/3；不可用时进入wreq/BoringSSL连接池并按HTTP/2、HTTP/1.1顺序协商。未知origin的首次H3尝试或探测最多占用1.5秒，并与后续降级共享原请求总超时。安全方法可在H3失败后重试；POST等非安全方法会先发送不含业务Body的HEAD传输探测并按origin和DNS路由缓存能力，避免为了降级而重复提交业务请求。成功能力缓存10分钟，失败能力缓存30秒；响应的`http_version`始终是最终实际协议。
+`http3`是完整指纹模板下的协议偏好，不是绕过模板的许可。直连HTTPS且记录为schema 2时，回放器用quiche+BoringSSL应用捕获的TLS ClientHello、QUIC Transport Parameters、HTTP/3 SETTINGS、Header名称顺序和QPACK策略，并按指纹变体、Origin与解析目标隔离和复用连接。H3失败后降级H2/H1.1；安全方法可以直接尝试，首次非安全方法先用无业务Body的HEAD探测，因此真实业务Body只发送一次。重定向、Cookie、gzip/br/zstd/deflate解压、流式读取和响应大小限制在H3路径保持相同API语义。
 
-QUIC后端支持普通同步/异步请求、Body、Cookie、重定向、读取超时、`max_response_bytes`和同步/异步流式响应。multipart、`transfer_stats`和普通HTTP/SOCKS代理不能使用当前QUIC后端，因此在同一个`http3`偏好下直接使用H2/H1.1；WebSocket仍单独使用`version`参数。
+schema 1没有完整H3模板，会直接从H2开始；普通HTTP/SOCKS代理、multipart、transfer_stats和请求级自定义DNS解析也走H2/H1.1，不会绕过代理或启动半指纹QUIC。收到H3响应头后的Body错误不会改走TCP重放。`response.http_version`始终给出实际协议。
 
 同一个 Session 可以按任意比例混合协议和代理。例如保持 25 条 WebSocket，同时运行 15 个 HTTP 代理请求和 10 个 SOCKS5 请求，正好共同占用 50 个槽位。超过上限的任务会异步等待已有请求完成或 WebSocket 关闭，不会阻塞事件循环，也不需要创建额外 `AsyncSession`。
 
@@ -460,11 +460,8 @@ response.history
 response.fingerprint_id
 response.impersonate
 response.http_version
-response.fingerprint_scope
 response.raise_for_status()
 ```
-
-`fingerprint_scope`说明本次响应实际覆盖的指纹边界：HTTP/1.1/2的wreq/BoringSSL路径返回`tls-http`；通用HTTP/3的Reqwest/Quinn/Rustls路径返回`headers-only`。后者仍使用所选profile的稳定Header和`fingerprint_id`做来源审计，但不表示浏览器ClientHello、QUIC Transport Parameters或QPACK已经对撞。
 
 ## TLS 传输层统计
 
@@ -542,7 +539,7 @@ files = {"document": r"C:\data\report.bin"}
 
 文件由 Rust 异步文件流读取，不需要先将整个文件加载为 Python `bytes`。
 
-multipart可继续传同一个`http_version`参数；选择`http3`时自动从HTTP/2开始协商，因为当前QUIC后端尚未实现multipart上传。
+multipart可继续传同一个`http_version`参数；当前multipart不走UDP/H3，选择`http3`时直接从HTTP/2开始协商。
 
 ## 自定义指纹文件
 
@@ -648,7 +645,7 @@ profile不会自动升级。必须重新采集、线级对撞并新增对应大�
 
 ## 重要边界
 
-- `http3`是H3→H2→H1.1偏好；当前TCP代理、multipart和`transfer_stats`从H2开始，WebSocket继续使用自己的`version`参数。QUIC后端不宣称复现浏览器QUIC指纹。
+- `http3`在schema 2完整模板、直连HTTPS时真实应用TLS/QUIC/H3/QPACK并优先H3；schema 1或不支持H3的场景从H2开始，必要时降级H1.1。WebSocket继续使用自己的`version`参数。
 - 不同指纹变体使用独立 Client、连接池和 TLS session cache，这是指纹隔离要求。
 - 切换Session默认代理或关闭Session会清空TLS session cache，避免旧代理身份签发的ticket用于新代理路径。
 - 调用方传入的 `User-Agent`、`sec-ch-ua*` 与其他同名 Header 优先，库不会覆盖。

@@ -2,6 +2,9 @@ import json
 import re
 from pathlib import Path
 
+HTTP3_FIXTURE_GLOB = "tests/fixtures/*_schema2.json"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+
 
 # 修改这些路径后可右键运行，把最新采集记录固化到Python wheel。
 项目目录 = Path(__file__).resolve().parents[1]
@@ -70,6 +73,20 @@ def main():
     if 浏览器基准文件.exists():
         baselines = 读取记录(浏览器基准文件)
     baseline_profiles = {识别版本(record) for record in baselines if 可嵌入(record)}
+    http3_templates = {}
+    for path in PROJECT_DIR.glob(HTTP3_FIXTURE_GLOB):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        fixture_records = document if isinstance(document, list) else document.get("records", [])
+        for record in fixture_records:
+            profile = record.get("profile")
+            if record.get("schema_version") == 2 and record.get("http3"):
+                http3_templates[profile] = record["http3"]
+    baselines = [
+        {**record, "schema_version": 2, "http3": http3_templates[profile]}
+        if (profile := record.get("profile")) in http3_templates
+        else record
+        for record in baselines
+    ]
     embedded = []
     counts = {}
     sources = baselines + [
@@ -97,13 +114,16 @@ def main():
             )
             profile_records = [seed]
         for record in profile_records:
-            embedded.append({
+            item = {
                 "schema_version": record.get("schema_version", 1),
                 "id": record["id"],
                 "profile": profile,
                 "tls": record["tls"],
                 "http": record["http"],
-            })
+            }
+            if record.get("http3"):
+                item["http3"] = record["http3"]
+            embedded.append(item)
             counts[profile] = counts.get(profile, 0) + 1
 
 

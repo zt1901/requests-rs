@@ -30,7 +30,8 @@ Google Chrome官方正式版`152.0.7977.64`已经作为内置`chrome152`发布�
 | btls | `SSL_CTX_set1_requested_trust_anchors`安全Rust包装 |
 | wreq | `TlsOptions`配置、Connector应用及`ExtensionType::TRUST_ANCHORS`扩展顺序 |
 | requests_rust | `extension_wire`严格解析、schema校验、payload传递及fail-closed错误 |
-| 指纹数据 | `browser_baselines.json`与`fingerprints.json`内置`chrome152`，`schema_version: 1` |
+| 指纹数据 | `browser_baselines.json`与`fingerprints.json`内置`chrome152`；schema 2补充TLS/QUIC/H3/QPACK完整模板 |
+| quiche | QUIC Transport Parameters顺序和值、DCID/SCID与Initial尺寸、HTTP/3 SETTINGS顺序及QPACK策略 |
 
 wreq和匹配的btls wrapper源码随仓库vendor，构建不依赖被本机修改的Cargo缓存。
 
@@ -49,6 +50,8 @@ wreq和匹配的btls wrapper源码随仓库vendor，构建不依赖被本机修�
 
 ## 边界
 
-该验收针对wreq/BoringSSL的HTTP/1.1/2传输路径，响应标记`fingerprint_scope="tls-http"`。HTTP/3仍使用Reqwest/Quinn/Rustls通用传输，响应标记`fingerprint_scope="headers-only"`；`chrome152`名称和`fingerprint_id`在H3路径只说明Header/profile来源，不代表Chrome QUIC、Transport Parameters或QPACK指纹等价。
+Chrome 152现有schema 2记录同时覆盖HTTP/1.1、HTTP/2和HTTP/3。直连HTTPS且选择`http3`时，库使用quiche+BoringSSL逐项应用并严格校验捕获的ClientHello、QUIC Transport Parameters原始wire与结构化字段、HTTP/3 SETTINGS顺序、Header顺序和QPACK策略；不支持完整回放的记录或场景会降级H2/H1.1，不会从通用或半指纹H3传输返回源`fingerprint_id`。
 
-新增浏览器profile仍必须经过相同门禁：正式产品身份、完整版本、真实TLS/HTTP2捕获、未知字段严格校验、线级ClientHello对照、Header顺序和HTTP/2参数回归。不能通过删除新扩展、改UA或复制旧记录伪造支持。
+H3线级对照确认Chrome Initial使用8字节DCID、0字节SCID和1250字节UDP datagram；源与回放QUIC Transport Parameters语义和顺序、HTTP/3 SETTINGS顺序、Header名称和值均一致，QPACK编码逐字节一致。Session构造期会拒绝TLS payload摘要、QUIC raw wire、参数ID/长度/值、顶层语义字段、SETTINGS顺序或DATAGRAM联动不一致的schema 2记录。
+
+新增浏览器profile仍必须经过相同门禁：正式产品身份、完整版本、真实TLS/HTTP2/H3捕获、未知字段严格校验、线级ClientHello和QUIC/H3/QPACK对照、Header顺序及HTTP/2参数回归。不能通过删除新扩展、改UA、复制旧记录或只复用Header伪造支持。

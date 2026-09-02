@@ -199,7 +199,6 @@ class Response:
         fingerprint_id: str,
         impersonate: str | os.PathLike[str],
         http_version: str = "UNKNOWN",
-        fingerprint_scope: str = "tls-http",
         content: bytes | None = None,
         stream: Any = None,
         history: Sequence["Response"] = (),
@@ -211,7 +210,6 @@ class Response:
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self.http_version = http_version
-        self.fingerprint_scope = fingerprint_scope
         self._content = content
         self._stream = stream
         self.transfer_stats = None
@@ -229,7 +227,6 @@ class Response:
         response.fingerprint_id = native.fingerprint_id
         response.impersonate = native.impersonate
         response.http_version = native.http_version
-        response.fingerprint_scope = native.fingerprint_scope
         response.transfer_stats = native.transfer_stats
         response._content = native.content
         response._stream = None
@@ -255,7 +252,6 @@ class Response:
                 self._native_response.history(),
                 self.fingerprint_id,
                 self.impersonate,
-                self.fingerprint_scope,
             )
         return self._history
 
@@ -981,7 +977,6 @@ class Session:
                 native.history,
                 native.fingerprint_id,
                 native.impersonate,
-                native.fingerprint_scope,
             )
             return Response(
                 status_code=native.status_code,
@@ -991,7 +986,6 @@ class Session:
                 impersonate=native.impersonate,
                 stream=native,
                 http_version=native.http_version,
-                fingerprint_scope=native.fingerprint_scope,
                 history=history,
             )
 
@@ -1274,7 +1268,6 @@ def _build_history(
     entries: Sequence[tuple[int, str, str, Sequence[tuple[str, str]]]],
     fingerprint_id: str,
     impersonate: str,
-    fingerprint_scope: str = "tls-http",
 ) -> list[Response]:
     return [
         Response(
@@ -1284,7 +1277,6 @@ def _build_history(
             url=previous,
             fingerprint_id=fingerprint_id,
             impersonate=impersonate,
-            fingerprint_scope=fingerprint_scope,
         )
         for status, previous, _target, headers in entries
     ]
@@ -1303,12 +1295,10 @@ def _response_from_stream(native: Any, *, async_stream: bool = False) -> Respons
         impersonate=native.impersonate,
         stream=native,
         http_version=native.http_version,
-        fingerprint_scope=native.fingerprint_scope,
         history=_build_history(
             native.history,
             native.fingerprint_id,
             native.impersonate,
-            native.fingerprint_scope,
         ),
     )
     response._async_stream = async_stream

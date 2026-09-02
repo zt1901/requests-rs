@@ -176,14 +176,25 @@ def main() -> None:
             raise AssertionError("非法0xca34 payload必须在Session创建时失败")
 
         future = copy.deepcopy(record)
-        future["schema_version"] = 2
+        future["schema_version"] = 3
         future_profile = _写临时指纹(directory, "future-schema.json", [future])
         try:
             Session(impersonate=future_profile, fingerprint_rotation=False)
         except RuntimeError as error:
-            assert "schema_version=2" in str(error), error
+            assert "schema_version=3" in str(error), error
         else:
             raise AssertionError("未知schema_version必须fail-closed")
+
+        mismatched_envelope = {
+            "schema_version": 2,
+            "records": [record],
+        }
+        try:
+            Session(impersonate=mismatched_envelope, fingerprint_rotation=False)
+        except RuntimeError as error:
+            assert "与内部指纹记录不一致" in str(error), error
+        else:
+            raise AssertionError("envelope与内部record的schema不一致时必须fail-closed")
 
     print("Collector schema、MCP envelope、Chrome 152 Trust Anchor线级回放与fail-closed验证通过")
 

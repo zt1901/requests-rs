@@ -2,9 +2,9 @@
 
 ## 定位
 
-`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3优先协议协商、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2及浏览器TLS指纹，通过Reqwest/Quinn/Rustls执行HTTP/3，通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
+`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过quiche/BoringSSL执行schema 2模板驱动的HTTP/3，并通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
 
-当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、Rustls、Quinn、Reqwest、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
+当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、quiche、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
 
 ## 导入
 
@@ -144,7 +144,7 @@ with Session(impersonate="chrome150") as session:
 | `files` | 文件路径Mapping；由Rust Tokio文件流读取 |
 | `timeout` | 请求总超时，必须是有限正数 |
 | `read_timeout` | Body读取超时，必须是有限正数 |
-| `http_version` | 唯一协议参数，默认`http2`：`http3`按H3→H2→H1.1，`http2`按H2→H1.1，`http1.1`固定H1.1；`auto`仅作为兼容别名保留 |
+| `http_version` | 唯一协议参数，默认`http2`：`http3`在schema 2完整模板、直连HTTPS时优先H3并失败降H2→H1.1，schema 1或不支持H3的场景直接H2→H1.1；`http1.1`固定H1.1，`auto`仅作为兼容别名保留 |
 | `stream` | `True`时不预读完整Body |
 | `proxy` | 单请求代理覆盖；`None`表示该请求直连；省略表示使用Session代理 |
 | `proxies` | curl_cffi 风格代理映射，如 `{"http": "http://...", "https": "http://..."}`；按目标 URL 协议选择，也接受 `http://`、`https://`、`all://`、`all` 键；不能与 `proxy` 同时传入 |
@@ -180,11 +180,9 @@ asyncio.run(main())
 
 ## HTTP/3
 
-`http_version="http3"`表示H3优先。直连HTTPS先进入Reqwest/Quinn/Rustls后端；H3不可用时进入wreq/BoringSSL并按H2、H1.1协商。普通请求、重定向、Cookie、Body上限和同步/异步流继续使用现有公开对象与统一Rust Semaphore。
+`http_version="http3"`是完整模板下的H3优先策略。直连HTTPS且记录为schema 2时，回放器应用该记录的BoringSSL ClientHello、QUIC Transport Parameters、HTTP/3 SETTINGS、Header名称顺序与QPACK策略；同一指纹变体、Origin和解析目标会复用对应QUIC连接。H3连接或握手失败后，安全方法可降级到H2/H1.1；首次非安全方法先发无业务Body的HEAD探测，之后真实业务Body只发送一次。总超时覆盖探测、H3、重定向、Body读取和降级全过程。
 
-安全方法可在H3传输失败后降级重试。未知origin的首次H3尝试或探测上限为1.5秒，H3与后续降级共享请求总超时。非安全方法首次访问时先用无业务Body的HEAD探测QUIC，并按origin和DNS路由缓存能力，不能在可能已经提交业务Body后盲目重放。正缓存10分钟、负缓存30秒。HTTP CONNECT、SOCKS5、multipart和`transfer_stats`当前不能承载QUIC，使用`http3`时直接从H2/H1.1开始且绝不绕过代理。
-
-HTTP/3后端不读取wreq的BoringSSL TLS配置。Profile默认Header仍生效，`fingerprint_id`仍表示所选记录，但响应的`fingerprint_scope`为`headers-only`；HTTP/3的Rustls ClientHello、QUIC Transport Parameters、连接ID及QPACK状态不等同于真实Chrome/Edge，不能宣称浏览器QUIC指纹对撞。若H3失败后实际降级到wreq HTTP/2/1.1，scope则为`tls-http`。
+schema 1没有完整QUIC/H3画像，选择`http3`时直接走H2→H1.1。普通HTTP/SOCKS代理、multipart、transfer_stats和请求级自定义DNS解析同样直接走TCP路径，且绝不绕过代理。只有完整模板实际生效时才会把请求作为该记录的H3回放；不存在通用Rustls H3或仅复用Header的旁路。实际协议以`response.http_version`为准。
 
 ## WebSocket
 
@@ -288,7 +286,6 @@ history: list[Response]
 fingerprint_id: str
 impersonate: str
 http_version: str
-fingerprint_scope: str
 ok: bool
 json() -> Any
 raise_for_status() -> None
@@ -300,7 +297,7 @@ aclose() -> Awaitable[None]
 
 `Headers`大小写不敏感。`headers.get_list(name)`返回重复值列表；`headers.raw`保留完整二元组序列。
 
-`fingerprint_scope == "tls-http"`表示实际请求使用了profile的TLS与HTTP/1.1/2画像；`fingerprint_scope == "headers-only"`表示实际请求走通用HTTP/3后端，只应用稳定Header，不能将`fingerprint_id`解释为浏览器QUIC指纹等价。
+只要响应带有`fingerprint_id`，就表示该源模板已应用到实际TLS与HTTP/1.1/2传输；库不再提供“只应用部分模板”的响应状态。
 
 ## Cookie与代理
 
@@ -409,7 +406,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 关闭语义
 
-`Session.close()`和 `await AsyncSession.close()`禁止新请求并释放缓存的wreq与Reqwest Client、TCP和QUIC连接。关闭前已经接受的请求持有独立Client引用，可以继续完成。关闭后请求、代理修改和Cookie操作统一失败。
+`Session.close()`和 `await AsyncSession.close()`禁止新请求并释放缓存的wreq与模板H3 Client、TCP和QUIC连接。关闭前已经接受的请求持有独立Client引用，可以继续完成。关闭后请求、代理修改和Cookie操作统一失败。
 
 ## 错误边界
 
@@ -425,7 +422,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 - Chrome 152官方记录已内置；外部样本和wheel内置profile分别捕获真实ClientHello，`0xca34` payload均为206字节且SHA-256为`c9378c...ee01`，与源样本完全相同。非法Base64、长度错误和未来schema在Session构造期拒绝。
 - Firefox 151五次独立完整握手的核心TLS/HTTP2字段全部一致，已收敛为一条火种；同路由50请求只出现固定完整握手JA3及增加PSK扩展41的恢复JA3，`fingerprint_id`始终唯一。
 - Chrome/Edge在本地keep-alive代理上连续请求只建立1条物理连接；自然新建连接时原始JA3允许变化，过滤签名GREASE后的规范JA4、JA3N和`fingerprint_id`保持稳定。Firefox保持固定完整握手与PSK恢复结构。
-- 本地真实UDP/QUIC服务验证HTTP/3同步/异步GET与POST、同连接并发、静态DNS覆盖、重定向、Set-Cookie、Body上限、普通/流式Body、版本字段、取消和拒绝边界；公网证书验证直连`cloudflare-quic.com`返回`HTTP/3`响应。
+- Chrome 152 schema 2模板已完成真实UDP/H3回放：BoringSSL ClientHello、QUIC Transport Parameters、HTTP/3 SETTINGS、Header顺序和QPACK均由同一捕获记录驱动；schema 1仍不会进入UDP/H3。
 - HTTP/2 fork：431 passed、0 failed、1 ignored；文档测试40 passed、0 failed、1 ignored。
 - Python API覆盖动态代理、Cookie、重复Header、重定向、超时、同步/异步流、取消、并发读拒绝、multipart、Session关闭竞态和JSON兼容。
 - WebSocket覆盖同步/异步、WS/WSS、HTTP代理、WSS CONNECT预认证、SOCKS5、服务端Close、控制帧边界、50条不同代理身份和25 WS + 15 HTTP + 10 SOCKS5混合上限。
@@ -436,7 +433,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 - 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
 - 当前manylinux目标依赖glibc，不代表Alpine musl支持。
-- HTTP/3使用Reqwest/Quinn/Rustls直连；当前TCP代理、multipart和`transfer_stats`在`http3`偏好下从H2开始，WebSocket单独配置，也不复现wreq/BoringSSL浏览器TLS或QUIC指纹。
+- schema 2完整模板的直连HTTPS请求可走可验证的quiche+BoringSSL H3路径；schema 1、代理及其他不支持H3的场景走H2/H1.1。WebSocket单独配置。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
 - TCP字段来自浏览器和requests_rust共享的Windows内核网络栈，不代表能在其他系统伪造Windows TCP SYN。
 - 普通响应Body最终需要复制为Python `bytes`；Rust内部直接保留wreq返回的 `Bytes`，已去掉中间 `Bytes -> Vec<u8>`完整拷贝。大文件仍应使用流式接口降低峰值内存。

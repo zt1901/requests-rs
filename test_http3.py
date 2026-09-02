@@ -97,7 +97,6 @@ def 验证同步(url: str) -> None:
             cookies={"explicit": "yes"},
         )
         assert first.http_version == "HTTP/3"
-        assert first.fingerprint_scope == "headers-only"
         first_data = first.json()
         assert first_data["method"] == "GET"
         assert first_data["query"] == "page=1"
@@ -118,7 +117,6 @@ def 验证同步(url: str) -> None:
 
         streamed = session.get(url + "/stream", stream=True)
         assert streamed.http_version == "HTTP/3"
-        assert streamed.fingerprint_scope == "headers-only"
         assert streamed.content
         streamed.close()
 
@@ -178,7 +176,6 @@ def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> Non
             assert session.http_version == "http2"
             response = session.get(fallback_url)
             assert response.http_version == "HTTP/1.1"
-            assert response.fingerprint_scope == "tls-http"
 
         for preference in ("http3", "http2", "http1.1"):
             with Session(impersonate=测试版本, http_version=preference) as session:
@@ -231,18 +228,15 @@ def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> Non
         server.server_close()
         thread.join(timeout=5)
 
-    with Session(
-        impersonate=测试版本,
-        verify=False,
-        http_version="http3",
-        max_response_bytes=32,
-    ) as session:
+    # UDP-only H3 must not use the generic Quinn/Rustls client while claiming
+    # that the selected browser fingerprint was applied.
+    with Session(impersonate=测试版本, verify=False, http_version="http3") as session:
         try:
-            session.get(url + "/echo")
-        except RuntimeError as error:
-            assert "max_response_bytes" in str(error)
+            session.get(url + "/echo", timeout=1)
+        except RuntimeError:
+            pass
         else:
-            raise AssertionError("HTTP/3响应Body上限没有生效")
+            raise AssertionError("模板请求不应进入无法回放浏览器指纹的通用HTTP/3后端")
 
 
 async def 验证异步(url: str) -> None:
@@ -258,7 +252,6 @@ async def 验证异步(url: str) -> None:
             *(session.post(url + "/echo", data=f"body-{index}") for index in range(10))
         )
         assert all(response.http_version == "HTTP/3" for response in responses)
-        assert all(response.fingerprint_scope == "headers-only" for response in responses)
         assert [response.json()["body"] for response in responses] == [
             f"body-{index}" for index in range(10)
         ]
@@ -282,6 +275,76 @@ async def 验证异步(url: str) -> None:
         assert sentinel.http_version == "HTTP/3"
 
 
+def verify_schema2_http3(url: str) -> None:
+    from requests_rust import Session
+
+    with Session(impersonate="chrome152", verify=False, http_version="http3") as session:
+        response = session.get(url + "/echo", headers={"x-echo": "schema2"}, timeout=10)
+        assert response.http_version == "HTTP/3"
+        assert response.status_code == 200
+        assert response.json()["x_echo"] == "schema2"
+        assert response.fingerprint_id == "66e05a9d467e4b54b2c2b71f12ced6f7"
+        connection_id = response.headers["x-http3-connection-id"]
+
+        large_body = "x" * 200_000
+        posted = session.post(url + "/echo", data=large_body, timeout=10)
+        assert posted.http_version == "HTTP/3"
+        assert posted.json()["body"] == large_body
+        assert posted.headers["x-http3-connection-id"] == connection_id
+
+        redirected = session.get(url + "/redirect", timeout=10)
+        assert redirected.http_version == "HTTP/3"
+        assert redirected.url.endswith("/final")
+        assert len(redirected.history) == 1
+        assert redirected.history[0].status_code == 302
+        assert "redirected=1" in redirected.json()["cookie"]
+        assert redirected.headers["x-http3-connection-id"] == connection_id
+
+        not_redirected = session.get(url + "/redirect", allow_redirects=False, timeout=10)
+        assert not_redirected.status_code == 302
+        assert not_redirected.url.endswith("/redirect")
+        assert not not_redirected.history
+
+        compressed = session.get(url + "/gzip", timeout=10)
+        assert compressed.content == b"schema2-http3-compressed-response" * 256
+        assert "content-encoding" not in compressed.headers
+        assert compressed.headers["x-http3-connection-id"] == connection_id
+
+        streamed = session.get(url + "/stream", stream=True, timeout=10)
+        assert streamed.http_version == "HTTP/3"
+        assert streamed.content
+        assert streamed.headers["x-http3-connection-id"] == connection_id
+        streamed.close()
+
+    with Session(
+        impersonate="chrome152",
+        verify=False,
+        http_version="http3",
+        max_response_bytes=128,
+    ) as limited:
+        try:
+            limited.get(url + "/gzip", timeout=10)
+        except RuntimeError as error:
+            assert "max_response_bytes" in str(error)
+        else:
+            raise AssertionError("模板HTTP/3响应Body上限没有生效")
+
+
+async def verify_schema2_http3_async(url: str) -> None:
+    from requests_rust import AsyncSession
+
+    async with AsyncSession(
+        impersonate="chrome152", verify=False, http_version="http3"
+    ) as session:
+        responses = await asyncio.gather(
+            *(session.get(url + "/echo", headers={"x-echo": str(index)}, timeout=10)
+              for index in range(4))
+        )
+        assert all(response.http_version == "HTTP/3" for response in responses)
+        assert [response.json()["x_echo"] for response in responses] == [str(i) for i in range(4)]
+        assert len({response.headers["x-http3-connection-id"] for response in responses}) == 1
+
+
 def main() -> None:
     port = 获取UDP端口()
     with tempfile.TemporaryDirectory(prefix="requests-rust-http3-test-") as temp_dir:
@@ -290,10 +353,10 @@ def main() -> None:
         process = 启动服务(port, certificate, private_key)
         url = f"https://127.0.0.1:{port}"
         try:
-            验证同步(url)
-            asyncio.run(验证异步(url))
+            verify_schema2_http3(url)
+            asyncio.run(verify_schema2_http3_async(url))
             验证降级与边界(url, certificate, private_key)
-            print("HTTP/3优先、HTTP/1.1降级、同步、异步、连接复用、重定向、Cookie和流验证通过")
+            print("模板完整性优先、HTTP/3偏好自动降级和通用H3拒绝边界验证通过")
         finally:
             process.terminate()
             process.wait(timeout=5)

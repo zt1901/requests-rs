@@ -1,12 +1,13 @@
+use std::fs;
 use std::{
     env,
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
 };
-use std::fs;
 
 use bytes::{Buf, Bytes};
+use flate2::{Compression, write::GzEncoder};
 use http::{Request, Response, StatusCode, header};
 use quinn::crypto::rustls::QuicServerConfig;
 use serde_json::json;
@@ -19,11 +20,7 @@ fn 查询参数<'a>(request: &'a Request<()>, name: &str) -> Option<&'a str> {
     })
 }
 
-fn 构造响应(
-    request: &Request<()>,
-    request_body: &[u8],
-    connection_id: u64,
-) -> Response<Bytes> {
+fn 构造响应(request: &Request<()>, request_body: &[u8], connection_id: u64) -> Response<Bytes> {
     let path = request.uri().path();
     let builder = Response::builder()
         .status(StatusCode::OK)
@@ -49,6 +46,18 @@ fn 构造响应(
             .body(body)
             .expect("基准响应有效");
     }
+    if path == "/gzip" {
+        let original = b"schema2-http3-compressed-response".repeat(256);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).expect("gzip write");
+        let body = Bytes::from(encoder.finish().expect("gzip finish"));
+        return builder
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(body)
+            .expect("gzip响应有效");
+    }
     let body = json!({
         "method": request.method().as_str(),
         "path": path,
@@ -73,7 +82,10 @@ fn 构造响应(
         .expect("JSON响应有效")
 }
 
-async fn 处理连接(connection: quinn::Connection, connection_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn 处理连接(
+    connection: quinn::Connection,
+    connection_id: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut h3_connection =
         h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
     while let Some(resolver) = h3_connection.accept().await? {
@@ -96,7 +108,9 @@ async fn 处理连接(connection: quinn::Connection, connection_id: u64) -> Resu
                 if delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                stream.send_response(Response::from_parts(parts, ())).await?;
+                stream
+                    .send_response(Response::from_parts(parts, ()))
+                    .await?;
                 if !body.is_empty() {
                     stream.send_data(body).await?;
                 }
@@ -116,10 +130,8 @@ async fn 处理连接(connection: quinn::Connection, connection_id: u64) -> Resu
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let port = env::var("HTTP3_TEST_PORT")?.parse::<u16>()?;
-    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])?;
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
     if let Ok(path) = env::var("HTTP3_TEST_CERT") {
         fs::write(path, cert.pem())?;
     }
@@ -132,9 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
-    let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
-        QuicServerConfig::try_from(tls)?,
-    ));
+    let server_config =
+        quinn::ServerConfig::with_crypto(std::sync::Arc::new(QuicServerConfig::try_from(tls)?));
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let endpoint = quinn::Endpoint::server(server_config, address)?;
     println!("HTTP3_READY={}", endpoint.local_addr()?);
