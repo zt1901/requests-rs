@@ -1,0 +1,2 @@
+820198f4e9a6b185b40534ee08829df5fbaa34efe09bfae2c88dcb6cf53b4a68  requests_rs-0.4.0-cp310-abi3-win_amd64.whl
+3955c7ca9b0cf353a3eb9b80f4adab88df71c13e6273f0e6806b12d3c90ff912  requests_rs-0.4.0-cp310-abi3-manylinux_2_38_x86_64.whl
