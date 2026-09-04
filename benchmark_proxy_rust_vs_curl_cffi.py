@@ -25,7 +25,8 @@ import requests
 import wreq
 from urllib3.exceptions import InsecureRequestWarning
 from curl_cffi import requests as curl_requests
-from requests_rust import AsyncSession
+from requests_rs import requests
+AsyncSession = requests.AsyncSession
 
 
 # 基准后端使用本地自签名证书且请求明确关闭校验，关闭重复告警以免影响同步库测量。

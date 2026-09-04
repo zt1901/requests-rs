@@ -7,7 +7,8 @@ import statistics
 import time
 
 import psutil
-from requests_rust import AsyncSession
+from requests_rs import requests
+AsyncSession = requests.AsyncSession
 
 
 # 可右键运行；脚本会自动启动本地代理，不访问外网。

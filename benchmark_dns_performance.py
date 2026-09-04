@@ -12,7 +12,9 @@ import time
 
 import psutil
 
-from requests_rust import AsyncSession
+from requests_rs import requests
+
+AsyncSession = requests.AsyncSession
 
 
 # 可右键运行；所有HTTP和DNS流量仅使用本机回环地址。

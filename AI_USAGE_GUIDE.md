@@ -1,39 +1,21 @@
-# requests_rust 0.3.0 AI使用手册
+# requests-rs 0.4.0 AI使用手册
 
 ## 定位
 
-`requests_rust`是Python 3.10+的浏览器指纹HTTP、HTTP/3、代理和WebSocket原生扩展。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过quiche/BoringSSL执行schema 2模板驱动的HTTP/3，并通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
+`requests-rs`是Python 3.10+的浏览器指纹HTTP、HTTP/3、代理和WebSocket原生扩展，唯一公开调用方式是`from requests_rs import requests`。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过quiche/BoringSSL执行schema 2模板驱动的HTTP/3，并通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
 
-当前完整回归成品为`requests_rust-0.3.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、quiche、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
+当前完整回归成品为`requests_rs-0.4.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、quiche、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
 
 ## 导入
 
 ```python
-from requests_rust import (
-    AsyncSession,
-    AsyncWebSocket,
-    Cookies,
-    Headers,
-    Response,
-    Session,
-    WebSocket,
-    WebSocketMessage,
-    available_profiles,
-    delete,
-    get,
-    head,
-    options,
-    patch,
-    post,
-    put,
-    request,
-)
+from requests_rs import requests
 ```
 
 内置Profile：`chrome146`、`chrome150`、`chrome152`、`edge152`、`firefox151`。这些名称是已采集并验证的固定快照，不代表官网当前Stable，也不会自动随浏览器升级。`chrome152`来自Google Chrome 152.0.7977.64官方正式版，Trust Anchor Identifiers扩展`0xca34`已完成线级回放；`edge152`来自Microsoft Edge 152.0.4191.53系统稳定版；`firefox151`来自playwright_rust Juggler，只是研发兼容快照，不代表Mozilla官网Stable。
 
 ```python
-print(available_profiles())
+print(requests.available_profiles())
 ```
 
 ## Session
@@ -111,9 +93,9 @@ profile默认Header只在调用方没有传同名Header时兜底。值allowlist�
 同步示例：
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
-with Session(impersonate="chrome150") as session:
+with requests.Session(impersonate="chrome150") as session:
     response = session.post(
         "https://example.com/api",
         params={"page": 1},
@@ -130,7 +112,7 @@ with Session(impersonate="chrome150") as session:
 
 支持方法：`request`、`get`、`post`、`put`、`patch`、`delete`、`head`、`options`。
 
-`requests_rust` 优先与 `curl_cffi.requests` 保持高频名称和参数一致，方便替换既有调用；但不承诺兼容其全部专有参数、底层对象或 TLS 行为。未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
+`requests_rs.requests` 优先与 `curl_cffi.requests` 保持高频名称和参数一致，方便替换既有调用；但不承诺兼容其全部专有参数、底层对象或 TLS 行为。未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
 请求关键字参数：
 
@@ -159,11 +141,11 @@ with Session(impersonate="chrome150") as session:
 
 ```python
 import asyncio
-from requests_rust import AsyncSession
+from requests_rs import requests
 
 
 async def main():
-    async with AsyncSession(
+    async with requests.AsyncSession(
         impersonate="firefox151",
     ) as session:
         first, second = await asyncio.gather(

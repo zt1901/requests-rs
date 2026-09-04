@@ -1241,7 +1241,7 @@ def request(
     method: str,
     url: str,
     *,
-    impersonate: FingerprintInput,
+    impersonate: FingerprintInput = "chrome152",
     fingerprint_rotation: bool = True,
     proxy: str | None = None,
     proxies: ProxyInput | None = None,

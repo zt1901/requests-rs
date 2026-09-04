@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from requests_rust import AsyncSession, Response
+from requests_rs import requests
+
+AsyncSession = requests.AsyncSession
+
+Response = requests.Response
 
 
 # 本地直接运行的默认代理；传入代理时优先使用传入值。

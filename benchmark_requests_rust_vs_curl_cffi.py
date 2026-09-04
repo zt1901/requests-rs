@@ -3,7 +3,8 @@ import statistics
 import time
 
 from curl_cffi import requests as curl_requests
-from requests_rust import Session
+from requests_rs import requests
+Session = requests.Session
 
 
 # 可右键运行；先用Debian 12容器在本机18080端口启动HTTP服务。

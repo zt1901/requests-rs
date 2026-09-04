@@ -4814,8 +4814,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let api_module = PyModule::from_code(
         module.py(),
         API包装源码,
-        c"requests_rust._embedded_api",
-        c"requests_rust._embedded_api",
+        c"requests_rs._embedded_api",
+        c"requests_rs._embedded_api",
     )?;
     for name in [
         "Response",

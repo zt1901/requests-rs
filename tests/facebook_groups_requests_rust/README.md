@@ -16,7 +16,7 @@
 
 | 原项目 | 此测试副本 |
 |---|---|
-| `curl_cffi.requests.AsyncSession` | `requests_rust.AsyncSession` |
+| `curl_cffi.requests.AsyncSession` | `requests_rs.requests.AsyncSession` |
 | `curl_cffi` 的 `proxies={...}` | `requests_rust` 的请求级 `proxy=` |
 | `curl_cffi` 的 `impersonate` | `requests_rust` 的 profile 名称或单 profile 指纹文件路径；兼容旧式 `fingerprints_path`，测试基类保留按 profile 覆盖 UA 的原逻辑 |
 

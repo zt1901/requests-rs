@@ -53,7 +53,8 @@ def _查找ClientHello扩展(record: bytes, wanted: int) -> bytes | None:
 
 
 def _捕获一次ClientHello(profile: Any) -> bytes:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -103,7 +104,9 @@ def _写临时指纹(directory: Path, name: str, document: object) -> Path:
 
 
 def main() -> None:
-    from requests_rust import Session, available_profiles
+    from requests_rs import requests
+    Session = requests.Session
+    available_profiles = requests.available_profiles
 
     source = json.loads(Chrome152样本.read_text(encoding="utf-8"))
     record = source[0]

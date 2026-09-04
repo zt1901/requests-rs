@@ -209,7 +209,11 @@ def 创建代理处理器(name):
 
 
 def main():
-    from requests_rust import AsyncSession, Response, Session, get
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
+    Response = requests.Response
+    Session = requests.Session
+    get = requests.get
 
     quoted_charset = Response(
         status_code=200,
@@ -675,12 +679,13 @@ def main():
         assert shortcut.headers["x-test-proxy"] == "A"
 
         async def 测试异步API():
-            from requests_rust import Response
-            from requests_rust._native import NativeSession
+            from requests_rs import requests
+            Response = requests.Response
+            from requests_rs._native import NativeSession
 
             # 公共包装已编译进_native.pyd，源码不可再由inspect读取；异步行为以下方真实并发与流式请求验证。
-            assert AsyncSession.__module__ == "requests_rust._embedded_api"
-            assert Response.__module__ == "requests_rust._embedded_api"
+            assert AsyncSession.__module__ == "requests_rs._embedded_api"
+            assert Response.__module__ == "requests_rs._embedded_api"
             async with AsyncSession(impersonate=测试版本) as session:
                 responses = await asyncio.gather(
                     session.get(target_url + "/headers"),

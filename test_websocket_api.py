@@ -345,7 +345,8 @@ def 断言消息(message, message_type: str, data) -> None:
 
 
 def 测试同步直连(ws_url: str) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     with Session(impersonate=测试版本) as session:
         session.cookies.set("session_cookie", "kept", url=ws_url.replace("ws://", "http://"))
@@ -380,7 +381,8 @@ def 测试同步直连(ws_url: str) -> None:
 
 
 async def 测试异步直连(ws_url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本) as session:
         async with await session.websocket(ws_url) as websocket:
@@ -394,7 +396,8 @@ async def 测试异步直连(ws_url: str) -> None:
 
 
 async def 测试动态代理并发连接(proxy_port: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本) as session:
         async def 建立连接(index: int):
@@ -425,7 +428,8 @@ async def 测试动态代理并发连接(proxy_port: int) -> None:
 
 
 async def 测试动态SOCKS5并发连接(ws_url: str, proxy_port: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本) as session:
         async def 建立连接(index: int):
@@ -454,7 +458,8 @@ async def 测试混合连接池(
     socks_target_handler,
     response_gate: threading.Event,
 ) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本, max_connections=50) as session:
         async def 建立WebSocket(index: int):
@@ -522,7 +527,8 @@ async def 测试混合连接池(
 
 
 async def 测试连接槽位生命周期(ws_url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     http_url = ws_url.replace("ws://", "http://")
 
@@ -576,7 +582,8 @@ async def 测试连接槽位生命周期(ws_url: str) -> None:
 
 
 async def 测试接收队列溢出(ws_url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本) as session:
         websocket = await session.websocket(ws_url + "/burst")
@@ -638,7 +645,8 @@ async def 测试并发流读取不释放槽位(
     normal_url: str,
     response_gate: threading.Event,
 ) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试版本, max_connections=1) as session:
         response = await session.get(slow_url, stream=True)
@@ -661,7 +669,8 @@ async def 测试并发流读取不释放槽位(
 
 
 def 测试HTTP代理(proxy_port: int) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     proxy = (
         f"http://{quote(代理用户名, safe='')}:{quote(代理密码, safe='')}"
@@ -675,7 +684,8 @@ def 测试HTTP代理(proxy_port: int) -> None:
 
 
 def 测试WSS(wss_url: str) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     with Session(impersonate=测试版本, verify=False) as session:
         with session.websocket(wss_url) as websocket:
@@ -685,7 +695,8 @@ def 测试WSS(wss_url: str) -> None:
 
 
 def 测试WSS_HTTP代理(wss_url: str, proxy_port: int) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     proxy = (
         f"http://{quote(代理用户名, safe='')}:{quote(代理密码, safe='')}"
@@ -699,7 +710,8 @@ def 测试WSS_HTTP代理(wss_url: str, proxy_port: int) -> None:
 
 
 def 测试SOCKS5代理(ws_url: str, proxy_port: int) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     proxy = (
         f"socks5h://{quote(代理用户名, safe='')}:{quote(代理密码, safe='')}"
@@ -713,7 +725,8 @@ def 测试SOCKS5代理(ws_url: str, proxy_port: int) -> None:
 
 
 def 测试WSS_SOCKS5代理(wss_url: str, proxy_port: int) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     proxy = (
         f"socks5h://{quote(代理用户名, safe='')}:{quote(代理密码, safe='')}"

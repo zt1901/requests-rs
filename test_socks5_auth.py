@@ -77,7 +77,8 @@ class SOCKS5服务(socketserver.ThreadingTCPServer):
 
 
 def main() -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     server = SOCKS5服务(("127.0.0.1", 0), SOCKS5处理器)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

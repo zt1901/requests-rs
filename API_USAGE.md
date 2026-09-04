@@ -1,6 +1,6 @@
-# requests_rust 使用与 API 手册
+# requests-rs 使用与 API 手册
 
-`requests_rust` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端。网络由 Rust 执行，支持 TLS/HTTP2/QUIC/HTTP3 指纹、HTTP/1.1、HTTP/2、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。schema 2 模板可直接真实回放 H3；旧 schema 自动使用 H2/H1.1。
+`requests-rs` 是 Python 3.10+ 的浏览器指纹 HTTP 与 WebSocket 客户端，唯一公开入口是 `from requests_rs import requests`。网络由 Rust 执行，支持 TLS/HTTP2/QUIC/HTTP3 指纹、HTTP/1.1、HTTP/2、IPv4/IPv6、HTTP 与 SOCKS5 代理、Cookie、重定向、流式响应、multipart 和 WebSocket。schema 2 模板可直接真实回放 H3；旧 schema 自动使用 H2/H1.1。
 
 高频 API 命名接近 `curl_cffi.requests`，但未实现的关键字参数会抛出 `TypeError`，不会被静默忽略。
 
@@ -9,7 +9,7 @@
 从 [GitHub Releases](https://github.com/zt1901/requests_rust-source/releases) 下载与系统、CPU架构匹配的wheel，再安装：
 
 ```bash
-python -m pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
+python -m pip install requests_rs-0.4.0-cp310-abi3-win_amd64.whl
 ```
 
 wheel 使用 CPython stable ABI，要求 CPython 3.10 或更高版本。
@@ -33,7 +33,7 @@ git clone https://github.com/zt1901/requests_rust-source.git
 cd requests_rust-source
 python -m pip install "maturin>=1.9,<2"
 maturin build --release --out dist
-python -m pip install --force-reinstall dist/requests_rust-*.whl
+python -m pip install --force-reinstall dist/requests_rs-*.whl
 ```
 
 源码构建还需要Rust stable、CMake、Clang/libclang和当前平台的C/C++工具链。Windows开发者也可右键运行`build_and_install.py`，它会同步指纹、构建wheel并安装到当前Python。
@@ -41,21 +41,9 @@ python -m pip install --force-reinstall dist/requests_rust-*.whl
 ## 导入与内置指纹
 
 ```python
-from requests_rust import (
-    AsyncSession,
-    Session,
-    available_profiles,
-    delete,
-    get,
-    head,
-    options,
-    patch,
-    post,
-    put,
-    request,
-)
+from requests_rs import requests
 
-print(available_profiles())
+print(requests.available_profiles())
 ```
 
 当前内置profile如下。名称表示真实采集并验证的快照，不代表官网当前Stable，也不会自动跟随浏览器升级。
@@ -90,7 +78,7 @@ profile决定TLS/HTTP2传输画像，不应保存业务Cookie、认证Header、C
 ### 第一个可运行脚本
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
 
 # 【可调参数】先使用公开测试页面跑通，再换成自己的业务地址。
@@ -98,7 +86,7 @@ from requests_rust import Session
 指纹版本 = "edge152"
 
 
-with Session(impersonate=指纹版本, timeout=30) as 会话:
+with requests.Session(impersonate=指纹版本, timeout=30) as 会话:
     响应 = 会话.get(
         目标地址,
         headers={"accept": "text/html,application/xhtml+xml"},
@@ -122,9 +110,9 @@ with Session(impersonate=指纹版本, timeout=30) as 会话:
 `Session` 适合顺序请求或现有同步业务代码。应通过上下文管理器或 `close()` 释放连接池资源。
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
-with Session(
+with requests.Session(
     impersonate="chrome150",
     headers={"Accept": "application/json"},
     timeout=30,
@@ -238,11 +226,11 @@ DNS性能应按业务实际任务模型测试。仓库的`benchmark_dns_performa
 
 ```python
 import asyncio
-from requests_rust import AsyncSession
+from requests_rs import requests
 
 
 async def main():
-    async with AsyncSession(
+    async with requests.AsyncSession(
         impersonate="firefox151",
         max_connections=50,
         proxy="http://user:password@proxy.example:8080",
@@ -322,17 +310,16 @@ await session.close()
 无需手动创建 Session 时可以使用模块级方法；它们会为这一次调用创建并关闭 Session，适合低频简单请求，不适合高并发循环。
 
 ```python
-from requests_rust import get, post
+from requests_rs import requests
 
-response = get("https://example.com/", impersonate="chrome150")
-created = post(
+response = requests.get("https://example.com/")  # 默认使用 chrome152
+created = requests.post(
     "https://example.com/api/items",
-    impersonate="chrome150",
     json={"name": "demo"},
 )
 ```
 
-模块级 `request/get/post/put/patch/delete/head/options` 都需要传入 `impersonate`。
+模块级 `request/get/post/put/patch/delete/head/options` 默认使用 `chrome152`；需要其他模板时再显式传入 `impersonate`。
 
 ## 请求参数
 
@@ -377,9 +364,9 @@ response = session.get(
 同步示例：
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
-with Session(impersonate="chrome146", proxy="http://user:password@proxy.example:8080") as session:
+with requests.Session(impersonate="chrome146", proxy="http://user:password@proxy.example:8080") as session:
     with session.websocket(
         "wss://example.com/socket",
         headers={"Origin": "https://example.com"},
@@ -394,9 +381,9 @@ with Session(impersonate="chrome146", proxy="http://user:password@proxy.example:
 异步示例：
 
 ```python
-from requests_rust import AsyncSession
+from requests_rs import requests
 
-async with AsyncSession(impersonate="chrome146") as session:
+async with requests.AsyncSession(impersonate="chrome146") as session:
     async with await session.websocket("wss://example.com/socket") as websocket:
         await websocket.send_bytes(b"payload")
         async for message in websocket:
@@ -567,7 +554,7 @@ with Session(impersonate=捕获结果, fingerprint_rotation=False) as 会话:
 ```python
 from pathlib import Path
 
-from requests_rust import Session
+from requests_rs import requests
 
 
 # 【可调参数】替换为捕获器生成的真实文件和业务地址。
@@ -584,7 +571,7 @@ from requests_rust import Session
     ("sec-fetch-dest", "document"),
 ]
 
-with Session(
+with requests.Session(
     impersonate=指纹文件,
     fingerprint_rotation=False,
     headers=浏览器请求头,

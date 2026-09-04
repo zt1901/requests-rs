@@ -6,7 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from requests_rust import Session
+from requests_rs import requests
+
+Session = requests.Session
 
 
 FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "chrome152_schema2.json"

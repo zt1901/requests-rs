@@ -44,7 +44,8 @@ def 等待端口(端口: int, 进程: subprocess.Popen) -> None:
 
 
 def main() -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     所有记录 = json.loads((项目目录 / "fingerprints.json").read_text(encoding="utf-8"))
     源记录 = next(记录 for 记录 in 所有记录 if 记录["profile"] == "edge152")

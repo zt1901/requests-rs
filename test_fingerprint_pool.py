@@ -56,7 +56,8 @@ def 代理地址(port: int, session_id: str) -> str:
 
 
 async def 验证自然指纹池(port: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     target = "http://pool-target.test/resource"
     proxy_a = 代理地址(port, "session-a")

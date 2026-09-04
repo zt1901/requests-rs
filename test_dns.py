@@ -147,7 +147,8 @@ def 启动服务(server) -> threading.Thread:
 
 
 async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     dns_server = f"127.0.0.1:{dns_port}"
     async with AsyncSession(
@@ -248,7 +249,8 @@ async def 验证DNS(dns_port: int, http_port: int, proxy_port: int, socks_port: 
 
 
 def main() -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     tcp_dns = 线程TCP服务(("127.0.0.1", 0), TCPDNS处理器)
     dns_port = tcp_dns.server_address[1]

@@ -92,7 +92,9 @@ def main():
     )
     try:
         等待捕获器启动(测试端口, server)
-        from requests_rust import Session, available_profiles
+        from requests_rs import requests
+        Session = requests.Session
+        available_profiles = requests.available_profiles
 
         print("内置版本:", available_profiles())
         with Session(

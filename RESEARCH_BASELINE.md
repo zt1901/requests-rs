@@ -64,7 +64,7 @@
 浏览器已人工完成登录和业务操作后，Copy as cURL 的请求可转换为：
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
 浏览器请求头 = {
     "accept": "application/json, text/plain, */*",
@@ -80,7 +80,7 @@ from requests_rust import Session
     "x-csrf-token": "浏览器当前操作得到的值",
 }
 
-with Session(
+with requests.Session(
     impersonate="chrome150",
 ) as session:
     response = session.post(

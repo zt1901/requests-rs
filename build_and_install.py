@@ -10,7 +10,7 @@ from pathlib import Path
 # 可右键运行：同步指纹、构建支持Python 3.10及以上版本的wheel并安装。
 项目目录 = Path(__file__).resolve().parent
 输出目录 = 项目目录 / "dist"
-源码原生模块 = 项目目录 / "python" / "requests_rust" / "_native.pyd"
+源码原生模块 = 项目目录 / "python" / "requests_rs" / "_native.pyd"
 本机构建缓存 = Path(r"D:\BuildCache\requests-rust-target")
 本机LLVM目录 = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin")
 本机Cargo目录 = Path(r"D:\Rust\cargo")
@@ -34,7 +34,7 @@ def run(*command):
 def 同步可编辑原生模块(wheel: Path):
     """editable 安装通过 .pth 指向源码目录，需同步 wheel 内的新原生模块。"""
     with zipfile.ZipFile(wheel) as archive:
-        with archive.open("requests_rust/_native.pyd") as source:
+        with archive.open("requests_rs/_native.pyd") as source:
             临时模块 = 源码原生模块.with_suffix(".pyd.tmp")
             临时模块.write_bytes(source.read())
             os.replace(临时模块, 源码原生模块)
@@ -51,7 +51,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="requests-rust-wheel-") as temp_dir:
         build_output = Path(temp_dir)
         run(maturin, "build", "--release", "--out", str(build_output))
-        wheels = list(build_output.glob("requests_rust-*.whl"))
+        wheels = list(build_output.glob("requests_rs-*.whl"))
         if len(wheels) != 1:
             raise RuntimeError(f"本次构建应生成唯一wheel，实际为: {wheels}")
         wheel = wheels[0]

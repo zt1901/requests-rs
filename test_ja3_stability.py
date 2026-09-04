@@ -37,7 +37,8 @@ def 等待端口(port: int, process: subprocess.Popen) -> None:
 
 def main() -> None:
     from curl_cffi.requests import Session as CurlSession
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     port = 获取空闲端口()
     url = f"https://127.0.0.1:{port}/api/fingerprint?source=ja3-stability"

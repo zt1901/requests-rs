@@ -5,7 +5,8 @@ import os
 import time
 
 import psutil
-from requests_rust import AsyncSession
+from requests_rs import requests
+AsyncSession = requests.AsyncSession
 
 
 # 可右键运行；脚本自动启动本地HTTP服务，不访问外网。

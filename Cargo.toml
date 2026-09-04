@@ -1,6 +1,6 @@
 [package]
 name = "requests_rust"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zt1901/requests_rust-source"
@@ -40,7 +40,7 @@ http = "1"
 http2 = { path = "vendor/http2" }
 
 [target.'cfg(not(windows))'.dependencies]
-wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws", "prefix-symbols"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws"] }
 
 [profile.release]
 codegen-units = 1

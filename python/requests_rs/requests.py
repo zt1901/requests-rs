@@ -1,12 +1,14 @@
+"""The requests-style public API exported by :mod:`requests_rs`."""
+
 from ._native import (
     AsyncSession,
+    AsyncWebSocket,
     Cookie,
     CookieTypes,
     Cookies,
     Headers,
     Response,
     Session,
-    AsyncWebSocket,
     WebSocket,
     WebSocketMessage,
     available_profiles,

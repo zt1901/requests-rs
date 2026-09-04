@@ -63,7 +63,8 @@ class 预认证代理处理器(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), 预认证代理处理器)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

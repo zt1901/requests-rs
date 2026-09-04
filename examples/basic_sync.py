@@ -1,4 +1,4 @@
-from requests_rust import Session
+from requests_rs import requests
 
 
 # 【可调参数】右键运行前只需要修改这里。
@@ -8,7 +8,7 @@ from requests_rust import Session
 
 
 def main() -> None:
-    with Session(
+    with requests.Session(
         impersonate=指纹版本,
         timeout=请求超时秒数,
     ) as 会话:

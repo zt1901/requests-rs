@@ -8,7 +8,9 @@ from urllib.parse import quote
 
 import psutil
 
-from requests_rust import AsyncSession
+from requests_rs import requests
+
+AsyncSession = requests.AsyncSession
 
 
 # 【可调参数】同一IPIPGO账号、端口和sticky session，仅切换HTTP/SOCKS5协议。

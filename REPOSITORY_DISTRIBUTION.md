@@ -83,11 +83,11 @@ maturin build --release --out dist
 当前版本wheel命名示例：
 
 ```text
-requests_rust-0.3.0-cp310-abi3-win_amd64.whl
-requests_rust-0.3.0-cp310-abi3-win_arm64.whl
-requests_rust-0.3.0-cp310-abi3-manylinux_2_34_x86_64.whl
-requests_rust-0.3.0-cp310-abi3-manylinux_2_34_aarch64.whl
-requests_rust-0.3.0-cp310-abi3-macosx_11_0_arm64.whl
+requests_rs-0.4.0-cp310-abi3-win_amd64.whl
+requests_rs-0.4.0-cp310-abi3-win_arm64.whl
+requests_rs-0.4.0-cp310-abi3-manylinux_2_34_x86_64.whl
+requests_rs-0.4.0-cp310-abi3-manylinux_2_34_aarch64.whl
+requests_rs-0.4.0-cp310-abi3-macosx_11_0_arm64.whl
 ```
 
 ## Profile发布门禁
@@ -97,7 +97,7 @@ requests_rust-0.3.0-cp310-abi3-macosx_11_0_arm64.whl
 1. 浏览器正式产品名称、完整版本、来源和二进制摘要。
 2. TLS、HTTP/2、Header顺序和生命周期采集记录。
 3. 对GREASE、随机KeyShare、ECH载荷和Chromium扩展乱序的正确归一化。
-4. `requests_rust`直接加载捕获JSON的回放结果。
+4. `from requests_rs import requests`直接加载捕获JSON的回放结果。
 5. 内置profile同步脚本结果和对应回归。
 
 禁止通过修改profile名称、UA或Client Hints让旧记录冒充新浏览器。Juggler、Nightly、Chromium和其他研发构建必须明确标注，不能写成Chrome或Firefox官网Stable。

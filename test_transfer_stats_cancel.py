@@ -6,7 +6,9 @@ import os
 
 import psutil
 
-from requests_rust import AsyncSession
+from requests_rs import requests
+
+AsyncSession = requests.AsyncSession
 
 
 # 可右键运行；黑洞地址只用于让计量隧道停留在连接阶段，不发送业务数据。

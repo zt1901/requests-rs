@@ -154,7 +154,8 @@ def 断言Rust后端响应(response) -> None:
 
 
 async def 测试异步全部代理入口(target_url: str, proxy_a: str, proxy_b: str, handler_a, handler_b) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(impersonate=测试指纹版本, proxy=proxy_a, verify=False) as session:
         断言Rust后端响应(await session.get(target_url + "?async=constructor"))
@@ -192,7 +193,9 @@ async def 测试异步全部代理入口(target_url: str, proxy_a: str, proxy_b:
 
 
 def main() -> None:
-    from requests_rust import Session, get
+    from requests_rs import requests
+    Session = requests.Session
+    get = requests.get
 
     backend_port = 获取空闲端口()
     executable = 准备Rust后端()

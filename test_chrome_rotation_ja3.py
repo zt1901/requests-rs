@@ -44,7 +44,8 @@ def 去除PSK扩展(ja3: str) -> str:
 
 
 async def main() -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     backend_port = 获取空闲端口()
     proxy_port = 获取空闲端口()

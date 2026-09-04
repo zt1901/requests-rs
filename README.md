@@ -1,4 +1,4 @@
-# requests_rust
+# requests-rs
 
 <p align="center">
   <strong>Python 的浏览器网络指纹客户端，核心网络路径由 Rust 执行。</strong>
@@ -12,7 +12,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green">
 </p>
 
-`requests_rust` 为 Python 提供接近 `curl_cffi.requests` 使用习惯的同步和原生异步 API。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行。schema 2 指纹包含完整 QUIC/H3 模板时，`http3` 会真实回放该模板；schema 1 或代理场景自动使用 H2/H1.1。
+`requests-rs` 为 Python 提供接近 `requests` 使用习惯的同步和原生异步 API。唯一公开入口是 `from requests_rs import requests`。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行。schema 2 指纹包含完整 QUIC/H3 模板时，`http3` 会真实回放该模板；schema 1 或代理场景自动使用 H2/H1.1。
 
 适合需要长期 Session、真实连接复用、代理身份隔离和可审计浏览器传输画像的采集、自动化与网络研究项目。
 
@@ -32,7 +32,7 @@
 项目发布 wheel 后，从 [GitHub Releases](https://github.com/zt1901/requests_rust-source/releases) 下载与系统和 CPU 匹配的文件：
 
 ```bash
-python -m pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
+python -m pip install requests_rs-0.4.0-cp310-abi3-win_amd64.whl
 ```
 
 当前 wheel 使用 CPython stable ABI，支持 CPython 3.10 及以上版本。仓库尚未发布对应 Release 时，可按下方“从源码构建”操作。
@@ -40,9 +40,9 @@ python -m pip install requests_rust-0.3.0-cp310-abi3-win_amd64.whl
 ### 2. 发起请求
 
 ```python
-from requests_rust import Session
+from requests_rs import requests
 
-with Session(impersonate="edge152", timeout=30) as 会话:
+with requests.Session(impersonate="edge152", timeout=30) as 会话:
     响应 = 会话.get(
         "https://example.com/",
         headers={"accept": "text/html,application/xhtml+xml"},
@@ -57,12 +57,12 @@ with Session(impersonate="edge152", timeout=30) as 会话:
 
 ```python
 import asyncio
-from requests_rust import AsyncSession
+from requests_rs import requests
 
 
 async def 异步主程序() -> None:
     目标地址列表 = [f"https://example.com/?task={序号}" for 序号 in range(10)]
-    async with AsyncSession(
+    async with requests.AsyncSession(
         impersonate="edge152",
         max_connections=10,
     ) as 会话:
@@ -85,7 +85,7 @@ asyncio.run(异步主程序())
 
 ```python
 from pathlib import Path
-from requests_rust import Session
+from requests_rs import requests
 
 指纹文件 = Path(r"C:\fingerprints\edge152.json")
 
@@ -98,7 +98,7 @@ from requests_rust import Session
     ("sec-fetch-dest", "document"),
 ]
 
-with Session(
+with requests.Session(
     impersonate=指纹文件,
     fingerprint_rotation=False,
     headers=浏览器请求头,
@@ -184,7 +184,7 @@ Alpine musl 和 macOS Intel 当前不在发布矩阵中。原生安装冒烟不�
 
 ## 功能边界
 
-- `requests_rust` 兼容 `curl_cffi.requests` 的高频命名，不承诺兼容全部专有参数；未知关键字会明确报错。
+- `requests_rs.requests` 兼容 `curl_cffi.requests` 的高频命名，不承诺兼容全部专有参数；未知关键字会明确报错。
 - schema 2 模板统一覆盖 H1/H2/H3；schema 1 只覆盖 H1/H2，选择`http3`时安全降级，不会执行半指纹 H3 请求。
 - `verify=False` 只适用于受控本地自签名测试。
 - 不同 profile 不共享 TLS/HTTP2 连接池，这是指纹隔离要求。
@@ -209,7 +209,7 @@ git clone https://github.com/zt1901/requests_rust-source.git
 cd requests_rust-source
 python -m pip install "maturin>=1.9,<2"
 maturin build --release --out dist
-python -m pip install --force-reinstall dist/requests_rust-*.whl
+python -m pip install --force-reinstall dist/requests_rs-*.whl
 ```
 
 Windows 开发环境也可右键运行 `build_and_install.py`。该脚本同步内置指纹、构建wheel、安装到当前Python，并同步editable源码目录中的原生模块。

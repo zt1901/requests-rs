@@ -41,7 +41,8 @@ def 启动IPv6服务():
 
 
 async def 验证异步(url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(
         impersonate=测试版本,
@@ -54,7 +55,8 @@ async def 验证异步(url: str) -> None:
 
 
 def main() -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     server, thread = 启动IPv6服务()
     url = f"http://[::1]:{server.server_address[1]}/ipv6"

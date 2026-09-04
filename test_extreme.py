@@ -102,7 +102,8 @@ class 切换代理处理器(socketserver.StreamRequestHandler):
 
 
 async def 验证极端(url: str, proxy_port: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     try:
         AsyncSession(impersonate=测试版本, max_connections=2**63 - 1)
@@ -248,7 +249,8 @@ async def 验证极端(url: str, proxy_port: int) -> None:
 
 
 async def 验证代理切换竞态(proxy_a: int, proxy_b: int) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     session = AsyncSession(
         impersonate=测试版本,

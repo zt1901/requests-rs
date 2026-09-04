@@ -82,7 +82,8 @@ async def 运行批次(请求函数, 请求数量: int) -> None:
 
 
 async def 测量原生Future(测试地址: str, 事件循环: 计数事件循环) -> dict:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(
         impersonate=测试版本,
@@ -115,7 +116,8 @@ async def 测量原生Future(测试地址: str, 事件循环: 计数事件循环
 
 
 async def 测量线程池(测试地址: str, 事件循环: 计数事件循环) -> dict:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     with Session(
         impersonate=测试版本,

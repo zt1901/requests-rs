@@ -189,7 +189,8 @@ class 透明QUIC中继:
 
 async def 创建客户端(name: str, max_connections: int):
     if name == "requests_rust":
-        from requests_rust import AsyncSession
+        from requests_rs import requests
+        AsyncSession = requests.AsyncSession
 
         return AsyncSession(
             impersonate=测试版本,

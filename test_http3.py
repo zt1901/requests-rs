@@ -82,7 +82,8 @@ def 启动服务(port: int, certificate: Path, private_key: Path) -> subprocess.
 
 
 def 验证同步(url: str) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     with Session(
         impersonate=测试版本,
@@ -138,7 +139,8 @@ def 验证同步(url: str) -> None:
 
 
 def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     try:
         Session(impersonate=测试版本, http_version="invalid")
@@ -240,7 +242,8 @@ def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> Non
 
 
 async def 验证异步(url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(
         impersonate=测试版本,
@@ -276,7 +279,8 @@ async def 验证异步(url: str) -> None:
 
 
 def verify_schema2_http3(url: str) -> None:
-    from requests_rust import Session
+    from requests_rs import requests
+    Session = requests.Session
 
     with Session(impersonate="chrome152", verify=False, http_version="http3") as session:
         response = session.get(url + "/echo", headers={"x-echo": "schema2"}, timeout=10)
@@ -331,7 +335,8 @@ def verify_schema2_http3(url: str) -> None:
 
 
 async def verify_schema2_http3_async(url: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(
         impersonate="chrome152", verify=False, http_version="http3"

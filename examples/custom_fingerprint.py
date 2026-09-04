@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from requests_rust import Session
+from requests_rs import requests
 
 
 # 【可调参数】指向指纹捕获器导出的单profile JSON。
@@ -22,7 +22,7 @@ def main() -> None:
     if not 指纹文件.is_file():
         raise FileNotFoundError(f"请先把指纹文件路径改成真实JSON: {指纹文件}")
 
-    with Session(
+    with requests.Session(
         impersonate=指纹文件,
         fingerprint_rotation=False,
         headers=浏览器请求头,

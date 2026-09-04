@@ -41,7 +41,8 @@ def 验证Firefox请求头(请求头: dict[str, str]) -> None:
 
 
 async def 验证异步请求(目标地址: str) -> None:
-    from requests_rust import AsyncSession
+    from requests_rs import requests
+    AsyncSession = requests.AsyncSession
 
     async with AsyncSession(
         impersonate=测试版本,
@@ -53,7 +54,9 @@ async def 验证异步请求(目标地址: str) -> None:
 
 
 def main() -> None:
-    from requests_rust import Session, available_profiles
+    from requests_rs import requests
+    Session = requests.Session
+    available_profiles = requests.available_profiles
 
     assert 测试版本 in available_profiles(), available_profiles()
     服务 = ThreadingHTTPServer(("127.0.0.1", 0), 请求头处理器)

@@ -12,7 +12,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from curl_cffi import requests as curl_requests
-from requests_rust import AsyncSession
+from requests_rs import requests
+AsyncSession = requests.AsyncSession
 
 from benchmark_proxy_rust_vs_curl_cffi import (
     IPIPGO本地代理,
