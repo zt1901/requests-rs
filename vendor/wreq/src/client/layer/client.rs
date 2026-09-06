@@ -969,7 +969,11 @@ impl Builder {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "client error ({:?})", self.kind)
+        write!(f, "client error ({:?})", self.kind)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
     }
 }
 

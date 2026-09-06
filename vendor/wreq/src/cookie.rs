@@ -3,7 +3,7 @@
 use std::{collections::HashMap, convert::TryInto, fmt, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
-use cookie::{Cookie as RawCookie, CookieJar, Expiration, SameSite, time::Duration};
+use cookie::{Cookie as RawCookie, CookieJar, Expiration, SameSite, time::OffsetDateTime};
 use http::{Uri, Version};
 
 use crate::{IntoUri, error::Error, ext::UriExt, header::HeaderValue, sync::RwLock};
@@ -306,6 +306,12 @@ impl Jar {
                 return;
             };
 
+            // Max-Age takes precedence over Expires. Store an absolute deadline
+            // once, so reading the jar cannot restart a cookie's lifetime.
+            if let Some(age) = cookie.max_age() {
+                cookie.set_expires(OffsetDateTime::now_utc().saturating_add(age));
+            }
+
             // If the canonicalized request-host does not domain-match the
             // domain-attribute:
             //    Ignore the cookie entirely and abort these steps.
@@ -349,8 +355,7 @@ impl Jar {
             // RFC 6265: If Max-Age=0 or Expires in the past, remove the cookie
             let expired = cookie
                 .expires_datetime()
-                .is_some_and(|dt| dt <= SystemTime::now())
-                || cookie.max_age().is_some_and(Duration::is_zero);
+                .is_some_and(|dt| dt <= SystemTime::now());
 
             if expired {
                 name_map.remove(cookie);
@@ -432,12 +437,17 @@ impl CookieStore for Jar {
         let iter = store
             .iter()
             .filter(|(domain, _)| domain_match(host, domain))
-            .flat_map(|(_, path_map)| {
+            .flat_map(|(domain, path_map)| {
                 path_map
                     .iter()
                     .filter(|(path, _)| path_match(uri.path(), path))
-                    .flat_map(|(_, name_map)| {
-                        name_map.iter().filter(|cookie| {
+                    .flat_map(move |(_, name_map)| {
+                        name_map.iter().filter(move |cookie| {
+                            // A cookie without Domain is host-only, not a
+                            // domain cookie inherited by every subdomain.
+                            if cookie.domain().is_none() && host != domain {
+                                return false;
+                            }
                             if cookie.secure() == Some(true) && uri.is_http() {
                                 return false;
                             }

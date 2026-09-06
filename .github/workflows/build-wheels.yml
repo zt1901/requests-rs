@@ -90,7 +90,7 @@ jobs:
       - name: Python API与构建安全回归
         env:
           PYTHONUTF8: "1"
-        run: python -m unittest test_audit_python_api test_audit_build test_audit_rust_api test_audit_http3 test_audit_quic_cancel -v
+        run: python -m unittest test_audit_python_api test_audit_build test_audit_rust_api test_audit_http3 test_audit_quic_cancel test_audit_error_details -v
 
       - name: 独立HTTP3动态QPACK互操作
         env:

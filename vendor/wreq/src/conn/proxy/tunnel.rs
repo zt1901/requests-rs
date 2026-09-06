@@ -39,6 +39,7 @@ pub enum TunnelError {
     ProxyAuthRequired,
     TunnelUnexpectedEof,
     TunnelUnsuccessful,
+    ProxyStatus(u16),
 }
 
 impl<C> TunnelConnector<C> {
@@ -191,7 +192,8 @@ where
             httparse::Status::Complete(_) => match res.code {
                 Some(200) => return Ok(conn),
                 Some(407) => return Err(TunnelError::ProxyAuthRequired),
-                Some(_) | None => return Err(TunnelError::TunnelUnsuccessful),
+                Some(code) => return Err(TunnelError::ProxyStatus(code)),
+                None => return Err(TunnelError::TunnelUnsuccessful),
             },
         }
     }
@@ -201,15 +203,16 @@ impl std::fmt::Display for TunnelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("tunnel error: ")?;
 
-        f.write_str(match self {
-            TunnelError::MissingHost => "missing destination host",
-            TunnelError::ProxyAuthRequired => "proxy authorization required",
-            TunnelError::Parse(_) => "invalid proxy response",
-            TunnelError::TunnelUnexpectedEof => "unexpected end of file",
-            TunnelError::TunnelUnsuccessful => "unsuccessful",
-            TunnelError::ConnectFailed(_) => "failed to create underlying connection",
-            TunnelError::Io(_) => "io error establishing tunnel",
-        })
+        match self {
+            TunnelError::ProxyStatus(code) => write!(f, "CONNECT rejected with HTTP status {code}"),
+            TunnelError::MissingHost => f.write_str("missing destination host"),
+            TunnelError::ProxyAuthRequired => f.write_str("CONNECT rejected with HTTP status 407: proxy authorization required"),
+            TunnelError::Parse(e) => write!(f, "invalid proxy response: {e}"),
+            TunnelError::TunnelUnexpectedEof => f.write_str("unexpected end of file"),
+            TunnelError::TunnelUnsuccessful => f.write_str("unsuccessful"),
+            TunnelError::ConnectFailed(e) => write!(f, "failed to create underlying connection: {e}"),
+            TunnelError::Io(e) => write!(f, "io error establishing tunnel: {e}"),
+        }
     }
 }
 

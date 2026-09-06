@@ -223,3 +223,9 @@ Windows 开发环境也可右键运行 `build_and_install.py`。该脚本默认�
 ## 许可证
 
 项目原创代码按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 双许可证发布，使用者可任选其一。vendored第三方组件继续遵循各自许可证与NOTICE。
+
+### 请求错误诊断
+
+请求失败会保留底层原因，不只返回 `Connect` / `ProxyConnect` 分类。
+HTTP CONNECT 被代理拒绝时，异常文本包含代理实际返回的状态码（包括 407、429、502、504、631 等非标准码）；631 不是目标网站响应状态，也不是 libcurl 错误号。
+代理认证失败、提前断开、格式错误和超时有对应诊断。现有 `RuntimeError` 捕获方式不变，不伪造 libcurl 专属错误编号。

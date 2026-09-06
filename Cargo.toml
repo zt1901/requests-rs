@@ -1,6 +1,6 @@
 [package]
 name = "requests_rust"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zt1901/requests-rs"
@@ -44,6 +44,8 @@ http2 = { path = "vendor/http2" }
 wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "stream", "multipart", "gzip", "brotli", "zstd", "deflate", "socks", "ws"] }
 
 [profile.release]
+# Portable high-optimization release; avoid target-cpu=native in public wheels.
+opt-level = 3
 codegen-units = 1
 lto = "fat"
 strip = true
