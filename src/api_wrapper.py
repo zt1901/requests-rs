@@ -101,6 +101,10 @@ class Cookies(Mapping[str, str]):
         secure: bool = False,
         http_only: bool = False,
     ) -> None:
+        name, value = _validated_cookie_pair(str(name), str(value))
+        path = _validated_cookie_attribute("path", str(path))
+        if domain:
+            domain = _validated_cookie_attribute("domain", str(domain))
         attributes = [f"{name}={value}", f"Path={path}"]
         if domain:
             attributes.append(f"Domain={domain}")
@@ -148,9 +152,9 @@ def _cookie_items(cookies: Any, url: str) -> list[tuple[str, str]]:
     if isinstance(cookies, Cookies):
         return list(cookies._native.get_cookie_pairs(url))
     if isinstance(cookies, Mapping):
-        return [(str(name), str(value)) for name, value in cookies.items()]
+        return [_validated_cookie_pair(str(name), str(value)) for name, value in cookies.items()]
     if isinstance(cookies, list):
-        return [(str(name), str(value)) for name, value in cookies]
+        return [_validated_cookie_pair(str(name), str(value)) for name, value in cookies]
     if isinstance(cookies, CookieJar):
         request = Request(url)
         cookies.add_cookie_header(request)
@@ -159,10 +163,26 @@ def _cookie_items(cookies: Any, url: str) -> list[tuple[str, str]]:
     raise TypeError("cookies必须是Cookies、CookieJar、dict或list[tuple[str, str]]")
 
 
+def _validated_cookie_attribute(name: str, value: str) -> str:
+    # These fields are interpolated into a Set-Cookie header, not URL-encoded.
+    if any(character == ";" or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"Cookie {name}不能包含分号或控制字符")
+    return value
+
+
+def _validated_cookie_pair(name: str, value: str) -> tuple[str, str]:
+    if not name or any(
+        not (character.isascii() and (character.isalnum() or character in "!#$%&'*+-.^_`|~"))
+        for character in name
+    ):
+        raise ValueError("Cookie名称必须是非空HTTP token")
+    return name, _validated_cookie_attribute("value", value)
+
+
 def _validate_timeout(name: str, value: float | None, *, optional: bool = False) -> None:
     if value is None and optional:
         return
-    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name}必须是有限正数")
 
 
@@ -215,6 +235,7 @@ class Response:
         self.transfer_stats = None
         self._consumer_active = False
         self._async_stream = False
+        self._close_task = None
         self.history = list(history)
 
     @classmethod
@@ -232,6 +253,7 @@ class Response:
         response._stream = None
         response._consumer_active = False
         response._async_stream = False
+        response._close_task = None
         response._history = None
         return response
 
@@ -266,9 +288,13 @@ class Response:
                 raise RuntimeError("响应流已经关闭")
             if self._async_stream:
                 raise RuntimeError("异步流响应不能同步读取content；请使用await response.aread()")
+            if self._consumer_active:
+                raise RuntimeError("同一响应同时只允许一个活动消费者")
+            self._consumer_active = True
             try:
                 self._content = self._stream.read()
             finally:
+                self._consumer_active = False
                 self.close()
         return self._content
 
@@ -297,13 +323,18 @@ class Response:
             return self._content
         if self._stream is None:
             raise RuntimeError("响应流已经关闭")
+        if self._consumer_active:
+            raise RuntimeError("同一响应同时只允许一个活动消费者")
+        self._consumer_active = True
+        stream = self._stream
         chunks = []
         try:
-            while chunk := await self._stream.read_async(64 * 1024):
+            while chunk := await stream.read_async(64 * 1024):
                 chunks.append(chunk)
             self._content = b"".join(chunks)
             return self._content
         finally:
+            self._consumer_active = False
             await self.aclose()
 
     async def atext(self) -> str:
@@ -333,11 +364,14 @@ class Response:
             return
         if self._stream is None:
             raise RuntimeError("响应流已经关闭")
+        if self._async_stream:
+            raise RuntimeError("异步流响应请使用response.aiter_content()")
         if self._consumer_active:
             raise RuntimeError("同一响应同时只允许一个活动消费者")
         self._consumer_active = True
+        stream = self._stream
         try:
-            while chunk := self._stream.read(chunk_size):
+            while chunk := stream.read(chunk_size):
                 yield chunk
         finally:
             self._consumer_active = False
@@ -372,10 +406,26 @@ class Response:
             stream.close()
 
     async def aclose(self) -> None:
-        if self._stream is not None:
-            stream = self._stream
+        if self._close_task is None and self._stream is not None:
+            # Keep the native close alive if the caller is cancelled; later callers
+            # must await that same operation rather than return before it releases
+            # the connection permit.
+            self._close_task = asyncio.ensure_future(self._stream.close_async())
+            self._close_task.add_done_callback(self._consume_close_result)
             self._stream = None
-            await stream.close_async()
+        if self._close_task is not None:
+            await asyncio.shield(self._close_task)
+
+    @staticmethod
+    def _consume_close_result(task: asyncio.Future) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def __aenter__(self) -> "Response":
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.aclose()
 
     def __enter__(self) -> "Response":
         return self
@@ -711,8 +761,8 @@ class Session:
         _validate_timeout("timeout", request_timeout)
         request_read_timeout = self.read_timeout if read_timeout is None else read_timeout
         _validate_timeout("read_timeout", request_read_timeout, optional=True)
-        if max_redirects < 0:
-            raise ValueError("max_redirects不能小于0")
+        if isinstance(max_redirects, bool) or not isinstance(max_redirects, int) or max_redirects < 0:
+            raise ValueError("max_redirects必须是非负整数")
         if params:
             url = _append_query(url, params)
 
@@ -796,6 +846,12 @@ class Session:
             raise ValueError("version必须是http1或http2")
         if not url.startswith(("ws://", "wss://")):
             raise ValueError("WebSocket URL必须使用ws://或wss://")
+        if protocols is not None and (
+            isinstance(protocols, (str, bytes))
+            or not isinstance(protocols, Sequence)
+            or any(not isinstance(protocol, str) for protocol in protocols)
+        ):
+            raise TypeError("protocols必须是字符串序列，不能是单个字符串")
 
         current_headers = tuple(self.headers)
         if current_headers != self._native_headers:

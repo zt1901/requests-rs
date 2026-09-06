@@ -65,8 +65,7 @@ impl<T> UnknownTransportParameter<T> {
     ///
     /// See Section 18.1 in [RFC9000](https://datatracker.ietf.org/doc/html/rfc9000#name-reserved-transport-paramete).
     pub fn is_reserved(&self) -> bool {
-        let n = (self.id - 27) / 31;
-        self.id == 31 * n + 27
+        self.id >= 27 && (self.id - 27) % 31 == 0
     }
 }
 

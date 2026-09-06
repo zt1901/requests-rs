@@ -73,7 +73,7 @@ jobs:
           rustup target add ${{ matrix.target }}
           # 注意：CI不使用同步指纹.py（它依赖本机采集的fingerprint_records.json），
           # 直接用仓库内已提交的fingerprints.json构建。
-          maturin build --release --target ${{ matrix.target }} --out dist
+          maturin build --release --locked --target ${{ matrix.target }} --out dist
 
       - name: 冒烟测试（原生平台）
         shell: bash
@@ -86,6 +86,21 @@ jobs:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: "utf-8"
         run: python test_http3.py
+
+      - name: Python API与构建安全回归
+        env:
+          PYTHONUTF8: "1"
+        run: python -m unittest test_audit_python_api test_audit_build test_audit_rust_api test_audit_http3 test_audit_quic_cancel -v
+
+      - name: 独立HTTP3动态QPACK互操作
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python -m pip install "aioquic==1.3.0" "pylsqpack==0.3.24"
+          python test_audit_h3_interop.py
+
+      - name: Rust原生审计回归
+        run: cargo test --locked --all-targets
 
       - name: 上传wheel产物
         uses: actions/upload-artifact@v4

@@ -177,7 +177,10 @@ impl HeaderProtectionKey {
             Algorithm::AES128_GCM | Algorithm::AES256_GCM => unsafe {
                 let key_len_bits = alg.key_len() as u32 * 8;
 
-                let mut aes_key = MaybeUninit::<AES_KEY>::uninit();
+                // AES-128/192 only initialize their active round keys. The
+                // remaining Rust array elements must also be initialized before
+                // assume_init() creates an AES_KEY value.
+                let mut aes_key = MaybeUninit::<AES_KEY>::zeroed();
 
                 let rc = AES_set_encrypt_key(
                     hp_key.as_ptr(),
@@ -249,7 +252,10 @@ impl HeaderProtectionKey {
 }
 
 fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
-    let mut ctx = MaybeUninit::uninit();
+    // BoringSSL initializes algorithm-specific state, not every byte of this
+    // opaque Rust storage (which also reserves more space than the bundled
+    // native context). Zero every integer field before assume_init().
+    let mut ctx = MaybeUninit::zeroed();
 
     let ctx = unsafe {
         let aead = alg.get_evp_aead();

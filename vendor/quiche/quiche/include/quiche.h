@@ -1038,6 +1038,12 @@ enum quiche_h3_error {
     // over HTTP/1.1.
     QUICHE_H3_ERR_VERSION_FALLBACK = -20,
 
+    // Invalid instructions received on the QPACK encoder stream.
+    QUICHE_H3_ERR_QPACK_ENCODER_STREAM_ERROR = -21,
+
+    // Invalid instructions received on the QPACK decoder stream.
+    QUICHE_H3_ERR_QPACK_DECODER_STREAM_ERROR = -22,
+
     // The following QUICHE_H3_TRANSPORT_ERR_* errors are propagated
     // from the QUIC transport layer.
 

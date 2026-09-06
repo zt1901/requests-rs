@@ -24,7 +24,7 @@ pub(crate) const MAX_PROBES_DEFAULT: u8 = 3;
 /// Min Packetization Layer Path MTU (PLPMTU).
 /// https://datatracker.ietf.org/doc/html/rfc8899#section-5.1.2
 /// For QUIC, this is 1200 bytes per https://datatracker.ietf.org/doc/html/rfc9000#section-14.1
-const MIN_PLPMTU: usize = crate::MIN_CLIENT_INITIAL_LEN;
+const MIN_PLPMTU: usize = crate::MIN_QUIC_PAYLOAD_LEN;
 
 #[derive(Default)]
 pub struct Pmtud {

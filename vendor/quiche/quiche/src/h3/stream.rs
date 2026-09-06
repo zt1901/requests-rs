@@ -1071,8 +1071,8 @@ mod tests {
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
         let raw_settings = vec![
-            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
         ];
 
@@ -1177,8 +1177,8 @@ mod tests {
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
         let raw_settings = vec![
-            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
         ];
 

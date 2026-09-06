@@ -584,7 +584,9 @@ fn build_client(
         // 每次握手由请求目标的URI host决定SNI，不能依赖采集记录中的一次性值。
         .tls_sni(true)
         .tls_session_cache(session_cache)
-        .connect_timeout(Duration::from_secs(请求超时秒数));
+        .connect_timeout(Duration::from_secs(请求超时秒数))
+        // Bound response headers and body as well as TCP/TLS connection setup.
+        .timeout(Duration::from_secs(请求超时秒数));
 
     if 本地自签证书 {
         builder = builder.tls_cert_verification(false);

@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import sys
 import zipfile
@@ -7,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-# 可右键运行：同步指纹、构建支持Python 3.10及以上版本的wheel并安装。
+# 可右键运行：使用已提交指纹构建wheel并安装；更新采集记录必须显式选择。
 项目目录 = Path(__file__).resolve().parent
 输出目录 = 项目目录 / "dist"
 源码原生模块 = 项目目录 / "python" / "requests_rs" / "_native.pyd"
@@ -21,13 +22,13 @@ def run(*command):
     print("运行:", " ".join(map(str, command)))
     environment = os.environ.copy()
     # 本机缓存和 LLVM 不写入仓库级 Cargo 配置，确保 Linux/Windows ARM64 CI 可移植构建。
-    environment["CARGO_TARGET_DIR"] = str(本机构建缓存)
+    environment.setdefault("CARGO_TARGET_DIR", str(本机构建缓存))
     if 本机LLVM目录.is_dir():
-        environment["LIBCLANG_PATH"] = str(本机LLVM目录)
+        environment.setdefault("LIBCLANG_PATH", str(本机LLVM目录))
     if 本机Cargo目录.is_dir() and 本机Rustup目录.is_dir():
-        environment["CARGO_HOME"] = str(本机Cargo目录)
-        environment["RUSTUP_HOME"] = str(本机Rustup目录)
-        environment["PATH"] = str(本机Cargo目录 / "bin") + os.pathsep + environment.get("PATH", "")
+        environment.setdefault("CARGO_HOME", str(本机Cargo目录))
+        environment.setdefault("RUSTUP_HOME", str(本机Rustup目录))
+        environment["PATH"] = str(Path(environment["CARGO_HOME"]) / "bin") + os.pathsep + environment.get("PATH", "")
     subprocess.run(command, cwd=项目目录, check=True, env=environment)
 
 
@@ -41,21 +42,28 @@ def 同步可编辑原生模块(wheel: Path):
     print("已同步 editable 原生模块:", 源码原生模块)
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="构建并安装已提交源码；默认不修改内置指纹")
+    parser.add_argument("--sync-fingerprints", action="store_true", help="构建前从本机采集记录显式更新 fingerprints.json")
+    args = parser.parse_args(argv)
     if os.name != "nt":
         raise RuntimeError("build_and_install.py仅用于Windows本机右键构建")
-    run(sys.executable, str(项目目录 / "scripts" / "同步指纹.py"))
     maturin = shutil.which("maturin")
     if maturin is None:
         raise RuntimeError("没有找到maturin可执行文件")
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("没有找到uv可执行文件")
+    if args.sync_fingerprints:
+        run(sys.executable, str(项目目录 / "scripts" / "同步指纹.py"))
     with tempfile.TemporaryDirectory(prefix="requests-rust-wheel-") as temp_dir:
         build_output = Path(temp_dir)
-        run(maturin, "build", "--release", "--out", str(build_output))
+        run(maturin, "build", "--release", "--locked", "--out", str(build_output))
         wheels = list(build_output.glob("requests_rs-*.whl"))
         if len(wheels) != 1:
             raise RuntimeError(f"本次构建应生成唯一wheel，实际为: {wheels}")
         wheel = wheels[0]
-        run("uv", "pip", "install", "--python", sys.executable, "--reinstall", str(wheel))
+        run(uv, "pip", "install", "--python", sys.executable, "--reinstall", str(wheel))
         同步可编辑原生模块(wheel)
         输出目录.mkdir(parents=True, exist_ok=True)
         final_wheel = 输出目录 / wheel.name

@@ -45,6 +45,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A QPACK error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The field section requires encoder instructions not yet received.
+    Blocked,
+
+    /// An encoder-stream instruction is invalid.
+    InvalidEncoderInstruction,
+
     /// The provided buffer is too short.
     BufferTooShort,
 
@@ -121,8 +127,7 @@ mod tests {
         // of fields, including the length of the name and value in bytes plus
         // an overhead of 32 bytes for each field. See
         // https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2
-        let qpack_field_section_size =
-            (b"hello".len() + b"world".len() + 32) * NUM_HDRS;
+        let qpack_field_section_size = (b"hello".len() + b"world".len() + 32) * NUM_HDRS;
 
         let mut enc = Encoder::new();
         assert_eq!(enc.encode(&headers, &mut encoded), Ok(102));
@@ -142,8 +147,7 @@ mod tests {
         );
 
         // Smaller max_size param (forgetting 32 byte overhead) fails
-        let wrong_qpack_field_section_size =
-            (b"hello".len() + b"world".len()) * NUM_HDRS;
+        let wrong_qpack_field_section_size = (b"hello".len() + b"world".len()) * NUM_HDRS;
         assert_eq!(
             dec.decode(&encoded, wrong_qpack_field_section_size as u64),
             Err(HeaderListTooLarge)

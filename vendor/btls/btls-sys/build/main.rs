@@ -578,9 +578,10 @@ fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
                 .define("FIPS", "1");
         }
 
-        if config.features.prefix_symbols {
-            cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
-        }
+        // The static TLS archives are also linked into Python/shared libraries.
+        // Request PIC at the CMake target level for every build, not only when
+        // symbol prefixing is enabled; cached/default CXX flags are insufficient.
+        cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
 
         cache::apply(config, &mut cfg);
 
@@ -664,7 +665,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    emit_rerun_if_changed();
+    emit_rerun_if_changed(&config);
     ensure_patches_applied(&config)?;
     if !config.env.docs_rs {
         emit_link_directives(&config);
@@ -695,12 +696,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn emit_rerun_if_changed() {
+fn emit_rerun_if_changed(config: &Config) {
     println!("cargo:rerun-if-changed=patches");
-    // 本地TLS指纹补丁修改这些BoringSSL源码时必须重新编译静态库。
-    println!("cargo:rerun-if-changed=deps/boringssl/include/openssl/ssl.h");
-    println!("cargo:rerun-if-changed=deps/boringssl/ssl/ssl_privkey.cc");
-    println!("cargo:rerun-if-changed=deps/boringssl/ssl/encrypted_client_hello.cc");
+    // Once any rerun-if-changed directive is emitted, Cargo stops watching
+    // the whole package. Track every native input, not just three fingerprint
+    // patch files, or edits/security fixes can silently reuse an old library.
+    println!("cargo:rerun-if-changed=deps/boringssl");
+    println!("cargo:rerun-if-changed=cmake");
+    for path in [
+        config.env.source_path.as_ref(),
+        config.env.path.as_ref(),
+        config.env.include_path.as_ref(),
+        config.env.cmake_toolchain_file.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn emit_link_directives(config: &Config) {

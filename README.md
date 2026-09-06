@@ -14,6 +14,8 @@
 
 `requests-rs` 为 Python 提供接近 `requests` 使用习惯的同步和原生异步 API。唯一公开入口是 `from requests_rs import requests`。HTTP/1.1、HTTP/2、TLS 浏览器画像、代理和 WebSocket 由 wreq、BoringSSL 与 Tokio 执行。schema 2 指纹包含完整 QUIC/H3 模板时，`http3` 会真实回放该模板；schema 1 或代理场景自动使用 H2/H1.1。
 
+**HTTP/3 兼容性边界：** 接收端已实现动态 QPACK 表、增量编码器指令、阻塞头块恢复及 ACK／取消反馈；发送端仍使用合法的静态／字面量编码。捕获的 SETTINGS 按模板发送，不会偷偷降低容量改变指纹；本地另有阻塞缓冲和反馈队列资源上限，超限会明确失败。该实现仍需持续进行独立服务端互操作验证，不能视为完整浏览器 H3 行为保证。请求已经发出后的失败不会自动重试，以避免重复执行有副作用的操作。
+
 适合需要长期 Session、真实连接复用、代理身份隔离和可审计浏览器传输画像的采集、自动化与网络研究项目。
 
 ## 为什么使用
@@ -212,7 +214,7 @@ maturin build --release --out dist
 python -m pip install --force-reinstall dist/requests_rs-*.whl
 ```
 
-Windows 开发环境也可右键运行 `build_and_install.py`。该脚本同步内置指纹、构建wheel、安装到当前Python，并同步editable源码目录中的原生模块。
+Windows 开发环境也可右键运行 `build_and_install.py`。该脚本默认使用仓库内置指纹、构建 wheel、安装到当前 Python，并同步 editable 源码目录中的原生模块。仅显式运行 `python build_and_install.py --sync-fingerprints` 时才同步本机指纹。
 
 ## 贡献
 

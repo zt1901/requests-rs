@@ -439,7 +439,10 @@ const PROTOCOL_VERSION_V1: u32 = 0x0000_0001;
 /// The maximum length of a connection ID.
 pub const MAX_CONN_ID_LEN: usize = packet::MAX_CID_LEN as usize;
 
-/// The minimum length of Initial packets sent by a client.
+/// RFC 9000 minimum supported UDP payload size, independent of fingerprints.
+pub(crate) const MIN_QUIC_PAYLOAD_LEN: usize = 1200;
+
+/// Fingerprint padding target for Initial packets sent by a client.
 pub const MIN_CLIENT_INITIAL_LEN: usize = 1250;
 
 /// The default initial RTT.
@@ -4091,6 +4094,18 @@ impl<F: BufFactory> Connection<F> {
             out[done..done + pad_len].fill(0);
 
             done += pad_len;
+
+            // send_single accounts for QUIC packets, but this datagram-level
+            // padding is also transmitted and consumes anti-amplification credit.
+            let path = self.paths.get_mut(send_pid)?;
+            let had_send_budget = path.max_send_bytes > 0;
+            path.max_send_bytes = path.max_send_bytes.saturating_sub(pad_len);
+            if self.is_server && !path.verified_peer_address &&
+                had_send_budget && path.max_send_bytes == 0
+            {
+                self.amplification_limited_count =
+                    self.amplification_limited_count.saturating_add(1);
+            }
         }
 
         let send_path = self.paths.get(send_pid)?;

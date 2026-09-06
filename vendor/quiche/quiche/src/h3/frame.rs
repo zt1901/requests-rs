@@ -770,11 +770,10 @@ mod tests {
         let mut d = [42; 128];
 
         let raw_settings = vec![
-            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
             (SETTINGS_ENABLE_CONNECT_PROTOCOL, 0),
-            (SETTINGS_H3_DATAGRAM_00, 0),
             (SETTINGS_H3_DATAGRAM, 0),
         ];
 
@@ -789,7 +788,7 @@ mod tests {
             additional_settings: None,
         };
 
-        let frame_payload_len = 13;
+        let frame_payload_len = 10;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -826,11 +825,10 @@ mod tests {
         };
 
         let raw_settings = vec![
-            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
             (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
             (SETTINGS_ENABLE_CONNECT_PROTOCOL, 0),
-            (SETTINGS_H3_DATAGRAM_00, 0),
             (SETTINGS_H3_DATAGRAM, 0),
             (33, 33),
         ];
@@ -848,7 +846,7 @@ mod tests {
             additional_settings: Some(vec![(33, 33)]),
         };
 
-        let frame_payload_len = 15;
+        let frame_payload_len = 12;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -987,7 +985,7 @@ mod tests {
         let mut d = [42; 128];
 
         let raw_settings =
-            vec![(SETTINGS_H3_DATAGRAM_00, 1), (SETTINGS_H3_DATAGRAM, 1)];
+            vec![(SETTINGS_H3_DATAGRAM, 1)];
 
         let frame = Frame::Settings {
             max_field_section_size: None,
@@ -1000,7 +998,7 @@ mod tests {
             additional_settings: None,
         };
 
-        let frame_payload_len = 5;
+        let frame_payload_len = 2;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -1036,7 +1034,7 @@ mod tests {
             additional_settings: None,
         };
 
-        let frame_payload_len = 5;
+        let frame_payload_len = 2;
         let frame_header_len = 2;
 
         let wire_len = {

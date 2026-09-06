@@ -2,7 +2,11 @@ use std::{
     cell::Cell,
     collections::HashSet,
     io::{Read, Write},
-    net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, UdpSocket},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,12 +16,45 @@ use btls::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ExtensionType, KeyShare,
     SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
 };
+use btls::x509::{X509, store::X509Store, store::X509StoreBuilder, verify::X509CheckFlags};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use quiche::h3::NameValue;
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
+
+/// Shared with the async owner: dropping its future stops a running worker.
+#[derive(Clone)]
+pub(crate) struct H3Control {
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl H3Control {
+    pub(crate) fn new(started: Instant, timeout: Duration) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            started,
+            timeout,
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            bail!("HTTP/3 request cancelled")
+        }
+        if self.started.elapsed() >= self.timeout {
+            bail!("HTTP/3请求超过timeout")
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ProfileHttp3 {
@@ -228,10 +265,37 @@ fn decode_parameter_value(bytes: &[u8], id: u64) -> Result<u64> {
 }
 
 fn validate_transport_parameters(tp: &H3TransportParameters, raw: &[u8]) -> Result<()> {
+    const MAX_VARINT: u64 = (1_u64 << 62) - 1;
+    // These values configure both the transport state and its captured wire
+    // override. Reject invalid values instead of relying on quiche's setters
+    // to clamp them and silently disagree with the advertised fingerprint.
+    if !(1200..=65_527).contains(&tp.max_udp_payload_size)
+        || tp.initial_max_streams_bidi > (1_u64 << 60)
+        || tp.initial_max_streams_uni > (1_u64 << 60)
+        || tp.ack_delay_exponent > 20
+        || tp.max_ack_delay >= (1_u64 << 14)
+        || tp.active_connection_id_limit < 2
+        || [
+            tp.max_idle_timeout,
+            tp.initial_max_data,
+            tp.initial_max_stream_data_bidi_local,
+            tp.initial_max_stream_data_bidi_remote,
+            tp.initial_max_stream_data_uni,
+            tp.active_connection_id_limit,
+            tp.max_datagram_frame_size,
+        ]
+        .iter()
+        .any(|value| *value > MAX_VARINT)
+        || Instant::now()
+            .checked_add(Duration::from_millis(tp.max_idle_timeout))
+            .is_none()
+    {
+        bail!("QUIC Transport Parameters exceed supported numeric bounds")
+    }
     let mut offset = 0;
     let mut seen = HashSet::new();
     for item in &tp.wire.parameters {
-        if !seen.insert(item.id) || item.value_hex.len() != item.length * 2 {
+        if !seen.insert(item.id) || item.length.checked_mul(2) != Some(item.value_hex.len()) {
             bail!("QUIC Transport Parameters wire.parameters is invalid")
         }
         let expected = decode_hex(&item.value_hex, "QUIC TP value_hex")?;
@@ -313,6 +377,19 @@ fn validate_transport_parameters(tp: &H3TransportParameters, raw: &[u8]) -> Resu
 }
 
 fn validate_settings(profile: &ProfileHttp3) -> Result<()> {
+    for &(id, value) in &profile.http.settings {
+        if id >= (1_u64 << 62) || value >= (1_u64 << 62) {
+            bail!("HTTP/3 SETTINGS exceeds QUIC varint range")
+        }
+        // quiche omits these settings when disabled. Advertising a captured
+        // zero would therefore be a silent wire mismatch, not exact replay.
+        if matches!(id, 8 | 51) && value != 1 {
+            if id == 51 {
+                bail!("HTTP/3 SETTINGS H3_DATAGRAM cannot reproduce this boolean value")
+            }
+            bail!("HTTP/3 SETTINGS {id} cannot reproduce this boolean value")
+        }
+    }
     let grease_ids = profile
         .http
         .settings
@@ -435,9 +512,6 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
         bail!("http3.tls.extension_wire与extensions顺序不一致")
     }
     for item in &profile.tls.extension_wire {
-        decode_wire(&item.payload_base64, "http3 TLS扩展payload", item.length)?;
-    }
-    for item in &profile.tls.extension_wire {
         let payload = decode_wire(
             &item.payload_base64,
             "HTTP/3 TLS extension payload",
@@ -463,7 +537,7 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
     let mut tp_ids = HashSet::new();
     for item in &tp.wire.parameters {
         if !tp_ids.insert(item.id)
-            || item.value_hex.len() != item.length * 2
+            || item.length.checked_mul(2) != Some(item.value_hex.len())
             || !item.value_hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
             bail!("QUIC Transport Parameters wire.parameters无效")
@@ -483,15 +557,26 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
     if actual_order != declared_order {
         bail!("http3.http.header_order与headers顺序不一致")
     }
-    for required in [":method", ":authority", ":scheme", ":path"] {
-        if !profile
-            .http
-            .header_order
-            .iter()
-            .any(|name| name == required)
-        {
-            bail!("http3.http.header_order缺少{required}")
+    let mut pseudo_headers = HashSet::new();
+    let mut regular_seen = false;
+    for (name, value) in &profile.http.headers {
+        validate_header(name, value)?;
+        if name.starts_with(':') {
+            if regular_seen
+                || !matches!(
+                    name.as_str(),
+                    ":method" | ":authority" | ":scheme" | ":path"
+                )
+                || !pseudo_headers.insert(name.as_str())
+            {
+                bail!("HTTP/3 template contains invalid or misplaced pseudo-headers")
+            }
+        } else {
+            regular_seen = true;
         }
+    }
+    if pseudo_headers.len() != 4 {
+        bail!("HTTP/3 template is missing required pseudo-headers")
     }
     let mut setting_ids = HashSet::new();
     if profile
@@ -648,11 +733,48 @@ fn tls_builder(tls: &H3TlsCapture, verify: bool) -> Result<SslContextBuilder> {
     }
     if verify {
         builder.set_verify(SslVerifyMode::PEER);
-        builder.set_default_verify_paths()?;
+        // Use the same bundled trust roots as the HTTP/1 and HTTP/2 client.
+        // BoringSSL's default filesystem paths are usually absent on Windows.
+        static ROOTS: OnceLock<std::result::Result<X509Store, String>> = OnceLock::new();
+        let roots = ROOTS.get_or_init(|| {
+            (|| -> Result<X509Store> {
+                let mut store = X509StoreBuilder::new()?;
+                for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+                    store.add_cert(X509::from_der(der.as_ref())?)?;
+                }
+                Ok(store.build())
+            })()
+            .map_err(|error| error.to_string())
+        });
+        builder.set_cert_store(
+            roots
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.clone()))?
+                .clone(),
+        );
     } else {
         builder.set_verify(SslVerifyMode::NONE);
     }
     Ok(builder)
+}
+
+fn configure_peer_identity(ssl: &mut btls::ssl::SslRef, url: &Url) -> Result<()> {
+    // SNI is a fingerprint choice, not an authorization policy. Always verify
+    // the URL identity, even when the captured ClientHello omitted SNI.
+    let param = ssl.verify_param_mut();
+    param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+    match url.host().context("URL缺少host")? {
+        Host::Domain(host) => param.set_host(host)?,
+        Host::Ipv4(ip) => {
+            // IP connections are created without server_name, so there is no
+            // DNS constraint to clear. BoringSSL rejects empty host names.
+            param.set_ip(ip.into())?;
+        }
+        Host::Ipv6(ip) => {
+            param.set_ip(ip.into())?;
+        }
+    }
+    Ok(())
 }
 
 fn configure_quiche(profile: &ProfileHttp3, verify: bool) -> Result<quiche::Config> {
@@ -751,20 +873,78 @@ fn transport_parameter_template(tp: &H3TransportParameters) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn is_stable_capture_header(name: &str) -> bool {
+    matches!(
+        name,
+        "user-agent"
+            | "sec-ch-ua"
+            | "sec-ch-ua-mobile"
+            | "sec-ch-ua-platform"
+            | "sec-ch-ua-arch"
+            | "sec-ch-ua-bitness"
+            | "sec-ch-ua-full-version"
+            | "sec-ch-ua-full-version-list"
+            | "sec-ch-ua-model"
+            | "sec-ch-ua-platform-version"
+            | "sec-ch-ua-wow64"
+            | "accept-encoding"
+            | "accept-language"
+            | "dnt"
+            | "sec-gpc"
+            | "te"
+    )
+}
+
+fn validate_header(name: &str, value: &str) -> Result<()> {
+    let token = name.strip_prefix(':').unwrap_or(name);
+    if token.is_empty()
+        || !token.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&byte)
+        })
+        || value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+    {
+        bail!("HTTP/3 header contains an invalid name or value")
+    }
+    if matches!(
+        name,
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+    ) || (name == "te" && !value.eq_ignore_ascii_case("trailers"))
+    {
+        bail!("HTTP/3 forbids connection-specific header {name}")
+    }
+    Ok(())
+}
+
 fn request_headers(
     profile: &ProfileHttp3,
     request: &H3Request,
     url: &Url,
 ) -> Result<Vec<quiche::h3::Header>> {
-    let authority = match url.port() {
+    let mut authority = match url.port() {
         Some(port) if port != 443 => format!("{}:{port}", url.host_str().context("URL缺少host")?),
         _ => url.host_str().context("URL缺少host")?.to_string(),
     };
+    let mut used = vec![false; request.headers.len()];
+    let mut has_host = false;
+    for (index, (name, value)) in request.headers.iter().enumerate() {
+        let name = name.to_ascii_lowercase();
+        validate_header(&name, value)?;
+        if name.starts_with(':') {
+            bail!("HTTP/3 request pseudo-headers are derived from the request URL and method")
+        }
+        if name == "host" {
+            if has_host || value.is_empty() {
+                bail!("HTTP/3 request must not contain an empty or duplicate Host")
+            }
+            authority = value.clone();
+            used[index] = true;
+            has_host = true;
+        }
+    }
     let path = match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
     };
-    let mut used = vec![false; request.headers.len()];
     let mut out = Vec::new();
     for name in &profile.http.header_order {
         let dynamic = match name.as_str() {
@@ -786,21 +966,134 @@ fn request_headers(
         {
             used[index] = true;
             out.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
-        } else if let Some((_, value)) = profile
-            .http
-            .headers
-            .iter()
-            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        } else if is_stable_capture_header(name)
+            && let Some((_, value)) = profile
+                .http
+                .headers
+                .iter()
+                .find(|(header, _)| header == name)
         {
+            // A fingerprint is not a request template. Never replay captured
+            // credentials, cookies, navigation context or entity framing.
             out.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
         }
     }
     for (index, (name, value)) in request.headers.iter().enumerate() {
-        if !used[index] && !name.starts_with(':') {
-            out.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+        if !used[index] {
+            out.push(quiche::h3::Header::new(
+                name.to_ascii_lowercase().as_bytes(),
+                value.as_bytes(),
+            ));
         }
     }
     Ok(out)
+}
+
+fn receive_response_headers(
+    list: Vec<quiche::h3::Header>,
+    status: &mut Option<u16>,
+    headers: &mut Vec<(String, String)>,
+    trailers_received: &mut bool,
+) -> Result<()> {
+    if *trailers_received {
+        bail!("HTTP/3 response contains multiple trailer sections")
+    }
+    let mut block_status = None;
+    let mut block_headers = Vec::new();
+    let mut regular_seen = false;
+    for header in list {
+        let name = std::str::from_utf8(header.name()).context("HTTP/3 invalid header name")?;
+        let value = std::str::from_utf8(header.value()).context("HTTP/3 invalid header value")?;
+        validate_header(name, value)?;
+        if name.starts_with(':') {
+            if name != ":status" || regular_seen || block_status.is_some() || status.is_some() {
+                bail!("HTTP/3 response contains an invalid pseudo-header")
+            }
+            if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("HTTP/3 invalid :status")
+            }
+            let code: u16 = value.parse()?;
+            if !(100..=599).contains(&code) || code == 101 {
+                bail!("HTTP/3 invalid :status")
+            }
+            block_status = Some(code);
+        } else {
+            regular_seen = true;
+            block_headers.push((name.to_string(), value.to_string()));
+        }
+    }
+    if status.is_some() {
+        // Trailers are not ordinary response headers. In particular they must
+        // not change decompression, framing, redirect or cookie processing.
+        *trailers_received = true;
+    } else {
+        let code = block_status.context("HTTP/3响应缺少:status")?;
+        if code >= 200 {
+            *status = Some(code);
+            *headers = block_headers;
+        }
+        // Informational fields apply only to that interim response.
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn finish_response_body(
+    method: &str,
+    status: u16,
+    headers: &mut Vec<(String, String)>,
+    body: Vec<u8>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    finish_response_body_controlled(
+        method,
+        status,
+        headers,
+        body,
+        limit,
+        &H3Control::new(Instant::now(), Duration::MAX),
+    )
+}
+
+fn finish_response_body_controlled(
+    method: &str,
+    status: u16,
+    headers: &mut Vec<(String, String)>,
+    body: Vec<u8>,
+    limit: usize,
+    control: &H3Control,
+) -> Result<Vec<u8>> {
+    control.check()?;
+    if method == "HEAD" || matches!(status, 204 | 304) {
+        if !body.is_empty() {
+            bail!("HTTP/3 response must not contain a body for this method/status")
+        }
+        // Content-Encoding/Length in HEAD or 304 describes a representation
+        // that was not transferred; attempting gzip decompression would fail.
+        return Ok(body);
+    }
+    let mut expected_length = None;
+    for value in headers
+        .iter()
+        .filter(|(name, _)| name == "content-length")
+        .flat_map(|(_, value)| value.split(','))
+    {
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("HTTP/3 invalid Content-Length")
+        }
+        let length = value
+            .parse::<u64>()
+            .context("HTTP/3 invalid Content-Length")?;
+        if expected_length.is_some_and(|previous| previous != length) {
+            bail!("HTTP/3 conflicting Content-Length values")
+        }
+        expected_length = Some(length);
+    }
+    if expected_length.is_some_and(|expected| expected != body.len() as u64) {
+        bail!("HTTP/3 response body disagrees with Content-Length")
+    }
+    decode_response_body(headers, body, limit, control)
 }
 
 fn request_origin(url: &Url) -> Result<String> {
@@ -813,15 +1106,23 @@ fn request_origin(url: &Url) -> Result<String> {
     ))
 }
 
-fn read_limited(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+fn read_limited(mut reader: impl Read, limit: usize, control: &H3Control) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    if limit == usize::MAX {
-        reader.take(u64::MAX).read_to_end(&mut output)?;
-    } else {
-        reader.take(limit as u64 + 1).read_to_end(&mut output)?;
-        if output.len() > limit {
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        control.check()?;
+        let available = chunk
+            .len()
+            .min(limit.saturating_sub(output.len()).saturating_add(1));
+        let len = reader.read(&mut chunk[..available])?;
+        control.check()?;
+        if len == 0 {
+            break;
+        }
+        if len > limit.saturating_sub(output.len()) {
             bail!("解压后的响应Body超过max_response_bytes限制")
         }
+        output.extend_from_slice(&chunk[..len]);
     }
     Ok(output)
 }
@@ -830,7 +1131,9 @@ fn decode_response_body(
     headers: &mut Vec<(String, String)>,
     mut body: Vec<u8>,
     limit: usize,
+    control: &H3Control,
 ) -> Result<Vec<u8>> {
+    control.check()?;
     let encodings = headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
@@ -840,12 +1143,16 @@ fn decode_response_body(
         .collect::<Vec<_>>();
     for encoding in encodings.iter().rev() {
         body = match encoding.as_str() {
-            "gzip" | "x-gzip" => read_limited(GzDecoder::new(body.as_slice()), limit)?,
-            "br" => read_limited(brotli::Decompressor::new(body.as_slice(), 4096), limit)?,
-            "zstd" => read_limited(zstd::stream::Decoder::new(body.as_slice())?, limit)?,
-            "deflate" => match read_limited(ZlibDecoder::new(body.as_slice()), limit) {
+            "gzip" | "x-gzip" => read_limited(GzDecoder::new(body.as_slice()), limit, control)?,
+            "br" => read_limited(
+                brotli::Decompressor::new(body.as_slice(), 4096),
+                limit,
+                control,
+            )?,
+            "zstd" => read_limited(zstd::stream::Decoder::new(body.as_slice())?, limit, control)?,
+            "deflate" => match read_limited(ZlibDecoder::new(body.as_slice()), limit, control) {
                 Ok(decoded) => decoded,
-                Err(_) => read_limited(DeflateDecoder::new(body.as_slice()), limit)?,
+                Err(_) => read_limited(DeflateDecoder::new(body.as_slice()), limit, control)?,
             },
             other => bail!("不支持的HTTP/3 Content-Encoding: {other}"),
         };
@@ -864,20 +1171,23 @@ fn decode_response_body(
 }
 
 impl H3Client {
-    pub(crate) fn connect(profile: ProfileHttp3, request: &H3Request) -> Result<Self> {
+    pub(crate) fn connect(
+        profile: ProfileHttp3,
+        request: &H3Request,
+        control: &H3Control,
+    ) -> Result<Self> {
+        control.check()?;
         validate(&profile)?;
         let url = Url::parse(&request.url)?;
         if url.scheme() != "https" {
             bail!("HTTP/3只支持https URL")
         }
-        let host = url.host_str().context("URL缺少host")?;
         let peer = match request.peer {
             Some(peer) => peer,
-            None => (host, url.port_or_known_default().unwrap_or(443))
-                .to_socket_addrs()?
-                .next()
-                .context("DNS没有返回地址")?,
+            // Resolve on the async side before entering a blocking worker.
+            None => bail!("HTTP/3 peer must be resolved before connection setup"),
         };
+        control.check()?;
         let bind: SocketAddr = if peer.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -888,6 +1198,7 @@ impl H3Client {
         socket.set_nonblocking(true)?;
         let local = socket.local_addr()?;
         let mut config = configure_quiche(&profile, request.verify)?;
+        control.check()?;
         let mut scid_bytes = [0_u8; quiche::MAX_CONN_ID_LEN];
         rand::rng().fill_bytes(&mut scid_bytes);
         let mut dcid_bytes = [0_u8; 8];
@@ -904,12 +1215,18 @@ impl H3Client {
         } else {
             quiche::ConnectionId::from_ref(&scid_bytes)
         };
-        let server_name = profile.tls.extensions.contains(&0).then_some(host);
+        let server_name = match url.host().context("URL缺少host")? {
+            Host::Domain(host) if profile.tls.extensions.contains(&0) => Some(host),
+            _ => None,
+        };
         let dcid = quiche::ConnectionId::from_ref(&dcid_bytes);
         let mut conn =
             quiche::connect_with_dcid(server_name, &scid, &dcid, local, peer, &mut config)?;
         {
             let ssl: &mut btls::ssl::SslRef = conn.as_mut();
+            if request.verify {
+                configure_peer_identity(ssl, &url)?;
+            }
             let shares = profile
                 .tls
                 .key_share_groups
@@ -939,6 +1256,7 @@ impl H3Client {
                 .max_udp_payload_size
                 .max(1350)
         ];
+        control.check()?;
         Ok(Self {
             origin: request_origin(&url)?,
             profile,
@@ -959,9 +1277,11 @@ impl H3Client {
     pub(crate) fn roundtrip(
         &mut self,
         request: H3Request,
+        control: &H3Control,
     ) -> std::result::Result<H3Response, H3RequestError> {
         let response_received = Cell::new(false);
         let result = (|| -> Result<H3Response> {
+            control.check()?;
             let url = Url::parse(&request.url)?;
             if request_origin(&url)? != self.origin {
                 bail!("HTTP/3连接不能跨origin复用")
@@ -976,10 +1296,12 @@ impl H3Client {
             let mut stream_id = None;
             let mut status = None;
             let mut response_headers = Vec::new();
+            let mut trailers_received = false;
             let mut response_body = Vec::new();
             let mut finished = false;
             let mut received_datagrams = 0usize;
             while !finished {
+                control.check()?;
                 if started.elapsed() >= request.timeout {
                     bail!(
                         "HTTP/3请求超时(received_datagrams={received_datagrams}, status={status:?}, body_bytes={})",
@@ -987,6 +1309,7 @@ impl H3Client {
                     )
                 }
                 loop {
+                    control.check()?;
                     match self.socket.recv_from(&mut self.input) {
                         Ok((len, from)) => {
                             received_datagrams += 1;
@@ -1031,24 +1354,25 @@ impl H3Client {
                         }
                     }
                     loop {
+                        control.check()?;
                         match h3_conn.poll(&mut self.conn) {
                             Ok((id, quiche::h3::Event::Headers { list, .. }))
                                 if Some(id) == stream_id =>
                             {
                                 response_received.set(true);
-                                for header in list {
-                                    let name = String::from_utf8_lossy(header.name()).into_owned();
-                                    let value =
-                                        String::from_utf8_lossy(header.value()).into_owned();
-                                    if name == ":status" {
-                                        status = Some(value.parse()?);
-                                    } else {
-                                        response_headers.push((name, value));
-                                    }
-                                }
+                                receive_response_headers(
+                                    list,
+                                    &mut status,
+                                    &mut response_headers,
+                                    &mut trailers_received,
+                                )?;
                             }
                             Ok((id, quiche::h3::Event::Data)) if Some(id) == stream_id => {
+                                if status.is_none() || trailers_received {
+                                    bail!("HTTP/3 response DATA outside the final response body")
+                                }
                                 loop {
+                                    control.check()?;
                                     match h3_conn.recv_body(&mut self.conn, id, &mut self.input) {
                                         Ok(len) => {
                                             if response_body.len().saturating_add(len)
@@ -1073,11 +1397,17 @@ impl H3Client {
                             }
                             Ok(_) => {}
                             Err(quiche::h3::Error::Done) => break,
+                            Err(quiche::h3::Error::QpackDecompressionFailed) => {
+                                bail!(
+                                    "HTTP/3 QPACK解码失败：头块、动态表引用或阻塞流数量违反协议约束"
+                                )
+                            }
                             Err(error) => return Err(error.into()),
                         }
                     }
                 }
                 loop {
+                    control.check()?;
                     match self.conn.send(&mut self.out) {
                         Ok((len, info)) => {
                             self.socket.send_to(&self.out[..len], info.to)?;
@@ -1091,13 +1421,17 @@ impl H3Client {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let body = decode_response_body(
+            let status = status.context("HTTP/3响应缺少最终:status")?;
+            let body = finish_response_body_controlled(
+                &request.method,
+                status,
                 &mut response_headers,
                 response_body,
                 request.max_response_bytes,
+                control,
             )?;
             Ok(H3Response {
-                status: status.context("HTTP/3响应缺少:status")?,
+                status,
                 headers: response_headers,
                 body,
             })
@@ -1106,5 +1440,421 @@ impl H3Client {
             error,
             response_received: response_received.get(),
         })
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn profile() -> ProfileHttp3 {
+        let records: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/chrome152_schema2.json")).unwrap();
+        serde_json::from_value(records[0]["http3"].clone()).unwrap()
+    }
+
+    #[test]
+    fn running_quic_roundtrip_observes_cancel_after_first_datagram() {
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let peer = sink.local_addr().unwrap();
+        let control = H3Control::new(Instant::now(), Duration::from_secs(30));
+        let worker_control = control.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let request = H3Request {
+                method: "POST".into(),
+                url: format!("https://{peer}/"),
+                headers: Vec::new(),
+                body: Some(b"no-replay".to_vec()),
+                timeout: Duration::from_secs(30),
+                verify: false,
+                max_response_bytes: 1024,
+                peer: Some(peer),
+            };
+            let result =
+                H3Client::connect(profile(), &request, &worker_control).and_then(|mut client| {
+                    client
+                        .roundtrip(request, &worker_control)
+                        .map_err(|e| e.error)
+                });
+            tx.send(result.err().map(|error| error.to_string()))
+                .unwrap();
+        });
+        let received = sink.recv_from(&mut [0_u8; 1500]);
+        // Cancel even on fixture failure so the test never leaves a 30s worker.
+        control.cancel();
+        assert!(
+            received.is_ok(),
+            "worker did not send QUIC Initial: {received:?}"
+        );
+        let error = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("running worker must stop, not wait for its original deadline")
+            .expect("cancelled request cannot succeed");
+        worker.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn decoded_chunk_is_not_returned_after_cancellation_or_deadline() {
+        struct CancelReader(H3Control);
+        impl Read for CancelReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.cancel();
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+        let control = H3Control::new(Instant::now(), Duration::from_secs(2));
+        let error = read_limited(CancelReader(control.clone()), 32, &control).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+
+        struct SlowReader;
+        impl Read for SlowReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(5));
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+        let control = H3Control::new(Instant::now(), Duration::from_millis(1));
+        assert!(
+            read_limited(SlowReader, 32, &control)
+                .unwrap_err()
+                .to_string()
+                .contains("timeout")
+        );
+    }
+
+    #[test]
+    fn quic_setup_uses_original_budget_and_rejects_pre_cancelled_work() {
+        let request = H3Request {
+            method: "GET".into(),
+            url: "https://127.0.0.1:1/".into(),
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(30),
+            verify: false,
+            max_response_bytes: 1024,
+            peer: Some("127.0.0.1:1".parse().unwrap()),
+        };
+        let expired = H3Control::new(
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert!(
+            H3Client::connect(profile(), &request, &expired)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timeout")
+        );
+        let cancelled = H3Control::new(Instant::now(), Duration::from_secs(30));
+        cancelled.cancel();
+        assert!(
+            H3Client::connect(profile(), &request, &cancelled)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn peer_identity_is_verified_without_sni_for_dns_and_ip() {
+        use btls::{
+            asn1::Asn1Time,
+            bn::BigNum,
+            hash::MessageDigest,
+            pkey::PKey,
+            rsa::Rsa,
+            ssl::Ssl,
+            stack::Stack,
+            x509::{
+                X509Name, X509StoreContext,
+                extension::{BasicConstraints, SubjectAlternativeName},
+            },
+        };
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509Name::builder().unwrap();
+        name.append_entry_by_text("CN", "example.test").unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        let san = SubjectAlternativeName::new()
+            .dns("example.test")
+            .ip("127.0.0.1")
+            .ip("::1")
+            .build(&cert.x509v3_context(None, None))
+            .unwrap();
+        cert.append_extension(&san).unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = cert.build();
+        for (url, expected) in [
+            ("https://example.test/", true),
+            ("https://other.test/", false),
+            ("https://127.0.0.1/", true),
+            ("https://127.0.0.2/", false),
+            ("https://[::1]/", true),
+            ("https://[::2]/", false),
+        ] {
+            let context = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
+            let mut ssl = Ssl::new(&context).unwrap();
+            configure_peer_identity(&mut ssl, &Url::parse(url).unwrap()).unwrap();
+            let mut store = X509StoreBuilder::new().unwrap();
+            store.add_cert(&cert).unwrap();
+            store.set_param(ssl.verify_param_mut()).unwrap();
+            let chain = Stack::new().unwrap();
+            let verified = X509StoreContext::new()
+                .unwrap()
+                .init(&store.build(), &cert, &chain, |ctx| ctx.verify_cert())
+                .unwrap();
+            assert_eq!(verified, expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn h3_verified_context_loads_bundled_roots() {
+        tls_builder(&profile().tls, true).unwrap();
+    }
+
+    #[test]
+    fn ipv6_literal_resolves_without_dns_or_brackets() {
+        let addresses = Url::parse("https://[::1]:8443/")
+            .unwrap()
+            .socket_addrs(|| Some(443))
+            .unwrap();
+        assert_eq!(addresses, vec!["[::1]:8443".parse::<SocketAddr>().unwrap()]);
+    }
+
+    fn request() -> H3Request {
+        H3Request {
+            method: "GET".into(),
+            url: "https://example.test/path".into(),
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(1),
+            verify: false,
+            max_response_bytes: 1024,
+            peer: None,
+        }
+    }
+
+    fn header_list(values: &[(&str, &str)]) -> Vec<quiche::h3::Header> {
+        values
+            .iter()
+            .map(|(name, value)| quiche::h3::Header::new(name.as_bytes(), value.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn captured_credentials_and_request_context_are_not_replayed() {
+        let mut template = profile();
+        for name in [
+            "cookie",
+            "authorization",
+            "x-api-key",
+            "content-length",
+            "host",
+        ] {
+            template.http.header_order.push(name.into());
+            template
+                .http
+                .headers
+                .push((name.into(), "captured-secret".into()));
+        }
+        let mut request = request();
+        request
+            .headers
+            .push(("Cookie".into(), "explicit=yes".into()));
+        request.headers.push(("Host".into(), "virtual.test".into()));
+        let headers =
+            request_headers(&template, &request, &Url::parse(&request.url).unwrap()).unwrap();
+        assert!(headers.iter().any(|header| header.name() == b"user-agent"));
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b"cookie" && header.value() == b"explicit=yes")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b":authority" && header.value() == b"virtual.test")
+        );
+        assert!(!headers.iter().any(|header| matches!(
+            header.name(),
+            b"origin" | b"referer" | b"authorization" | b"x-api-key" | b"content-length" | b"host"
+        )));
+    }
+
+    #[test]
+    fn request_rejects_connection_specific_headers() {
+        let mut request = request();
+        request
+            .headers
+            .push(("Connection".into(), "keep-alive".into()));
+        assert!(request_headers(&profile(), &request, &Url::parse(&request.url).unwrap()).is_err());
+    }
+
+    #[test]
+    fn template_rejects_duplicate_or_late_pseudo_headers() {
+        for name in [":status", ":path"] {
+            let mut template = profile();
+            template.http.headers.push((name.into(), "200".into()));
+            template.http.header_order.push(name.into());
+            assert!(validate(&template).is_err());
+        }
+    }
+
+    #[test]
+    fn informational_and_trailer_fields_do_not_modify_final_response() {
+        let mut status = None;
+        let mut headers = Vec::new();
+        let mut trailers = false;
+        receive_response_headers(
+            header_list(&[
+                (":status", "103"),
+                ("content-encoding", "gzip"),
+                ("set-cookie", "interim=1"),
+            ]),
+            &mut status,
+            &mut headers,
+            &mut trailers,
+        )
+        .unwrap();
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
+        receive_response_headers(
+            header_list(&[(":status", "200"), ("content-length", "2")]),
+            &mut status,
+            &mut headers,
+            &mut trailers,
+        )
+        .unwrap();
+        receive_response_headers(
+            header_list(&[("content-encoding", "gzip"), ("set-cookie", "trailer=1")]),
+            &mut status,
+            &mut headers,
+            &mut trailers,
+        )
+        .unwrap();
+        assert!(trailers);
+        assert_eq!(status, Some(200));
+        assert_eq!(headers, vec![("content-length".into(), "2".into())]);
+        assert_eq!(
+            finish_response_body("GET", 200, &mut headers, b"ok".to_vec(), 10).unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn invalid_response_status_and_pseudo_headers_are_rejected() {
+        for values in [
+            vec![(":status", "101")],
+            vec![(":status", "99")],
+            vec![(":status", "600")],
+            vec![(":status", "200"), (":status", "201")],
+            vec![("x-before", "1"), (":status", "200")],
+            vec![(":status", "200"), ("connection", "close")],
+        ] {
+            assert!(
+                receive_response_headers(
+                    header_list(&values),
+                    &mut None,
+                    &mut Vec::new(),
+                    &mut false
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn head_and_304_do_not_decompress_missing_representation() {
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 204)] {
+            let mut headers = vec![
+                ("content-encoding".into(), "gzip".into()),
+                ("content-length".into(), "999".into()),
+            ];
+            assert!(
+                finish_response_body(method, status, &mut headers, Vec::new(), 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(headers.len(), 2);
+            assert!(finish_response_body(method, status, &mut headers, vec![1], 1).is_err());
+        }
+    }
+
+    #[test]
+    fn response_content_length_is_checked_before_decompression() {
+        for value in ["3", "2, 3", "-1", "invalid"] {
+            let mut headers = vec![("content-length".into(), value.into())];
+            assert!(finish_response_body("GET", 200, &mut headers, b"ok".to_vec(), 10).is_err());
+        }
+        let mut headers = vec![("content-length".into(), "2, 2".into())];
+        assert_eq!(
+            finish_response_body("GET", 200, &mut headers, b"ok".to_vec(), 10).unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn settings_reject_varint_overflow_and_non_reproducible_boolean() {
+        for (id, value) in [(1, u64::MAX), (6, 1_u64 << 62), (8, 0), (8, 2), (51, 2)] {
+            let mut template = profile();
+            if let Some(setting) = template
+                .http
+                .settings
+                .iter_mut()
+                .find(|(key, _)| *key == id)
+            {
+                setting.1 = value;
+            } else {
+                template.http.settings.insert(3, (id, value));
+            }
+            assert!(validate(&template).is_err(), "setting {id}={value}");
+        }
+    }
+
+    #[test]
+    fn transport_parameters_reject_runtime_bounds_before_wire_replay() {
+        let original = profile().quic.transport_parameters;
+        let raw = BASE64.decode(&original.wire.base64).unwrap();
+        for field in 0..6 {
+            let mut tp = original.clone();
+            match field {
+                0 => tp.max_udp_payload_size = usize::MAX,
+                1 => tp.initial_max_streams_bidi = (1_u64 << 60) + 1,
+                2 => tp.initial_max_streams_uni = (1_u64 << 60) + 1,
+                3 => tp.ack_delay_exponent = 21,
+                4 => tp.max_ack_delay = 1_u64 << 14,
+                5 => tp.initial_max_data = u64::MAX,
+                _ => unreachable!(),
+            }
+            let error = validate_transport_parameters(&tp, &raw).unwrap_err();
+            assert!(error.to_string().contains("numeric bounds"), "{error}");
+        }
+    }
+
+    #[test]
+    fn oversized_wire_item_length_is_an_error_not_overflow() {
+        let mut tp = profile().quic.transport_parameters;
+        let raw = BASE64.decode(&tp.wire.base64).unwrap();
+        tp.wire.parameters[0].length = usize::MAX;
+        assert!(validate_transport_parameters(&tp, &raw).is_err());
     }
 }

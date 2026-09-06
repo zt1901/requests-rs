@@ -443,7 +443,7 @@ impl Path {
             std::cmp::max(self.max_challenge_size, challenge_size);
 
         if self.state == PathState::ValidatingMTU {
-            if self.max_challenge_size >= crate::MIN_CLIENT_INITIAL_LEN {
+            if self.max_challenge_size >= crate::MIN_QUIC_PAYLOAD_LEN {
                 // Path MTU is sufficient for QUIC traffic.
                 self.promote_to(PathState::Validated);
                 return true;
@@ -1060,7 +1060,7 @@ impl std::fmt::Debug for PathStats {
 #[cfg(test)]
 mod tests {
     use crate::rand;
-    use crate::MIN_CLIENT_INITIAL_LEN;
+    use crate::MIN_QUIC_PAYLOAD_LEN;
 
     use crate::recovery::RecoveryConfig;
     use crate::Config;
@@ -1103,12 +1103,12 @@ mod tests {
         assert!(path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(path_mgr.get_mut(pid).unwrap().probing_required());
 
-        // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN - 1
+        // Fake sending of PathChallenge in a packet of MIN_QUIC_PAYLOAD_LEN - 1
         // bytes.
         let data = rand::rand_u64().to_be_bytes();
         path_mgr.get_mut(pid).unwrap().add_challenge_sent(
             data,
-            MIN_CLIENT_INITIAL_LEN - 1,
+            MIN_QUIC_PAYLOAD_LEN - 1,
             Instant::now(),
         );
 
@@ -1133,12 +1133,12 @@ mod tests {
         );
         assert_eq!(path_mgr.pop_event(), None);
 
-        // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN
+        // Fake sending of PathChallenge in a packet of MIN_QUIC_PAYLOAD_LEN
         // bytes.
         let data = rand::rand_u64().to_be_bytes();
         path_mgr.get_mut(pid).unwrap().add_challenge_sent(
             data,
-            MIN_CLIENT_INITIAL_LEN,
+            MIN_QUIC_PAYLOAD_LEN,
             Instant::now(),
         );
 
@@ -1191,7 +1191,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data, MIN_QUIC_PAYLOAD_LEN, Instant::now());
 
         // Second probe.
         let data_2 = rand::rand_u64().to_be_bytes();
@@ -1199,7 +1199,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data_2, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data_2, MIN_QUIC_PAYLOAD_LEN, Instant::now());
         assert_eq!(
             client_path_mgr
                 .get(client_pid)
@@ -1275,7 +1275,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data, MIN_QUIC_PAYLOAD_LEN, Instant::now());
 
         // Second probe.
         let data_2 = rand::rand_u64().to_be_bytes();
@@ -1283,7 +1283,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data_2, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data_2, MIN_QUIC_PAYLOAD_LEN, Instant::now());
         assert_eq!(
             client_path_mgr
                 .get(client_pid)
@@ -1299,7 +1299,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data_3, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data_3, MIN_QUIC_PAYLOAD_LEN, Instant::now());
         assert_eq!(
             client_path_mgr
                 .get(client_pid)
@@ -1315,7 +1315,7 @@ mod tests {
         client_path_mgr
             .get_mut(client_pid)
             .unwrap()
-            .add_challenge_sent(data_4, MIN_CLIENT_INITIAL_LEN, Instant::now());
+            .add_challenge_sent(data_4, MIN_QUIC_PAYLOAD_LEN, Instant::now());
         assert_eq!(
             client_path_mgr
                 .get(client_pid)

@@ -663,7 +663,19 @@ fn validate_record(record: &Record) -> Result<()> {
         if !(1..=6).contains(&setting.id) {
             bail!("HTTP/2 SETTINGS ID {}尚不能等价回放", setting.id)
         }
+        if (setting.id == 2 && setting.value > 1)
+            || (setting.id == 4 && setting.value > 0x7fff_ffff)
+            || (setting.id == 5 && !(16_384..=16_777_215).contains(&setting.value))
+        {
+            bail!("HTTP/2 SETTINGS值超出协议范围: {setting:?}")
+        }
     }
+    if let Some(increment) = http.connection_window_update
+        && (increment == 0 || increment > 0x7fff_ffff - 65_535)
+    {
+        bail!("HTTP/2 connection_window_update超出协议范围: {increment}")
+    }
+    let mut pseudo_headers = HashSet::new();
     for name in &http.pseudo_header_order {
         if !matches!(
             name.as_str(),
@@ -671,13 +683,27 @@ fn validate_record(record: &Record) -> Result<()> {
         ) {
             bail!("未知HTTP/2伪Header: {name}")
         }
+        if !pseudo_headers.insert(name) {
+            bail!("HTTP/2伪Header顺序包含重复项: {name}")
+        }
     }
+    let mut headers_priorities = 0;
     for priority in &http.priorities {
         if !matches!(priority.source.as_str(), "HEADERS" | "PRIORITY")
             || priority.exclusive > 1
             || !(1..=256).contains(&priority.weight)
+            || !(1..=0x7fff_ffff).contains(&priority.stream_id)
+            || priority.dependency > 0x7fff_ffff
+            || priority.stream_id == priority.dependency
+            || (priority.source == "HEADERS" && priority.stream_id % 2 == 0)
         {
             bail!("HTTP/2 priority字段无法等价回放: {priority:?}")
+        }
+        if priority.source == "HEADERS" {
+            headers_priorities += 1;
+            if headers_priorities > 1 {
+                bail!("HTTP/2模板只能声明一个HEADERS priority")
+            }
         }
     }
     build_emulation(record).map(|_| ())
@@ -1225,7 +1251,7 @@ struct SessionState {
     dns_resolver: Option<CustomDnsResolver>,
     dns_overrides: Arc<Vec<(String, Vec<SocketAddr>)>>,
     // schema 2模板连接按指纹变体和origin隔离，并在Session生命周期内复用。
-    profile_http3_clients: Mutex<LruCache<String, Arc<Mutex<Option<profile_http3::H3Client>>>>>,
+    profile_http3_clients: Mutex<LruCache<String, Arc<AsyncMutex<Option<profile_http3::H3Client>>>>>,
     // QUIC能力按origin和请求级DNS路由缓存；短期负缓存避免每次都等待UDP超时。
     http3_capabilities: Mutex<LruCache<String, Http3Capability>>,
     cookie_jar: Arc<Jar>,
@@ -1236,13 +1262,19 @@ struct SessionState {
     max_websocket_message_bytes: usize,
 }
 
-async fn acquire_connection_slot(state: &Arc<SessionState>) -> PyResult<OwnedSemaphorePermit> {
-    state
-        .connection_slots
-        .clone()
-        .acquire_owned()
+async fn acquire_connection_slot(
+    state: &Arc<SessionState>,
+    timeout: Duration,
+) -> PyResult<(OwnedSemaphorePermit, Duration)> {
+    let started = Instant::now();
+    let permit = tokio::time::timeout(timeout, state.connection_slots.clone().acquire_owned())
         .await
-        .map_err(|_| PyRuntimeError::new_err("Session已经关闭"))
+        .map_err(|_| PyRuntimeError::new_err("request timeout waiting for connection slot"))?
+        .map_err(|_| PyRuntimeError::new_err("Session已经关闭"))?;
+    // Pool contention consumes the same budget as the request, not a fresh timeout.
+    let remaining = timeout.checked_sub(started.elapsed()).filter(|value| !value.is_zero())
+        .ok_or_else(|| PyRuntimeError::new_err("request timeout waiting for connection slot"))?;
+    Ok((permit, remaining))
 }
 
 fn normalize_profile(profile: &str) -> String {
@@ -1663,7 +1695,10 @@ async fn copy_with_counter<R, W>(
     let mut buffer = [0u8; 16_384];
     loop {
         let count = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                let _ = writer.shutdown().await;
+                return;
+            }
             Ok(count) => count,
         };
         if writer.write_all(&buffer[..count]).await.is_err() {
@@ -1684,15 +1719,43 @@ where
 {
     const MAX_CONNECT_HEAD: usize = 64 * 1024;
     let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line).await?;
-    if line.is_empty() {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |position| position + 1);
+        if count > MAX_CONNECT_HEAD.saturating_sub(*total) {
+            return Err(std::io::Error::other("CONNECT请求头超过64KiB"));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        *total += count;
+        if newline.is_some() {
+            return Ok(line);
+        }
     }
-    *total = total.saturating_add(line.len());
-    if *total > MAX_CONNECT_HEAD {
-        return Err(std::io::Error::other("CONNECT请求头超过64KiB"));
+}
+
+fn decode_proxy_userinfo(value: &str) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut escaped = bytes.clone();
+            if let (Some(high), Some(low)) = (escaped.next(), escaped.next())
+                && let (Some(high), Some(low)) =
+                    ((high as char).to_digit(16), (low as char).to_digit(16))
+            {
+                decoded.push((high * 16 + low) as u8);
+                bytes = escaped;
+                continue;
+            }
+        }
+        decoded.push(byte);
     }
-    Ok(line)
+    decoded
 }
 
 async fn run_transfer_meter(
@@ -1727,7 +1790,7 @@ async fn run_transfer_meter(
     let Ok((host, port)) = parse_connect_target(target) else {
         return;
     };
-    let mut upstream = if let Some(proxy_url) = upstream_proxy {
+    let upstream = if let Some(proxy_url) = upstream_proxy {
         let Ok(parsed) = Url::parse(&proxy_url) else {
             return;
         };
@@ -1748,8 +1811,10 @@ async fn run_transfer_meter(
         };
         let mut connect = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            let password = parsed.password().unwrap_or_default();
-            let auth = BASE64.encode(format!("{}:{password}", parsed.username()));
+            let mut credentials = decode_proxy_userinfo(parsed.username());
+            credentials.push(b':');
+            credentials.extend(decode_proxy_userinfo(parsed.password().unwrap_or_default()));
+            let auth = BASE64.encode(credentials);
             connect.push_str(&format!("Proxy-Authorization: Basic {auth}\r\n"));
         }
         connect.push_str("\r\n");
@@ -1774,22 +1839,23 @@ async fn run_transfer_meter(
             else {
                 return;
             };
+            connect_response_bytes += line.len();
             if line == b"\r\n" {
                 break;
             }
-            connect_response_bytes += line.len();
         }
         counters
             .download
             .fetch_add(connect_response_bytes as u64, Ordering::Relaxed);
-        upstream_reader.into_inner()
+        upstream_reader
     } else {
         let Ok(stream) = TcpStream::connect((host.as_str(), port)).await else {
             return;
         };
-        stream
+        BufReader::new(stream)
     };
-    let mut client = reader.into_inner();
+    // Retain bytes read ahead after CONNECT headers on both sides.
+    let mut client = reader;
     if client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
@@ -1797,8 +1863,8 @@ async fn run_transfer_meter(
     {
         return;
     }
-    let (client_read, client_write) = client.split();
-    let (upstream_read, upstream_write) = upstream.split();
+    let (client_read, client_write) = tokio::io::split(client);
+    let (upstream_read, upstream_write) = tokio::io::split(upstream);
     tokio::join!(
         copy_with_counter(client_read, upstream_write, counters.clone(), true),
         copy_with_counter(upstream_read, client_write, counters, false),
@@ -1892,6 +1958,15 @@ fn encode_form(params: Vec<(String, Vec<String>)>) -> Vec<u8> {
 }
 
 fn json_value(value: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
+    json_value_with_depth(value, 0)
+}
+
+fn json_value_with_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Option<JsonValue>> {
+    // Native recursion must be bounded, including self-referential containers.
+    // Fall back to Python's JSON encoder, which detects cycles and reports them safely.
+    if depth >= 64 {
+        return Ok(None);
+    }
     if value.is_none() {
         return Ok(Some(JsonValue::Null));
     }
@@ -1917,7 +1992,7 @@ fn json_value(value: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
     if let Ok(values) = value.cast::<PyList>() {
         let mut result = Vec::with_capacity(values.len());
         for item in values.iter() {
-            let Some(item) = json_value(&item)? else {
+            let Some(item) = json_value_with_depth(&item, depth + 1)? else {
                 return Ok(None);
             };
             result.push(item);
@@ -1927,7 +2002,7 @@ fn json_value(value: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
     if let Ok(values) = value.cast::<PyTuple>() {
         let mut result = Vec::with_capacity(values.len());
         for item in values.iter() {
-            let Some(item) = json_value(&item)? else {
+            let Some(item) = json_value_with_depth(&item, depth + 1)? else {
                 return Ok(None);
             };
             result.push(item);
@@ -1940,7 +2015,7 @@ fn json_value(value: &Bound<'_, PyAny>) -> PyResult<Option<JsonValue>> {
             let Ok(key) = key.extract::<String>() else {
                 return Ok(None);
             };
-            let Some(item) = json_value(&item)? else {
+            let Some(item) = json_value_with_depth(&item, depth + 1)? else {
                 return Ok(None);
             };
             result.insert(key, item);
@@ -2108,6 +2183,13 @@ fn prepare_headers(
         .map(|(index, (name, _))| (name.clone(), index))
         .collect();
     for (name, value) in request_cookies {
+        // Validate the native entry point too: HeaderValue alone does not reject
+        // semicolons, which would turn one caller-provided value into cookies.
+        if HeaderName::from_bytes(name.as_bytes()).is_err()
+            || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f || byte == b';')
+        {
+            return Err(PyRuntimeError::new_err("invalid request cookie name or value"));
+        }
         if let Some(index) = positions.get(&name) {
             values[*index] = (name, value);
         } else {
@@ -2202,11 +2284,61 @@ fn profile_http3_cache_key(index: usize, url: &str, peer: Option<SocketAddr>) ->
     ))
 }
 
+async fn acquire_http3_client(
+    slot: Arc<AsyncMutex<Option<profile_http3::H3Client>>>,
+    started: Instant,
+    timeout: Duration,
+) -> Result<tokio::sync::OwnedMutexGuard<Option<profile_http3::H3Client>>> {
+    let remaining = timeout.checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .context("HTTP/3连接排队超过timeout")?;
+    tokio::time::timeout(remaining, slot.lock_owned()).await
+        .context("HTTP/3连接排队超过timeout")
+}
+
+/// Abort queued work; running blocking work observes the shared flag instead.
+type PendingHttp3Client = Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<Option<profile_http3::H3Client>>>>>;
+
+struct Http3WorkerGuard {
+    control: profile_http3::H3Control,
+    abort: tokio::task::AbortHandle,
+    pending_client: PendingHttp3Client,
+}
+
+impl Drop for Http3WorkerGuard {
+    fn drop(&mut self) {
+        self.control.cancel();
+        self.abort.abort();
+        // A queued blocking task may not be dequeued promptly after abort.
+        // Release its origin lock here unless the worker already took ownership.
+        if let Ok(mut client) = self.pending_client.lock() {
+            client.take();
+        }
+    }
+}
+
+async fn await_http3_worker<T>(
+    worker: tokio::task::JoinHandle<T>,
+    guard: Http3WorkerGuard,
+    started: Instant,
+    timeout: Duration,
+) -> Result<T> {
+    let _guard = guard;
+    let remaining = timeout.checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .context("HTTP/3工作线程排队超过timeout")?;
+    tokio::time::timeout(remaining, worker).await
+        .context("HTTP/3工作线程超过timeout")?
+        .context("HTTP/3工作线程失败")
+}
+
 async fn profile_http3_roundtrip(
     state: Arc<SessionState>,
     index: usize,
-    request: profile_http3::H3Request,
+    mut request: profile_http3::H3Request,
 ) -> std::result::Result<profile_http3::H3Response, Http3AttemptError> {
+    let started = Instant::now();
+    let timeout = request.timeout;
     let template = state.variants[index]
         .record
         .http3
@@ -2232,40 +2364,82 @@ async fn profile_http3_roundtrip(
         if let Some(client) = clients.get(&key) {
             client.clone()
         } else {
-            let client = Arc::new(Mutex::new(None));
+            let client = Arc::new(AsyncMutex::new(None));
             clients.put(key.clone(), client.clone());
             client
         }
     };
-    let task_slot = slot.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut client = task_slot
-            .lock()
-            .map_err(|_| profile_http3::H3RequestError {
-                error: anyhow::anyhow!("模板HTTP/3连接锁已损坏"),
+    // Queue asynchronously: a same-origin request must not occupy a blocking
+    // worker or outlive its deadline merely waiting for the previous request.
+    let mut client = acquire_http3_client(slot.clone(), started, timeout)
+        .await
+        .map_err(|error| Http3AttemptError {
+            error: to_py_error(error),
+            response_received: false,
+        })?;
+    if client.as_ref().is_some_and(|client| !client.is_reusable()) {
+        *client = None;
+    }
+    if client.is_none() && request.peer.is_none() {
+        let parsed = Url::parse(&request.url).map_err(|error| Http3AttemptError {
+            error: to_py_error(error),
+            response_received: false,
+        })?;
+        let host = parsed.host_str().ok_or_else(|| Http3AttemptError {
+            error: PyRuntimeError::new_err("HTTP/3 URL缺少host"),
+            response_received: false,
+        })?.trim_start_matches('[').trim_end_matches(']');
+        let remaining = remaining_protocol_timeout(started, timeout).map_err(|error| {
+            Http3AttemptError { error, response_received: false }
+        })?;
+        let addresses = tokio::time::timeout(remaining,
+            tokio::net::lookup_host((host, parsed.port_or_known_default().unwrap_or(443))))
+            .await
+            .map_err(|_| Http3AttemptError {
+                error: PyRuntimeError::new_err("HTTP/3 DNS查询超过timeout"),
+                response_received: false,
+            })?
+            .map_err(|error| Http3AttemptError {
+                error: to_py_error(error),
                 response_received: false,
             })?;
-        if client.as_ref().is_some_and(|client| !client.is_reusable()) {
+        request.peer = Some(addresses.into_iter().next().ok_or_else(|| Http3AttemptError {
+            error: PyRuntimeError::new_err("HTTP/3 DNS没有返回地址"),
+            response_received: false,
+        })?);
+    }
+    let control = profile_http3::H3Control::new(started, timeout);
+    let worker_control = control.clone();
+    let pending_client = Arc::new(Mutex::new(Some(client)));
+    let worker_client = pending_client.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut client = worker_client.lock().ok().and_then(|mut client| client.take())
+            .ok_or_else(|| profile_http3::H3RequestError {
+                error: anyhow::anyhow!("HTTP/3 worker cancelled before execution"),
+                response_received: false,
+            })?;
+        let result = (|| {
+            worker_control.check().map_err(|error| profile_http3::H3RequestError {
+                error, response_received: false,
+            })?;
+            if client.is_none() {
+                *client = Some(profile_http3::H3Client::connect(template, &request, &worker_control)
+                    .map_err(|error| profile_http3::H3RequestError {
+                        error, response_received: false,
+                    })?);
+            }
+            client.as_mut().expect("HTTP/3 client initialized").roundtrip(request, &worker_control)
+        })();
+        // Cleanup belongs to the worker, not its awaiter (which may be gone).
+        // Never reuse a connection whose previous request was abandoned.
+        if result.is_err() || worker_control.check().is_err() {
             *client = None;
         }
-        if client.is_none() {
-            *client = Some(
-                profile_http3::H3Client::connect(template, &request).map_err(|error| {
-                    profile_http3::H3RequestError {
-                        error,
-                        response_received: false,
-                    }
-                })?,
-            );
-        }
-        client
-            .as_mut()
-            .expect("HTTP/3 client initialized")
-            .roundtrip(request)
-    })
-    .await
-    .map_err(|error| Http3AttemptError {
-        error: PyRuntimeError::new_err(format!("HTTP/3工作线程失败: {error}")),
+        result
+    });
+    let guard = Http3WorkerGuard { control, abort: worker.abort_handle(), pending_client };
+    let result = await_http3_worker(worker, guard, started, timeout).await.map_err(|error| Http3AttemptError {
+        error: PyRuntimeError::new_err(format!("{error:#}")),
         response_received: false,
     })?;
     match result {
@@ -2393,7 +2567,7 @@ async fn execute_profile_http3_request(
             headers.remove(COOKIE);
             headers.remove(HOST);
         }
-        if response.status == 303
+        if (response.status == 303 && method != Method::HEAD)
             || ((response.status == 301 || response.status == 302) && method == Method::POST)
         {
             method = Method::GET;
@@ -2454,6 +2628,8 @@ async fn execute_profile_http3_stream_request(
             buffered: Vec::new(),
             offset: 0,
             terminal_error: None,
+            received_bytes: 0,
+            max_response_bytes,
         })),
         closed: Arc::new(AtomicBool::new(false)),
         close_notify: Arc::new(Notify::new()),
@@ -2573,6 +2749,7 @@ async fn execute_stream_request(
     request_version: RequestHttpVersion,
     fingerprint_id: String,
     profile: String,
+    max_response_bytes: usize,
 ) -> PyResult<NativeStreamResponse> {
     let mut request = apply_wreq_request_version(client.request(method, &url), request_version)
         .timeout(timeout)
@@ -2628,6 +2805,8 @@ async fn execute_stream_request(
             buffered: Vec::new(),
             offset: 0,
             terminal_error: None,
+            received_bytes: 0,
+            max_response_bytes,
         })),
         closed: Arc::new(AtomicBool::new(false)),
         close_notify: Arc::new(Notify::new()),
@@ -2767,6 +2946,7 @@ async fn execute_preferred_request(
         && proxy_url.is_none()
         && !transfer_stats
         && !dns_override
+        && state.dns_resolver.is_none()
         && url.starts_with("https://")
         && state.variants[index].record.http3.is_some();
     if direct_http3 {
@@ -2825,7 +3005,9 @@ async fn execute_preferred_request(
                     }
                     Err(_) => {
                         store_http3_capability(&state, capability_key, false)?;
-                        permit = Some(acquire_connection_slot(&state).await?);
+                        permit = Some(acquire_connection_slot(
+                            &state, remaining_protocol_timeout(protocol_started, timeout)?
+                        ).await?.0);
                     }
                 }
             }
@@ -2896,6 +3078,7 @@ async fn execute_preferred_stream_request(
     let direct_http3 = request_version == RequestHttpVersion::Http3
         && proxy_url.is_none()
         && !dns_override
+        && state.dns_resolver.is_none()
         && url.starts_with("https://")
         && state.variants[index].record.http3.is_some();
     if direct_http3 {
@@ -2953,7 +3136,9 @@ async fn execute_preferred_stream_request(
                     }
                     Err(_) => {
                         store_http3_capability(&state, capability_key, false)?;
-                        permit = Some(acquire_connection_slot(&state).await?);
+                        permit = Some(acquire_connection_slot(
+                            &state, remaining_protocol_timeout(protocol_started, timeout)?
+                        ).await?.0);
                     }
                 }
             }
@@ -2988,6 +3173,7 @@ async fn execute_preferred_stream_request(
         request_version,
         fingerprint_id,
         profile,
+        state.max_response_bytes,
     )
     .await
 }
@@ -3517,6 +3703,8 @@ struct StreamState {
     buffered: Vec<u8>,
     offset: usize,
     terminal_error: Option<String>,
+    received_bytes: usize,
+    max_response_bytes: usize,
 }
 
 struct ReadGuard(Arc<AtomicBool>);
@@ -3584,7 +3772,21 @@ async fn read_stream(
             _ = notified => None,
             item = stream.next() => item,
         } {
-            Some(Ok(chunk)) => state.buffered.extend_from_slice(&chunk),
+            Some(Ok(chunk)) => {
+                if chunk.len() > state.max_response_bytes.saturating_sub(state.received_bytes) {
+                    let message = format!(
+                        "响应Body超过max_response_bytes限制: {}字节", state.max_response_bytes
+                    );
+                    state.stream = None;
+                    state.buffered.clear();
+                    state.offset = 0;
+                    state.terminal_error = Some(message.clone());
+                    permit.lock().ok().and_then(|mut permit| permit.take());
+                    return Err(PyRuntimeError::new_err(message));
+                }
+                state.received_bytes += chunk.len();
+                state.buffered.extend_from_slice(&chunk);
+            },
             Some(Err(error)) => {
                 let message = error.to_string();
                 state.stream = None;
@@ -4040,7 +4242,7 @@ impl NativeSession {
         let result = py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
+            let (permit, timeout) = runtime.block_on(acquire_connection_slot(&state, timeout))?;
             let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
             let result = runtime.block_on(execute_preferred_request(
@@ -4111,10 +4313,12 @@ impl NativeSession {
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
+        // Own the pending route before handing the future to Python: conversion can fail
+        // (no running event loop), and cancellation may drop it before its first poll.
+        let mut reservation =
+            CachedOriginReservation::new(state.clone(), cached_origin_reservation);
         rust_future_into_py(py, async move {
-            let mut reservation =
-                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = acquire_connection_slot(&state).await?;
+            let (permit, timeout) = acquire_connection_slot(&state, timeout).await?;
             let response = execute_preferred_request(
                 permit,
                 state.clone(),
@@ -4174,7 +4378,7 @@ impl NativeSession {
         py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
+            let (permit, timeout) = runtime.block_on(acquire_connection_slot(&state, timeout))?;
             let variant = &state.variants[index];
             let client = selected_request_client(
                 &state,
@@ -4232,10 +4436,12 @@ impl NativeSession {
             cache_route_allowed(&state, &url, proxy_url.as_deref())?;
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
+        // Own the pending route before handing the future to Python: conversion can fail
+        // (no running event loop), and cancellation may drop it before its first poll.
+        let mut reservation =
+            CachedOriginReservation::new(state.clone(), cached_origin_reservation);
         rust_future_into_py(py, async move {
-            let mut reservation =
-                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = acquire_connection_slot(&state).await?;
+            let (permit, timeout) = acquire_connection_slot(&state, timeout).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -4305,7 +4511,7 @@ impl NativeSession {
         py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
+            let (permit, timeout) = runtime.block_on(acquire_connection_slot(&state, timeout))?;
             let fingerprint_id = state.variants[index].record.id.clone();
             let profile = state.profile.clone();
             let result = runtime.block_on(execute_preferred_stream_request(
@@ -4373,10 +4579,12 @@ impl NativeSession {
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
+        // Own the pending route before handing the future to Python: conversion can fail
+        // (no running event loop), and cancellation may drop it before its first poll.
+        let mut reservation =
+            CachedOriginReservation::new(state.clone(), cached_origin_reservation);
         rust_future_into_py(py, async move {
-            let mut reservation =
-                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = acquire_connection_slot(&state).await?;
+            let (permit, timeout) = acquire_connection_slot(&state, timeout).await?;
             let result = execute_preferred_stream_request(
                 permit,
                 state.clone(),
@@ -4447,7 +4655,7 @@ impl NativeSession {
         let result = py.detach(move || {
             let mut reservation =
                 CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = runtime.block_on(acquire_connection_slot(&state))?;
+            let (permit, timeout) = runtime.block_on(acquire_connection_slot(&state, timeout))?;
             let variant = &state.variants[index];
             let client = selected_request_client(
                 &state,
@@ -4522,10 +4730,12 @@ impl NativeSession {
         let state = self.state.clone();
         let fingerprint_id = state.variants[index].record.id.clone();
         let profile = state.profile.clone();
+        // Own the pending route before handing the future to Python: conversion can fail
+        // (no running event loop), and cancellation may drop it before its first poll.
+        let mut reservation =
+            CachedOriginReservation::new(state.clone(), cached_origin_reservation);
         rust_future_into_py(py, async move {
-            let mut reservation =
-                CachedOriginReservation::new(state.clone(), cached_origin_reservation);
-            let permit = acquire_connection_slot(&state).await?;
+            let (permit, timeout) = acquire_connection_slot(&state, timeout).await?;
             let client = selected_request_client_async(
                 state.clone(),
                 index,
@@ -4840,4 +5050,119 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add(name, api_module.getattr(name)?)?;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn http3_client_queue_times_out_and_is_cancellation_safe() {
+        let slot = Arc::new(AsyncMutex::new(None));
+        let owner = slot.clone().lock_owned().await;
+        let started = Instant::now();
+        let result = acquire_http3_client(slot.clone(), started, Duration::from_millis(20)).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(owner);
+        assert!(acquire_http3_client(slot, Instant::now(), Duration::from_secs(1)).await.is_ok());
+    }
+
+    #[test]
+    fn http3_blocking_pool_queue_obeys_deadline_and_releases_origin() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all().max_blocking_threads(1).build().unwrap();
+        let (release, hold) = std::sync::mpsc::channel();
+        let (entered, started_worker) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            entered.send(()).unwrap();
+            let _ = hold.recv_timeout(Duration::from_secs(3));
+        });
+        started_worker.recv_timeout(Duration::from_secs(1)).unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.block_on(async {
+            let slot = Arc::new(AsyncMutex::new(None));
+            let pending_client = Arc::new(Mutex::new(Some(slot.clone().lock_owned().await)));
+            let worker_ran = ran.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                worker_ran.store(true, Ordering::Relaxed);
+            });
+            let started = Instant::now();
+            let timeout = Duration::from_millis(25);
+            let control = profile_http3::H3Control::new(started, timeout);
+            let guard = Http3WorkerGuard { control: control.clone(), abort: worker.abort_handle(), pending_client };
+            assert!(await_http3_worker(worker, guard, started, timeout).await.is_err());
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(control.check().is_err());
+            assert!(slot.try_lock().is_ok(), "queued worker retained origin lock after timeout");
+        });
+        release.send(()).unwrap();
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        assert!(!ran.load(Ordering::Relaxed), "expired queued worker was executed");
+    }
+
+    #[test]
+    fn proxy_userinfo_decoding_preserves_plus_and_raw_bytes() {
+        assert_eq!(decode_proxy_userinfo("user%40name+tag"), b"user@name+tag");
+        assert_eq!(decode_proxy_userinfo("p%3Ass%25%FF"), b"p:ss%\xff");
+        assert_eq!(decode_proxy_userinfo("bad%2x%"), b"bad%2x%");
+    }
+
+    #[tokio::test]
+    async fn connect_header_limit_is_enforced_before_allocation() {
+        let input = vec![b'x'; 128 * 1024];
+        let mut reader = input.as_slice();
+        let mut total = 0;
+        assert!(read_meter_line(&mut reader, &mut total).await.is_err());
+        assert_eq!(total, 0);
+        assert_eq!(reader.len(), input.len());
+
+        let mut reader = b"line\r\nremaining".as_slice();
+        assert_eq!(read_meter_line(&mut reader, &mut total).await.unwrap(), b"line\r\n");
+        assert_eq!(reader, b"remaining");
+    }
+
+    #[tokio::test]
+    async fn transfer_meter_preserves_read_ahead_and_half_close() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let meter_address = listener.local_addr().unwrap();
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let proxy_url = format!("http://u%40ser:p%3Ass@{}", proxy.local_addr().unwrap());
+        let counters = Arc::new(TransferCounters {
+            upload: AtomicU64::new(0), download: AtomicU64::new(0),
+        });
+        let mock_proxy = async {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut header = Vec::new();
+            let mut total = 0;
+            loop {
+                let line = read_meter_line(&mut stream, &mut total).await.unwrap();
+                let done = line == b"\r\n";
+                header.extend(line);
+                if done { break; }
+            }
+            let expected_auth = BASE64.encode(b"u@ser:p:ss");
+            assert!(String::from_utf8(header).unwrap().contains(&expected_auth));
+            // The banner is deliberately part of the CONNECT response write.
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nbanner").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).await.unwrap();
+            assert_eq!(body, b"payload");
+        };
+        let client = async {
+            let mut stream = TcpStream::connect(meter_address).await.unwrap();
+            stream.write_all(b"CONNECT example.test:443 HTTP/1.1\r\n\r\npayload").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\nbanner");
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run_transfer_meter(listener, Some(proxy_url), counters.clone()), mock_proxy, client);
+        }).await.expect("meter failed to propagate EOF");
+        assert_eq!(counters.download.load(Ordering::Relaxed), b"HTTP/1.1 200 OK\r\n\r\nbanner".len() as u64);
+    }
 }

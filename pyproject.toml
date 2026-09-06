@@ -25,10 +25,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zt1901/requests_rust-source"
-Documentation = "https://github.com/zt1901/requests_rust-source/blob/main/API_USAGE.md"
-Repository = "https://github.com/zt1901/requests_rust-source"
-Issues = "https://github.com/zt1901/requests_rust-source/issues"
+Homepage = "https://github.com/zt1901/requests-rs"
+Documentation = "https://github.com/zt1901/requests-rs/blob/main/API_USAGE.md"
+Repository = "https://github.com/zt1901/requests-rs"
+Issues = "https://github.com/zt1901/requests-rs/issues"
 
 [tool.maturin]
 python-source = "python"

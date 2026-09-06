@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 HTTP3_FIXTURE_GLOB = "tests/fixtures/*_schema2.json"
@@ -67,6 +69,25 @@ def 可嵌入(record):
     )
 
 
+def 写入指纹(path, records):
+    """先完成序列化和临时写入，再替换已提交数据，失败时保留原文件。"""
+    content = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=path.name + ".", suffix=".tmp", delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main():
     records = 读取记录(记录文件)
     baselines = []
@@ -129,10 +150,7 @@ def main():
 
     if not embedded:
         raise RuntimeError("没有找到包含浏览器版本和完整网络字段的指纹记录")
-    输出文件.write_text(
-        json.dumps(embedded, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    写入指纹(输出文件, embedded)
     print(f"已嵌入 {len(embedded)} 条指纹: {counts}，浏览器基准版本: {sorted(baseline_profiles)}")
 
 
