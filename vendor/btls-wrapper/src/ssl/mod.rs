@@ -1552,6 +1552,11 @@ impl SslContextBuilder {
         SslOptions::from_bits_retain(bits)
     }
 
+    /// Sets the AEAD and ciphertext length of ECH GREASE, retaining fresh randomness.
+    pub fn set_ech_grease_template(&mut self, aead: u16, payload_len: u16) -> Result<(), ErrorStack> {
+        unsafe { cvt(ffi::SSL_CTX_set_ech_grease_template(self.as_ptr(), aead, payload_len)).map(|_| ()) }
+    }
+
     /// Sets the minimum supported protocol version.
     ///
     /// If version is `None`, the default minimum version is used. For BoringSSL this defaults to

@@ -1,7 +1,7 @@
 //! Independent wire vectors from RFC 9204 Appendix B and section 4.
 //! Exercise the actual public vendored decoder, not extracted helper code.
-use quiche::h3::qpack::{Decoder, Error};
 use quiche::h3::Header;
+use quiche::h3::qpack::{Decoder, Error};
 
 fn hex(input: &str) -> Vec<u8> {
     let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
@@ -866,4 +866,55 @@ fn h3_feedback_queue_recovers_after_peer_consumption() {
     }
     queue_cancel_without_feedback_consumption(&mut peer).unwrap();
     assert!(peer.pipe.client.local_error().is_none());
+}
+
+#[test]
+fn firefox_ordered_settings_are_sent_without_added_field_limit() {
+    let mut client = transport_config(65536);
+    let mut server = transport_config(65536);
+    client.enable_dgram(true, 32, 32);
+    server.enable_dgram(true, 32, 32);
+    let mut pipe =
+        quiche::test_utils::Pipe::with_client_and_server_config(&mut client, &mut server).unwrap();
+    pipe.handshake().unwrap();
+    let values = vec![
+        (1, 65536),
+        (7, 20),
+        (727725890, 0),
+        (16765559, 1),
+        (51, 1),
+        (8, 1),
+    ];
+    let mut config = quiche::h3::Config::new().unwrap();
+    config.set_settings_template(values.clone()).unwrap();
+    let _client_h3 = quiche::h3::Connection::with_transport(&mut pipe.client, &config).unwrap();
+    let mut server_h3 = quiche::h3::Connection::with_transport(
+        &mut pipe.server,
+        &quiche::h3::Config::new().unwrap(),
+    )
+    .unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(
+        server_h3.poll(&mut pipe.server),
+        Err(quiche::h3::Error::Done)
+    );
+    assert_eq!(server_h3.peer_settings_raw().unwrap(), values.as_slice());
+}
+
+#[test]
+fn ordered_settings_reject_reserved_duplicate_and_overflow() {
+    for values in [
+        vec![(1, 0), (1, 1)],
+        vec![(2, 0)],
+        vec![(8, 2)],
+        vec![(51, 2)],
+        vec![(1, 1 << 62)],
+    ] {
+        assert!(
+            quiche::h3::Config::new()
+                .unwrap()
+                .set_settings_template(values)
+                .is_err()
+        );
+    }
 }

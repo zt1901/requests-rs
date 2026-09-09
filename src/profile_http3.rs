@@ -76,6 +76,10 @@ pub(crate) struct H3TlsCapture {
     #[serde(default)]
     pub signature_algorithms: Vec<u16>,
     #[serde(default)]
+    pub delegated_credentials: Vec<u16>,
+    #[serde(default)]
+    pub record_size_limit: Option<u16>,
+    #[serde(default)]
     pub certificate_compression_algorithms: Vec<u16>,
     #[serde(default)]
     pub alpn: Vec<String>,
@@ -339,6 +343,8 @@ fn validate_transport_parameters(tp: &H3TransportParameters, raw: &[u8]) -> Resu
             }
         } else {
             let default = match id {
+                1 | 4..=9 => Some(0),
+                3 => Some(65_527),
                 10 => Some(3),
                 11 => Some(25),
                 14 => Some(2),
@@ -370,8 +376,8 @@ fn validate_transport_parameters(tp: &H3TransportParameters, raw: &[u8]) -> Resu
         .iter()
         .find(|item| item.id == 15)
         .context("HTTP/3 template is missing initial_source_connection_id")?;
-    if source_cid.length != 0 {
-        bail!("HTTP/3 replay requires the captured zero-length source connection ID")
+    if source_cid.length > quiche::MAX_CONN_ID_LEN {
+        bail!("HTTP/3 source connection ID exceeds protocol limit")
     }
     Ok(())
 }
@@ -390,30 +396,8 @@ fn validate_settings(profile: &ProfileHttp3) -> Result<()> {
             bail!("HTTP/3 SETTINGS {id} cannot reproduce this boolean value")
         }
     }
-    let grease_ids = profile
-        .http
-        .settings
-        .iter()
-        .filter(|(id, _)| *id >= 33 && (*id - 33) % 31 == 0)
-        .map(|(id, _)| *id)
-        .collect::<Vec<_>>();
-    if grease_ids.len() != 1 {
-        bail!("HTTP/3 SETTINGS must contain exactly one GREASE placeholder")
-    }
-    let mut expected_order = [1_u64, 6, 7, 8, 51]
-        .into_iter()
-        .filter(|expected| profile.http.settings.iter().any(|(id, _)| id == expected))
-        .collect::<Vec<_>>();
-    expected_order.extend(grease_ids);
-    let actual_order = profile
-        .http
-        .settings
-        .iter()
-        .map(|(id, _)| *id)
-        .collect::<Vec<_>>();
-    if actual_order != expected_order {
-        bail!("HTTP/3 SETTINGS order or identifier cannot be reproduced exactly")
-    }
+    let mut config = quiche::h3::Config::new()?;
+    config.set_settings_template(profile.http.settings.clone())?;
     let datagram = profile.http.settings.iter().find(|(id, _)| *id == 51);
     if (profile.quic.transport_parameters.max_datagram_frame_size > 0)
         != datagram.is_some_and(|(_, value)| *value == 1)
@@ -474,6 +458,7 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
         .tls
         .signature_algorithms
         .iter()
+        .chain(&profile.tls.delegated_credentials)
         .copied()
         .filter(|id| !is_grease(*id) && signature_name(*id).is_none())
         .collect::<Vec<_>>();
@@ -497,9 +482,9 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
         .tls
         .certificate_compression_algorithms
         .iter()
-        .any(|id| *id != 2)
+        .any(|id| !matches!(*id, 1 | 2 | 3))
     {
-        bail!("HTTP/3当前只支持线级验证过的Brotli证书压缩算法")
+        bail!("HTTP/3只支持Zlib、Brotli和Zstd证书压缩算法")
     }
     let wire_ids = profile
         .tls
@@ -523,6 +508,7 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
             &format!("HTTP/3 TLS extension {}", item.id),
         )?;
     }
+    validate_tls_optional_fields(&profile.tls)?;
     let tp = &profile.quic.transport_parameters;
     let tp_wire = decode_wire(
         &tp.wire.base64,
@@ -543,10 +529,7 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
             bail!("QUIC Transport Parameters wire.parameters无效")
         }
     }
-    let required_tp = [1_u64, 3, 4, 5, 6, 7, 8, 9, 17];
-    if required_tp.iter().any(|id| !tp_ids.contains(id)) {
-        bail!("QUIC Transport Parameters缺少浏览器必需参数")
-    }
+    // Presence follows the protocol defaults checked above, not a Chrome-only list.
     let actual_order = profile
         .http
         .headers
@@ -587,9 +570,6 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
     {
         bail!("HTTP/3 SETTINGS包含重复ID")
     }
-    if !setting_ids.contains(&1) || !setting_ids.contains(&6) || !setting_ids.contains(&7) {
-        bail!("HTTP/3 SETTINGS缺少QPACK或字段上限")
-    }
     validate_settings(profile)?;
     if !profile.http.qpack.raw_capture {
         bail!("HTTP/3 QPACK必须包含原始捕获")
@@ -607,6 +587,78 @@ pub(crate) fn validate(profile: &ProfileHttp3) -> Result<()> {
     Ok(())
 }
 
+fn validate_tls_optional_fields(tls: &H3TlsCapture) -> Result<()> {
+    ech_grease_shape(tls)?;
+    let payload = |id| -> Result<Option<Vec<u8>>> {
+        tls.extension_wire
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| decode_wire(&item.payload_base64, "TLS extension", item.length))
+            .transpose()
+    };
+    for (id, expected) in [
+        (65281, &[0_u8][..]),
+        (23, &[][..]),
+        (5, &[1, 0, 0, 0, 0][..]),
+    ] {
+        if let Some(actual) = payload(id)? {
+            if actual != expected {
+                bail!("HTTP/3 TLS extension {id} payload cannot be reproduced");
+            }
+        }
+    }
+    let mut expected = Vec::new();
+    if !tls.delegated_credentials.is_empty() {
+        let size = u16::try_from(
+            tls.delegated_credentials
+                .len()
+                .checked_mul(2)
+                .context("delegated credential length overflow")?,
+        )?;
+        expected.extend_from_slice(&size.to_be_bytes());
+        for id in &tls.delegated_credentials {
+            expected.extend_from_slice(&id.to_be_bytes());
+        }
+    }
+    if payload(34)? != (!expected.is_empty()).then_some(expected) {
+        bail!("HTTP/3 delegated_credentials disagrees with extension wire");
+    }
+    if tls
+        .record_size_limit
+        .is_some_and(|limit| !(64..=16385).contains(&limit))
+    {
+        bail!("HTTP/3 record_size_limit outside TLS bounds");
+    }
+    if payload(28)?
+        != tls
+            .record_size_limit
+            .map(|limit| limit.to_be_bytes().to_vec())
+    {
+        bail!("HTTP/3 record_size_limit disagrees with extension wire");
+    }
+    let mut compression = Vec::new();
+    if !tls.certificate_compression_algorithms.is_empty() {
+        let size = u8::try_from(
+            tls.certificate_compression_algorithms
+                .len()
+                .checked_mul(2)
+                .context("certificate compression length overflow")?,
+        )?;
+        compression.push(size);
+        let mut seen = HashSet::new();
+        for id in &tls.certificate_compression_algorithms {
+            if !seen.insert(id) {
+                bail!("duplicate certificate compression algorithm");
+            }
+            compression.extend_from_slice(&id.to_be_bytes());
+        }
+    }
+    if payload(27)? != (!compression.is_empty()).then_some(compression) {
+        bail!("HTTP/3 certificate compression disagrees with extension wire");
+    }
+    Ok(())
+}
+
 fn cipher_name(id: u16) -> Option<&'static str> {
     Some(match id {
         0x1301 => "TLS_AES_128_GCM_SHA256",
@@ -620,6 +672,7 @@ fn group_name(id: u16) -> Option<&'static str> {
     Some(match id {
         23 => "P-256",
         24 => "P-384",
+        25 => "P-521",
         29 => "X25519",
         4588 => "X25519MLKEM768",
         _ => return None,
@@ -632,6 +685,8 @@ fn signature_name(id: u16) -> Option<&'static str> {
         0x0804 => "rsa_pss_rsae_sha256",
         0x0401 => "rsa_pkcs1_sha256",
         0x0503 => "ecdsa_secp384r1_sha384",
+        0x0603 => "ecdsa_secp521r1_sha512",
+        0x0203 => "ecdsa_sha1",
         0x0805 => "rsa_pss_rsae_sha384",
         0x0501 => "rsa_pkcs1_sha384",
         0x0806 => "rsa_pss_rsae_sha512",
@@ -644,6 +699,11 @@ fn signature_name(id: u16) -> Option<&'static str> {
 fn extension_type(id: u16) -> Option<ExtensionType> {
     Some(match id {
         0 => ExtensionType::SERVER_NAME,
+        5 => ExtensionType::STATUS_REQUEST,
+        23 => ExtensionType::EXTENDED_MASTER_SECRET,
+        28 => ExtensionType::RECORD_SIZE_LIMIT,
+        34 => ExtensionType::DELEGATED_CREDENTIAL,
+        65281 => ExtensionType::RENEGOTIATE,
         10 => ExtensionType::SUPPORTED_GROUPS,
         13 => ExtensionType::SIGNATURE_ALGORITHMS,
         16 => ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
@@ -674,6 +734,64 @@ impl CertificateCompressor for BrotliCert {
         let mut decoder = brotli::Decompressor::new(input, 4096);
         std::io::copy(&mut decoder, output).map(|_| ())
     }
+}
+
+#[derive(Clone)]
+struct ZlibCert;
+impl CertificateCompressor for ZlibCert {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::ZLIB;
+    const CAN_COMPRESS: bool = true;
+    const CAN_DECOMPRESS: bool = true;
+    fn compress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        let mut encoder = flate2::write::ZlibEncoder::new(output, flate2::Compression::default());
+        encoder.write_all(input)?;
+        encoder.finish().map(|_| ())
+    }
+    fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        std::io::copy(&mut ZlibDecoder::new(input), output).map(|_| ())
+    }
+}
+
+#[derive(Clone)]
+struct ZstdCert;
+impl CertificateCompressor for ZstdCert {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::ZSTD;
+    const CAN_COMPRESS: bool = true;
+    const CAN_DECOMPRESS: bool = true;
+    fn compress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        zstd::stream::copy_encode(input, output, 3)
+    }
+    fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        zstd::stream::copy_decode(input, output)
+    }
+}
+
+fn ech_grease_shape(tls: &H3TlsCapture) -> Result<Option<(u16, u16)>> {
+    let Some(extension) = tls.extension_wire.iter().find(|e| e.id == 0xfe0d) else {
+        if tls.has_ech {
+            bail!("ECH template is missing its wire payload")
+        }
+        return Ok(None);
+    };
+    let bytes = decode_wire(&extension.payload_base64, "ECH template", extension.length)?;
+    // Outer ECH: type(1), KDF(2), AEAD(2), config ID(1), enc(2+32), payload(2+n).
+    if !tls.has_ech
+        || bytes.len() < 42
+        || bytes[0] != 0
+        || bytes[1..3] != [0, 1]
+        || bytes[6..8] != [0, 32]
+    {
+        bail!("unsupported ECH GREASE template structure")
+    }
+    let aead = u16::from_be_bytes([bytes[3], bytes[4]]);
+    let length = u16::from_be_bytes([bytes[40], bytes[41]]);
+    if !matches!(aead, 1 | 2 | 3)
+        || !(16..=4096).contains(&length)
+        || bytes.len() != 42 + usize::from(length)
+    {
+        bail!("invalid ECH GREASE template lengths or AEAD")
+    }
+    Ok(Some((aead, length)))
 }
 
 fn tls_builder(tls: &H3TlsCapture, verify: bool) -> Result<SslContextBuilder> {
@@ -707,6 +825,9 @@ fn tls_builder(tls: &H3TlsCapture, verify: bool) -> Result<SslContextBuilder> {
     )?;
     builder.set_alpn_protos(b"\x02h3")?;
     builder.set_grease_enabled(tls.uses_grease);
+    if let Some((aead, length)) = ech_grease_shape(tls)? {
+        builder.set_ech_grease_template(aead, length)?;
+    }
     builder.set_aes_hw_override(true);
     builder.set_permute_extensions(false);
     let order = tls
@@ -728,8 +849,27 @@ fn tls_builder(tls: &H3TlsCapture, verify: bool) -> Result<SslContextBuilder> {
         }
         builder.set_requested_trust_anchors(&payload[2..])?;
     }
-    if tls.certificate_compression_algorithms.contains(&2) {
-        builder.add_certificate_compression_algorithm(BrotliCert)?;
+    if tls.extensions.contains(&5) {
+        builder.enable_ocsp_stapling();
+    }
+    if let Some(limit) = tls.record_size_limit {
+        builder.set_record_size_limit(limit);
+    }
+    if !tls.delegated_credentials.is_empty() {
+        let algorithms = tls
+            .delegated_credentials
+            .iter()
+            .map(|id| signature_name(*id).context("unsupported delegated credential algorithm"))
+            .collect::<Result<Vec<_>>>()?;
+        builder.set_delegated_credentials(&algorithms.join(":"))?;
+    }
+    for algorithm in &tls.certificate_compression_algorithms {
+        match algorithm {
+            1 => builder.add_certificate_compression_algorithm(ZlibCert)?,
+            2 => builder.add_certificate_compression_algorithm(BrotliCert)?,
+            3 => builder.add_certificate_compression_algorithm(ZstdCert)?,
+            _ => bail!("unsupported certificate compression algorithm"),
+        }
     }
     if verify {
         builder.set_verify(SslVerifyMode::PEER);
@@ -808,23 +948,7 @@ fn configure_quiche(profile: &ProfileHttp3, verify: bool) -> Result<quiche::Conf
 
 fn configure_h3(profile: &ProfileHttp3) -> Result<quiche::h3::Config> {
     let mut config = quiche::h3::Config::new()?;
-    let mut additional = Vec::new();
-    for &(id, value) in &profile.http.settings {
-        match id {
-            1 => config.set_qpack_max_table_capacity(value),
-            6 => config.set_max_field_section_size(value),
-            7 => config.set_qpack_blocked_streams(value),
-            8 => config.enable_extended_connect(value != 0),
-            51 => {}
-            _ if id >= 33 && (id - 33) % 31 == 0 => {
-                let mut rng = rand::rng();
-                let grease_id = 33 + 31 * u64::from((rng.next_u32() & 0x07ff_ffff) | 0x0400_0000);
-                additional.push((grease_id, u64::from(rng.next_u32() | 0x4000_0000)));
-            }
-            _ => additional.push((id, value)),
-        }
-    }
-    config.set_additional_settings(additional)?;
+    config.set_settings_template(profile.http.settings.clone())?;
     Ok(config)
 }
 
@@ -863,8 +987,12 @@ fn transport_parameter_template(tp: &H3TransportParameters) -> Result<Vec<u8>> {
         if item.id == 17 && value.len() >= 12 {
             let grease =
                 0x0a0a_0a0a_u32.wrapping_add(0x1010_1010_u32.wrapping_mul(rng.next_u32() & 0x0f));
-            let offset = value.len() - 4;
-            value[offset..].copy_from_slice(&grease.to_be_bytes());
+            for version in value[4..].chunks_exact_mut(4) {
+                let old = u32::from_be_bytes(version.try_into().unwrap());
+                if old & 0x0f0f_0f0f == 0x0a0a_0a0a {
+                    version.copy_from_slice(&grease.to_be_bytes());
+                }
+            }
         }
         encode_varint(id, &mut output)?;
         encode_varint(value.len() as u64, &mut output)?;
@@ -1203,18 +1331,27 @@ impl H3Client {
         rand::rng().fill_bytes(&mut scid_bytes);
         let mut dcid_bytes = [0_u8; 8];
         rand::rng().fill_bytes(&mut dcid_bytes);
-        let scid = if profile
+        let scid_length = profile
             .quic
             .transport_parameters
             .wire
             .parameters
             .iter()
-            .any(|item| item.id == 15 && item.length == 0)
-        {
-            quiche::ConnectionId::from_ref(&[])
-        } else {
-            quiche::ConnectionId::from_ref(&scid_bytes)
-        };
+            .find(|item| item.id == 15)
+            .context("missing source CID")?
+            .length;
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes[..scid_length]);
+        // Raw transport override must authenticate this connection's fresh CID,
+        // never the identifier from the captured browser connection.
+        let mut transport = profile.quic.transport_parameters.clone();
+        let item = transport
+            .wire
+            .parameters
+            .iter_mut()
+            .find(|item| item.id == 15)
+            .unwrap();
+        item.value_hex = scid.iter().map(|byte| format!("{byte:02x}")).collect();
+        config.set_raw_transport_parameters(transport_parameter_template(&transport)?);
         let server_name = match url.host().context("URL缺少host")? {
             Host::Domain(host) if profile.tls.extensions.contains(&0) => Some(host),
             _ => None,
@@ -1446,6 +1583,83 @@ impl H3Client {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    #[test]
+    fn firefox154_complete_template_validates() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/firefox154_schema2.json"))
+                .unwrap();
+        let profile: ProfileHttp3 =
+            serde_json::from_value(value["records"][0]["http3"].clone()).unwrap();
+        validate(&profile).unwrap();
+        configure_h3(&profile).unwrap();
+        let wire = transport_parameter_template(&profile.quic.transport_parameters).unwrap();
+        let mut offset = 0;
+        while offset < wire.len() {
+            let id = decode_varint(&wire, &mut offset, "id").unwrap();
+            let n = decode_varint(&wire, &mut offset, "len").unwrap() as usize;
+            if id == 17 {
+                assert_eq!(&wire[offset..offset + 4], &[0, 0, 0, 1]);
+                assert_eq!(&wire[offset + n - 4..offset + n], &[0, 0, 0, 1]);
+            }
+            offset += n;
+        }
+    }
+
+    #[test]
+    fn firefox154_tls_context_supports_captured_algorithms() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/firefox154_schema2.json"))
+                .unwrap();
+        let tls: H3TlsCapture =
+            serde_json::from_value(value["records"][0]["http3"]["tls"].clone()).unwrap();
+        assert_eq!(tls.certificate_compression_algorithms, [1, 3, 2]);
+        assert_eq!(tls.record_size_limit, Some(16385));
+        assert_eq!(tls.delegated_credentials, [1027, 1283, 1539, 515]);
+        assert!(
+            tls.extensions
+                .iter()
+                .all(|id| extension_type(*id).is_some())
+        );
+        validate_tls_optional_fields(&tls).unwrap();
+        let mut invalid = tls.clone();
+        invalid.record_size_limit = Some(16384);
+        assert!(validate_tls_optional_fields(&invalid).is_err());
+        invalid = tls.clone();
+        invalid.delegated_credentials.reverse();
+        assert!(validate_tls_optional_fields(&invalid).is_err());
+        tls_builder(&tls, false).unwrap();
+        tls_builder(&tls, true).unwrap();
+    }
+
+    #[test]
+    fn firefox_ech_grease_shape_preserves_aead_and_length() {
+        let envelope: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/firefox154_schema2.json")).unwrap();
+        let mut tls: H3TlsCapture = serde_json::from_value(envelope["records"][0]["http3"]["tls"].clone()).unwrap();
+        assert_eq!(ech_grease_shape(&tls).unwrap(), Some((3, 207)));
+        let extension = tls.extension_wire.iter_mut().find(|e| e.id == 0xfe0d).unwrap();
+        let mut bytes = BASE64.decode(&extension.payload_base64).unwrap();
+        bytes[41] -= 1;
+        extension.payload_base64 = BASE64.encode(bytes);
+        assert!(ech_grease_shape(&tls).is_err());
+        tls.extension_wire.retain(|e| e.id != 0xfe0d);
+        assert!(ech_grease_shape(&tls).is_err());
+    }
+
+    #[test]
+    fn firefox_certificate_codecs_roundtrip() {
+        let input = b"certificate compression test data".repeat(100);
+        let mut encoded = Vec::new();
+        ZlibCert.compress(&input, &mut encoded).unwrap();
+        let mut decoded = Vec::new();
+        ZlibCert.decompress(&encoded, &mut decoded).unwrap();
+        assert_eq!(input, decoded);
+        encoded.clear();
+        decoded.clear();
+        ZstdCert.compress(&input, &mut encoded).unwrap();
+        ZstdCert.decompress(&encoded, &mut decoded).unwrap();
+        assert_eq!(input, decoded);
+    }
 
     fn profile() -> ProfileHttp3 {
         let records: serde_json::Value =

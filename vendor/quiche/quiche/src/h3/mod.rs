@@ -282,15 +282,21 @@
 //! [`send_response()`]: struct.Connection.html#method.send_response
 //! [`send_body()`]: struct.Connection.html#method.send_body
 
-use std::collections::hash_map;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map;
 
 #[cfg(feature = "sfv")]
 use std::convert::TryFrom;
 use std::fmt;
 use std::fmt::Write;
 
+#[cfg(feature = "qlog")]
+use qlog::events::EventData;
+#[cfg(feature = "qlog")]
+use qlog::events::EventImportance;
+#[cfg(feature = "qlog")]
+use qlog::events::EventType;
 #[cfg(feature = "qlog")]
 use qlog::events::http3::FrameCreated;
 #[cfg(feature = "qlog")]
@@ -305,15 +311,9 @@ use qlog::events::http3::Initiator;
 use qlog::events::http3::StreamType;
 #[cfg(feature = "qlog")]
 use qlog::events::http3::StreamTypeSet;
-#[cfg(feature = "qlog")]
-use qlog::events::EventData;
-#[cfg(feature = "qlog")]
-use qlog::events::EventImportance;
-#[cfg(feature = "qlog")]
-use qlog::events::EventType;
 
-use crate::buffers::BufFactory;
 use crate::BufSplit;
+use crate::buffers::BufFactory;
 
 /// List of ALPN tokens of supported HTTP/3 versions.
 ///
@@ -589,6 +589,7 @@ pub struct Config {
     additional_settings: Option<Vec<(u64, u64)>>,
 
     max_priority_update_size: u64,
+    settings_template: Option<Vec<(u64, u64)>>,
 }
 
 impl Config {
@@ -600,6 +601,7 @@ impl Config {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             additional_settings: None,
+            settings_template: None,
             max_priority_update_size: PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         })
     }
@@ -687,6 +689,36 @@ impl Config {
             return Err(Error::SettingsError);
         }
         self.additional_settings = Some(additional_settings);
+        Ok(())
+    }
+
+    /// Applies a complete ordered wire template and its local protocol state.
+    /// Omitting setting 6 retains the local defensive header budget without
+    /// advertising a field-section limit that the template did not contain.
+    pub fn set_settings_template(&mut self, settings: Vec<(u64, u64)>) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut size = 0;
+        for &(id, value) in &settings {
+            if id >= (1 << 62)
+                || value >= (1 << 62)
+                || !seen.insert(id)
+                || matches!(id, 2..=5)
+                || (matches!(id, 8 | 51) && value > 1)
+            {
+                return Err(Error::SettingsError);
+            }
+            size += octets::varint_len(id) + octets::varint_len(value);
+        }
+        if size > frame::MAX_SETTINGS_PAYLOAD_SIZE {
+            return Err(Error::ExcessiveLoad);
+        }
+        let value = |key| settings.iter().find(|(id, _)| *id == key).map(|(_, v)| *v);
+        self.qpack_max_table_capacity = value(1);
+        self.max_field_section_size = value(6);
+        self.qpack_blocked_streams = value(7);
+        self.connect_protocol_enabled = value(8);
+        self.additional_settings = None;
+        self.settings_template = Some(settings);
         Ok(())
     }
 
@@ -1051,6 +1083,17 @@ impl Connection {
     fn new(config: &Config, is_server: bool, enable_dgram: bool) -> Result<Connection> {
         let initial_uni_stream_id = if is_server { 0x3 } else { 0x2 };
         let h3_datagram = if enable_dgram { Some(1) } else { None };
+        if let Some(settings) = &config.settings_template {
+            let value = |key| settings.iter().find(|(id, _)| *id == key).map(|(_, v)| *v);
+            if (value(51).unwrap_or(0) == 1) != enable_dgram
+                || value(1) != config.qpack_max_table_capacity
+                || value(6) != config.max_field_section_size
+                || value(7) != config.qpack_blocked_streams
+                || value(8) != config.connect_protocol_enabled
+            {
+                return Err(Error::SettingsError);
+            }
+        }
 
         Ok(Connection {
             is_server,
@@ -1068,7 +1111,7 @@ impl Connection {
                 connect_protocol_enabled: config.connect_protocol_enabled,
                 h3_datagram,
                 additional_settings: config.additional_settings.clone(),
-                raw: Default::default(),
+                raw: config.settings_template.clone(),
             },
 
             peer_settings: ConnectionSettings {
@@ -1134,7 +1177,10 @@ impl Connection {
     ) -> Result<Connection> {
         let is_client = !conn.is_server;
         if is_client && !(conn.is_established() || conn.is_in_early_data()) {
-            trace!("{} QUIC connection must be established or in early data before creating an HTTP/3 connection", conn.trace_id());
+            trace!(
+                "{} QUIC connection must be established or in early data before creating an HTTP/3 connection",
+                conn.trace_id()
+            );
             return Err(Error::InternalError);
         }
 
@@ -2592,13 +2638,26 @@ impl Connection {
             h3_datagram: self.local_settings.h3_datagram,
             grease,
             additional_settings: self.local_settings.additional_settings.clone(),
-            raw: Default::default(),
+            raw: self.local_settings.raw.clone(),
         };
 
-        let mut d = [42; 128];
+        let mut d = [0; frame::MAX_SETTINGS_PAYLOAD_SIZE + 16];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        frame.to_bytes(&mut b)?;
+        if let Some(settings) = &self.local_settings.raw {
+            let size: usize = settings
+                .iter()
+                .map(|(id, value)| octets::varint_len(*id) + octets::varint_len(*value))
+                .sum();
+            b.put_varint(frame::SETTINGS_FRAME_TYPE_ID)?;
+            b.put_varint(size as u64)?;
+            for &(id, value) in settings {
+                b.put_varint(id)?;
+                b.put_varint(value)?;
+            }
+        } else {
+            frame.to_bytes(&mut b)?;
+        }
 
         let off = b.off();
 
@@ -3661,8 +3720,8 @@ pub fn grease_value() -> u64 {
 pub mod testing {
     use super::*;
 
-    use crate::test_utils;
     use crate::DefaultBufFactory;
+    use crate::test_utils;
 
     /// Session is an HTTP/3 test helper structure. It holds a client, server
     /// and pipe that allows them to communicate.
@@ -4115,7 +4174,7 @@ mod tests {
             match pipe.client.send(&mut buf) {
                 Ok((len, _)) => {
                     assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
-                },
+                }
                 Err(crate::Error::Done) => break,
                 Err(e) => panic!("initial flight failed: {e:?}"),
             }
@@ -8240,7 +8299,12 @@ mod tests {
         let pkt_type = crate::packet::Type::Short;
         // ACK length depends on connection IDs and packet-number encoding.
         // Reset delivery and duplicate suppression are checked below.
-        assert!(s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).unwrap() > 0);
+        assert!(
+            s.pipe
+                .send_pkt_to_server(pkt_type, &frames, &mut buf)
+                .unwrap()
+                > 0
+        );
 
         // Server issues Reset event for the stream.
         assert_eq!(s.poll_server(), Ok((stream, Event::Reset(42))));
@@ -8249,7 +8313,12 @@ mod tests {
         // Sending RESET_STREAM again shouldn't trigger another Reset event.
         // ACK length depends on connection IDs and packet-number encoding.
         // Reset delivery and duplicate suppression are checked below.
-        assert!(s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).unwrap() > 0);
+        assert!(
+            s.pipe
+                .send_pkt_to_server(pkt_type, &frames, &mut buf)
+                .unwrap()
+                > 0
+        );
 
         assert_eq!(s.poll_server(), Err(Error::Done));
     }

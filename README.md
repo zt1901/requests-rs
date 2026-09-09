@@ -83,7 +83,7 @@ asyncio.run(异步主程序())
 
 ## 加载捕获器指纹
 
-捕获器输出是一个 JSON 记录列表；MCP `read_fingerprint_result`返回包含`records`的Python字典。单一`profile`的文件路径、记录列表或MCP结果对象都可以直接作为`impersonate`传入，不需要手动落盘或重写JSON：
+新版捕获器只输出一种完整 JSON：`{"schema_version": 2, "records": [...]}`；MCP `read_fingerprint_result` 返回同样包含 `schema_version` 和 `records` 的分页结果。无需分别准备 H2/H3 文件。旧裸记录数组仅为本库历史加载兼容，不是新版捕获器的输出选项。单一`profile`的文件路径、记录列表或MCP结果对象都可以直接作为`impersonate`传入，不需要手动落盘或重写JSON：
 
 ```python
 from pathlib import Path
@@ -229,3 +229,13 @@ Windows 开发环境也可右键运行 `build_and_install.py`。该脚本默认�
 请求失败会保留底层原因，不只返回 `Connect` / `ProxyConnect` 分类。
 HTTP CONNECT 被代理拒绝时，异常文本包含代理实际返回的状态码（包括 407、429、502、504、631 等非标准码）；631 不是目标网站响应状态，也不是 libcurl 错误号。
 代理认证失败、提前断开、格式错误和超时有对应诊断。现有 `RuntimeError` 捕获方式不变，不伪造 libcurl 专属错误编号。
+
+## 0.4.2
+
+新版捕获器统一输出 `{schema_version: 2, records: [...]}`，单文件包含 H1/H2 与 QUIC/H3 模板。
+0.4.2 补齐 Firefox154 H3 TLS 扩展、证书压缩、ECH GREASE 形状及原序 SETTINGS；
+已完成本机 Firefox154 / Chrome148 的真实 HTTP/3 200 回放与线级稳定字段对照。
+随机 key share、ECH 密文、连接 ID 和 GREASE 随机值按协议重新生成，不复用捕获密钥。
+这不代表任意历史浏览器都能等价回放；不支持的模板仍会明确拒绝。
+
+Linux x86_64 已提供 glibc >= 2.17 的 manylinux2014 wheel。后续统一使用 [固定 Docker 构建环境](scripts/manylinux2014/README.md)，不以宿主机 glibc 决定最低兼容版本。

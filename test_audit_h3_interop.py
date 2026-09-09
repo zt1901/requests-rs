@@ -33,7 +33,7 @@ def certificate(directory):
     return c, k
 
 
-async def scenario():
+async def scenario(profile="chrome152"):
     from aioquic.asyncio import serve, QuicConnectionProtocol
     from aioquic.h3.connection import H3Connection, H3_ALPN
     from aioquic.h3.events import HeadersReceived
@@ -90,7 +90,7 @@ async def scenario():
         port = server._transport.get_extra_info("sockname")[1]
         def client():
             # The certificate is ephemeral and this test binds loopback only.
-            with requests.Session(impersonate="chrome152", verify=False,
+            with requests.Session(impersonate=profile, verify=False,
                                   http_version="http3", timeout=5) as session:
                 for _ in range(8):
                     response = session.get(f"https://127.0.0.1:{port}/dynamic")
@@ -117,7 +117,11 @@ async def scenario():
 
 
 def test_independent_dynamic_qpack():
-    print(json.dumps(asyncio.run(scenario()), sort_keys=True))
+    for name, profile in (
+        ("chrome152", "chrome152"),
+        ("firefox154", json.loads((Path(__file__).parent / "tests/fixtures/firefox154_schema2.json").read_text(encoding="utf-8"))),
+    ):
+        print(name, json.dumps(asyncio.run(scenario(profile)), sort_keys=True))
 
 
 if __name__ == "__main__":

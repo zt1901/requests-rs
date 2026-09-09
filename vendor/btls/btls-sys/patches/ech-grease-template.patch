@@ -1,0 +1,72 @@
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -4047,6 +4047,10 @@
+   // grease_enabled is whether GREASE (RFC 8701) is enabled.
+   bool grease_enabled : 1;
+ 
++  // Optional ECH GREASE shape; zero keeps the default randomized policy.
++  uint16_t ech_grease_template_aead = 0;
++  uint16_t ech_grease_template_payload_len = 0;
++
+   // permute_extensions is whether to permute extensions when sending messages.
+   bool permute_extensions : 1;
+ 
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -4318,6 +4318,10 @@
+ // SSL_set_enable_ech_grease configures whether the client will send a GREASE
+ // ECH extension when no supported ECHConfig is available.
+ OPENSSL_EXPORT void SSL_set_enable_ech_grease(SSL *ssl, int enable);
++
++// Sets ECH GREASE shape only, not a real ECH encryption configuration.
++OPENSSL_EXPORT int SSL_CTX_set_ech_grease_template(SSL_CTX *ctx, uint16_t aead,
++                                                uint16_t payload_len);
+ 
+ // SSL_set1_ech_config_list configures |ssl| to, as a client, offer ECH with the
+ // specified configuration. |ech_config_list| should contain a serialized
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -741,6 +741,10 @@
+                               : EVP_has_aes_hardware();
+   const EVP_HPKE_AEAD *aead =
+       has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
++  if (hs->ssl->ctx->ech_grease_template_aead != 0) {
++    aead = get_ech_aead(hs->ssl->ctx->ech_grease_template_aead);
++    if (aead == nullptr) { return false; }
++  }
+   static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+                 "hs->grease_seed is too small");
+   uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
+@@ -768,9 +772,12 @@
+   const size_t payload_bucket =
+       hs->ssl->ctx->grease_enabled ? random_size(128 / 32, 224 / 32)
+                                    : 224 / 32;
+-  const size_t payload_len =
++  size_t payload_len =
+       32 * payload_bucket + aead_overhead(aead) -
+       (hs->ssl->ctx->grease_enabled ? 0 : 1);
++  if (hs->ssl->ctx->ech_grease_template_payload_len != 0) {
++    payload_len = hs->ssl->ctx->ech_grease_template_payload_len;
++  }
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
+@@ -920,6 +927,18 @@
+ BSSL_NAMESPACE_END
+ 
+ using namespace bssl;
++
++int SSL_CTX_set_ech_grease_template(SSL_CTX *ctx, uint16_t aead,
++                                   uint16_t payload_len) {
++  if (ctx == nullptr || get_ech_aead(aead) == nullptr ||
++      payload_len < 16 || payload_len > 4096) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return 0;
++  }
++  ctx->ech_grease_template_aead = aead;
++  ctx->ech_grease_template_payload_len = payload_len;
++  return 1;
++}
+ 
+ void SSL_set_enable_ech_grease(SSL *ssl, int enable) {
+   if (!ssl->config) {

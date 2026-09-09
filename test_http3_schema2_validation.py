@@ -53,7 +53,13 @@ def main() -> None:
     settings = copy.deepcopy(record)
     values = settings["http3"]["http"]["settings"]
     values[0], values[1] = values[1], values[0]
-    rejected(settings, "settings order")
+    # Ordered templates now reproduce either order instead of canonicalizing.
+    with Session(impersonate=[settings], http_version="http3"):
+        pass
+
+    duplicate = copy.deepcopy(record)
+    duplicate["http3"]["http"]["settings"].append(duplicate["http3"]["http"]["settings"][0])
+    rejected(duplicate, "重复ID")
 
     datagram = copy.deepcopy(record)
     for setting in datagram["http3"]["http"]["settings"]:
@@ -61,7 +67,17 @@ def main() -> None:
             setting[1] = 0
     rejected(datagram, "datagram")
 
-    print("schema 2 HTTP/3 strict validation: passed")
+    firefox = json.loads((FIXTURE.parent / "firefox154_schema2.json").read_text(encoding="utf-8"))["records"][0]
+    for protocol in ("http2", "http3"):
+        with Session(impersonate={"schema_version": 2, "records": [firefox]}, http_version=protocol):
+            pass
+    invalid = copy.deepcopy(firefox)
+    invalid["http3"]["tls"]["record_size_limit"] = 16384
+    rejected(invalid, "record_size_limit")
+    invalid = copy.deepcopy(firefox)
+    invalid["http3"]["tls"]["delegated_credentials"].reverse()
+    rejected(invalid, "delegated_credentials")
+    print("Chrome/Firefox schema 2 HTTP/3 strict validation: passed")
 
 
 if __name__ == "__main__":

@@ -485,6 +485,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
 
     println!("cargo:warning=applying windows cross compile patch to boringssl");
     apply_patch(config, "boringssl-windows.patch")?;
+    apply_patch(config, "quic-template-legacy-extensions.patch")?;
+    apply_patch(config, "ech-grease-template.patch")?;
 
     if config.features.underscore_wildcards {
         println!("cargo:warning=applying underscore wildcards patch to boringssl");
