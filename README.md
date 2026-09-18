@@ -361,7 +361,7 @@ HTTP/3 仍在持续进行独立互操作验证，不应把“请求成功”误�
 | Windows x64 | `x86_64-pc-windows-msvc` | `win_amd64` | PyPI wheel |
 | Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux2014_x86_64` | PyPI wheel，glibc >= 2.17 |
 | Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | CI 构建与安装验证，暂未发布 PyPI |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | CI 构建与安装验证，暂未发布 PyPI |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | PyPI wheel，glibc >= 2.34，原生 ARM64 完整回归通过 |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | CI 构建与安装验证，暂未发布 PyPI |
 
 Alpine musl 与 macOS Intel 当前不在公开发布矩阵中。安装时必须选择与操作系统和 CPU 匹配的 wheel。
