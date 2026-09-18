@@ -16,7 +16,7 @@
 - `requests_rs-0.4.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`
 - `requests_rs-0.4.3-cp310-abi3-manylinux_2_34_aarch64.whl`
 
-两个 wheel 均使用 CPython Stable ABI，支持 CPython 3.10 及以上版本。
+三个 wheel 均使用 CPython Stable ABI，支持 CPython 3.10 及以上版本。
 
 ## 安装
 

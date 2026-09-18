@@ -1262,6 +1262,22 @@ struct SessionState {
     max_websocket_message_bytes: usize,
 }
 
+#[derive(Clone)]
+struct ReadOnlyCookieStore(Arc<Jar>);
+
+impl CookieStore for ReadOnlyCookieStore {
+    fn set_cookies(
+        &self,
+        _cookie_headers: &mut dyn Iterator<Item = &HeaderValue>,
+        _uri: &Uri,
+    ) {
+    }
+
+    fn cookies(&self, uri: &Uri, version: Version) -> RequestCookies {
+        self.0.cookies(uri, version)
+    }
+}
+
 async fn acquire_connection_slot(
     state: &Arc<SessionState>,
     timeout: Duration,
@@ -2475,6 +2491,7 @@ async fn execute_profile_http3_request(
     fingerprint_id: String,
     profile: String,
     max_response_bytes: usize,
+    discard_cookies: bool,
 ) -> std::result::Result<RawNativeResponse, Http3AttemptError> {
     let started = Instant::now();
     let mut method = method;
@@ -2505,7 +2522,7 @@ async fn execute_profile_http3_request(
             peer: profile_http3_peer(&state, &url),
         };
         let response = profile_http3_roundtrip(state.clone(), index, request).await?;
-        if state.cookie_store {
+        if state.cookie_store && !discard_cookies {
             for (name, value) in &response.headers {
                 if name.eq_ignore_ascii_case("set-cookie") {
                     state.cookie_jar.add(value.as_str(), &url);
@@ -2594,6 +2611,7 @@ async fn execute_profile_http3_stream_request(
     max_redirects: usize,
     fingerprint_id: String,
     profile: String,
+    discard_cookies: bool,
 ) -> std::result::Result<NativeStreamResponse, Http3AttemptError> {
     let max_response_bytes = state.max_response_bytes;
     let response = execute_profile_http3_request(
@@ -2610,6 +2628,7 @@ async fn execute_profile_http3_stream_request(
         fingerprint_id,
         profile,
         max_response_bytes,
+        discard_cookies,
     )
     .await?;
     let (status_code, headers, body, fingerprint_id, impersonate, url, http_version, history, _) =
@@ -2657,6 +2676,8 @@ async fn execute_request(
     transfer_stats: bool,
     upstream_proxy: Option<String>,
     max_response_bytes: usize,
+    discard_cookies: bool,
+    cookie_jar: Arc<Jar>,
 ) -> PyResult<RawNativeResponse> {
     if transfer_stats && !url.starts_with("https://") {
         return Err(PyRuntimeError::new_err(
@@ -2676,6 +2697,9 @@ async fn execute_request(
             redirect::Policy::none()
         })
         .headers(headers);
+    if discard_cookies {
+        request = request.cookie_provider(ReadOnlyCookieStore(cookie_jar));
+    }
     if let Some(timeout) = read_timeout {
         request = request.read_timeout(timeout);
     }
@@ -2750,6 +2774,8 @@ async fn execute_stream_request(
     fingerprint_id: String,
     profile: String,
     max_response_bytes: usize,
+    discard_cookies: bool,
+    cookie_jar: Arc<Jar>,
 ) -> PyResult<NativeStreamResponse> {
     let mut request = apply_wreq_request_version(client.request(method, &url), request_version)
         .timeout(timeout)
@@ -2759,6 +2785,9 @@ async fn execute_stream_request(
             redirect::Policy::none()
         })
         .headers(headers);
+    if discard_cookies {
+        request = request.cookie_provider(ReadOnlyCookieStore(cookie_jar));
+    }
     if let Some(timeout) = read_timeout {
         request = request.read_timeout(timeout);
     }
@@ -2939,6 +2968,7 @@ async fn execute_preferred_request(
     dns_timeout: Option<f64>,
     cache_route: bool,
     proxy_generation: u64,
+    discard_cookies: bool,
 ) -> PyResult<RawNativeResponse> {
     let protocol_started = Instant::now();
     let mut permit = Some(permit);
@@ -2988,6 +3018,7 @@ async fn execute_preferred_request(
                     fingerprint_id.clone(),
                     profile.clone(),
                     state.max_response_bytes,
+                    discard_cookies,
                 )
                 .await;
                 match result {
@@ -3045,6 +3076,8 @@ async fn execute_preferred_request(
         transfer_stats,
         proxy_url,
         state.max_response_bytes,
+        discard_cookies,
+        state.cookie_jar.clone(),
     )
     .await
 }
@@ -3072,6 +3105,7 @@ async fn execute_preferred_stream_request(
     dns_timeout: Option<f64>,
     cache_route: bool,
     proxy_generation: u64,
+    discard_cookies: bool,
 ) -> PyResult<NativeStreamResponse> {
     let protocol_started = Instant::now();
     let mut permit = Some(permit);
@@ -3119,6 +3153,7 @@ async fn execute_preferred_stream_request(
                     max_redirects,
                     fingerprint_id.clone(),
                     profile.clone(),
+                    discard_cookies,
                 )
                 .await;
                 match result {
@@ -3174,6 +3209,8 @@ async fn execute_preferred_stream_request(
         fingerprint_id,
         profile,
         state.max_response_bytes,
+        discard_cookies,
+        state.cookie_jar.clone(),
     )
     .await
 }
@@ -3196,6 +3233,8 @@ async fn execute_multipart_request(
     fingerprint_id: String,
     profile: String,
     max_response_bytes: usize,
+    discard_cookies: bool,
+    cookie_jar: Arc<Jar>,
 ) -> PyResult<RawNativeResponse> {
     let mut form = multipart::Form::new();
     for (name, value) in fields {
@@ -3220,6 +3259,9 @@ async fn execute_multipart_request(
         })
         .headers(headers)
         .multipart(form);
+    if discard_cookies {
+        request = request.cookie_provider(ReadOnlyCookieStore(cookie_jar));
+    }
     if let Some(timeout) = read_timeout {
         request = request.read_timeout(timeout);
     }
@@ -4205,7 +4247,7 @@ impl NativeSession {
 
     // PyO3边界保留显式请求选项，避免把参数塞进不透明字典。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request(
         &self,
         py: Python<'_>,
@@ -4225,6 +4267,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4268,6 +4311,7 @@ impl NativeSession {
                 dns_timeout,
                 cache_route,
                 proxy_generation,
+                discard_cookies,
             ));
             if result.is_ok() {
                 reservation.commit();
@@ -4278,7 +4322,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, transfer_stats=false, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request_async<'py>(
         &self,
         py: Python<'py>,
@@ -4298,6 +4342,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4342,6 +4387,7 @@ impl NativeSession {
                 dns_timeout,
                 cache_route,
                 proxy_generation,
+                discard_cookies,
             )
             .await?;
             reservation.commit();
@@ -4475,7 +4521,7 @@ impl NativeSession {
 
     // 流式入口与普通入口使用相同选项，确保两种响应模式语义一致。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request_stream(
         &self,
         py: Python<'_>,
@@ -4494,6 +4540,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<NativeStreamResponse> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4536,6 +4583,7 @@ impl NativeSession {
                 dns_timeout,
                 cache_route,
                 proxy_generation,
+                discard_cookies,
             ));
             if result.is_ok() {
                 reservation.commit();
@@ -4545,7 +4593,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, body=None, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request_stream_async<'py>(
         &self,
         py: Python<'py>,
@@ -4564,6 +4612,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4607,6 +4656,7 @@ impl NativeSession {
                 dns_timeout,
                 cache_route,
                 proxy_generation,
+                discard_cookies,
             )
             .await;
             if result.is_ok() {
@@ -4618,7 +4668,7 @@ impl NativeSession {
 
     // multipart文件由Tokio直接流式读取，Python只传路径和元数据。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request_multipart(
         &self,
         py: Python<'_>,
@@ -4638,6 +4688,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<Py<NativeResponse>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4685,6 +4736,8 @@ impl NativeSession {
                 fingerprint_id,
                 profile,
                 state.max_response_bytes,
+                discard_cookies,
+                state.cookie_jar.clone(),
             ));
             if result.is_ok() {
                 reservation.commit();
@@ -4695,7 +4748,7 @@ impl NativeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0)))]
+    #[pyo3(signature = (method, url, headers, fields, files, timeout=30.0, read_timeout=None, proxy_override=false, proxy=None, cookies=None, http_version=String::from("http2"), allow_redirects=true, max_redirects=10, dns_override=false, dns_servers=Vec::new(), dns_timeout=Some(5.0), discard_cookies=false))]
     fn request_multipart_async<'py>(
         &self,
         py: Python<'py>,
@@ -4715,6 +4768,7 @@ impl NativeSession {
         dns_override: bool,
         dns_servers: Vec<String>,
         dns_timeout: Option<f64>,
+        discard_cookies: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_open(&self.state)?;
         let timeout = parse_timeout("timeout", timeout)?;
@@ -4763,6 +4817,8 @@ impl NativeSession {
                 fingerprint_id,
                 profile,
                 state.max_response_bytes,
+                discard_cookies,
+                state.cookie_jar.clone(),
             )
             .await?;
             reservation.commit();

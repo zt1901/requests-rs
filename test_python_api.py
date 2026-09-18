@@ -1,7 +1,6 @@
 import asyncio
 import contextvars
 import json
-import socket
 import tempfile
 import threading
 import time
@@ -37,6 +36,16 @@ class 目标处理器(静默处理器):
             self.send_header("Content-Length", "0")
             self.send_header("Set-Cookie", "nested=only; Path=/nested")
             self.end_headers()
+            return
+
+        if self.path in {"/discard-cookie", "/stored-cookie"}:
+            cookie_name = "discarded" if self.path == "/discard-cookie" else "stored"
+            body = cookie_name.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", f"{cookie_name}=1; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if self.path == "/slow":
@@ -101,7 +110,6 @@ class 目标处理器(静默处理器):
                 "upgrade_insecure_requests": self.headers.get("Upgrade-Insecure-Requests", ""),
                 "priority": self.headers.get("Priority", ""),
                 "runtime_default": self.headers.get("X-Runtime-Default", ""),
-                "cookie": self.headers.get("Cookie", ""),
             }
         ).encode()
         self.send_response(200)
@@ -294,6 +302,21 @@ def main():
                 proxy=None,
             ).json()["path"]
             assert tuple_query == "/query?bool=True&number=7&tuple=x%2Fy&tuple=raw+bytes", tuple_query
+
+            tuple_form = session.post(
+                target_url + "/echo-form",
+                data=[
+                    ("asin", "B08H5HMPDG"),
+                    ("lazyWidget", "one"),
+                    ("lazyWidget", "two"),
+                    ("scope", "reviewsAjax0"),
+                ],
+                proxy=None,
+            ).json()
+            assert tuple_form["content_type"] == "application/x-www-form-urlencoded"
+            assert tuple_form["body"] == (
+                "asin=B08H5HMPDG&lazyWidget=one&lazyWidget=two&scope=reviewsAjax0"
+            )
             binary_query = session.get(
                 target_url + "/query",
                 params={"raw": b"\xff"},
@@ -385,6 +408,12 @@ def main():
             assert direct.transfer_stats is None
 
             session.cookies.set("manual", "value", url=target_url)
+            session.cookies.set(
+                "domain-only",
+                "value",
+                domain="127.0.0.1",
+                path="/",
+            )
             assert session.cookies["manual"] == "value"
             assert any(cookie.name == "manual" for cookie in session.cookies.get_all())
             assert "manual=value" in session.get(target_url + "/headers").json()["cookie"]
@@ -478,8 +507,50 @@ def main():
                 Path(upload_path).unlink(missing_ok=True)
 
         with Session(impersonate=测试版本, cookie_store=False) as no_cookie_store:
-            no_cookie_store.get(target_url + "/headers")
+            response = no_cookie_store.get(target_url + "/headers")
             assert no_cookie_store.cookies.get_all() == []
+            assert response.cookies.get_dict() == {"first": "1", "second": "2"}
+            assert response.reason == "OK"
+
+        # curl_cffi兼容：只丢弃本次响应Cookie，仍发送Session已有Cookie，并允许调用方手动提交。
+        with Session() as compatibility_session:
+            compatibility_session.headers.update({"X-Runtime-Default": "amazon"})
+            compatibility_session.cookies.set("existing", "kept", url=target_url)
+            discarded = compatibility_session.get(
+                target_url + "/headers",
+                discard_cookies=True,
+                impersonate="chrome152",
+                verify=True,
+            )
+            assert discarded.json()["cookie"] == "existing=kept"
+            assert discarded.cookies.get_dict() == {"first": "1", "second": "2"}
+            assert compatibility_session.cookies.get_dict() == {"existing": "kept"}
+            compatibility_session.cookies.update(discarded.cookies)
+            assert compatibility_session.cookies.get_dict() == {
+                "existing": "kept",
+                "first": "1",
+                "second": "2",
+            }
+
+        async def 验证curl_cffi兼容异步接口() -> None:
+            async with AsyncSession(max_clients=2, verify=False) as compatibility_session:
+                compatibility_session.headers.update({"X-Runtime-Default": "async-amazon"})
+                discarded, stored = await asyncio.gather(
+                    compatibility_session.get(
+                        target_url + "/discard-cookie",
+                        discard_cookies=True,
+                        impersonate="chrome152",
+                        verify=False,
+                    ),
+                    compatibility_session.get(target_url + "/stored-cookie"),
+                )
+                assert compatibility_session.max_clients == 2
+                assert discarded.cookies.get_dict() == {"discarded": "1"}
+                assert stored.cookies.get_dict() == {"stored": "1"}
+                assert compatibility_session.cookies.get_dict() == {"stored": "1"}
+                assert discarded.reason == "OK"
+
+        asyncio.run(验证curl_cffi兼容异步接口())
 
         with tempfile.TemporaryDirectory() as temp_dir:
             # 从内置指纹中按版本拆成两个互不相同的实例文件，验证按实例独立加载

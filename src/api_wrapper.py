@@ -2,14 +2,16 @@ import asyncio
 import json as json_module
 import math
 import os
+from http import HTTPStatus
 from http.cookiejar import CookieJar
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, MutableSequence, Sequence
+from http.cookies import SimpleCookie
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request
 
-from ._native import NativeSession, available_profiles, build_response_headers
+from ._native import NativeSession, build_response_headers
 
 
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
@@ -59,6 +61,40 @@ class Headers(Mapping[str, str]):
         return super().items()
 
 
+class MutableHeaders(MutableSequence[tuple[str, str]]):
+    """保留重复项和顺序，同时兼容 curl_cffi 的 headers.update 用法。"""
+
+    def __init__(self, values: HeaderInput | None = None) -> None:
+        self._values = _header_items(values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, slice):
+            self._values[index] = _header_items(value)
+        else:
+            self._values[index] = (str(value[0]), str(value[1]))
+
+    def __delitem__(self, index) -> None:
+        del self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def insert(self, index: int, value: tuple[str, str]) -> None:
+        self._values.insert(index, (str(value[0]), str(value[1])))
+
+    def update(self, values: HeaderInput | None = None, **kwargs: str) -> None:
+        incoming = _header_items(values)
+        incoming.extend((str(name), str(value)) for name, value in kwargs.items())
+        replaced = {name.casefold() for name, _ in incoming}
+        self._values[:] = [
+            (name, value) for name, value in self._values if name.casefold() not in replaced
+        ]
+        self._values.extend(incoming)
+
+
 @dataclass(frozen=True, slots=True)
 class Cookie:
     name: str
@@ -95,7 +131,7 @@ class Cookies(Mapping[str, str]):
         name: str,
         value: str,
         *,
-        url: str,
+        url: str | None = None,
         domain: str | None = None,
         path: str = "/",
         secure: bool = False,
@@ -105,6 +141,11 @@ class Cookies(Mapping[str, str]):
         path = _validated_cookie_attribute("path", str(path))
         if domain:
             domain = _validated_cookie_attribute("domain", str(domain))
+        if url is None:
+            if not domain:
+                raise TypeError("Cookies.set必须提供url或domain")
+            host = domain.lstrip(".")
+            url = f"{'https' if secure else 'http'}://{host}{path}"
         attributes = [f"{name}={value}", f"Path={path}"]
         if domain:
             attributes.append(f"Domain={domain}")
@@ -126,6 +167,42 @@ class Cookies(Mapping[str, str]):
     def delete(self, name: str, *, url: str) -> None:
         self._native.remove_cookie(name, url)
 
+    def update(self, cookies: Any) -> None:
+        if isinstance(cookies, ResponseCookies):
+            for value in cookies.raw:
+                self._native.set_cookie(value, cookies.url)
+            return
+        raise TypeError("Cookies.update仅支持Response.cookies；普通Cookie请使用set并明确url")
+
+
+class ResponseCookies(Mapping[str, str]):
+    """当前响应 Set-Cookie 的独立快照，不依赖 Session Cookie Jar。"""
+
+    def __init__(self, values: Sequence[str], url: str) -> None:
+        self.raw = list(values)
+        self.url = url
+        parsed: dict[str, str] = {}
+        for value in self.raw:
+            cookie = SimpleCookie()
+            try:
+                cookie.load(value)
+            except Exception:
+                continue
+            parsed.update((name, morsel.value) for name, morsel in cookie.items())
+        self._values = parsed
+
+    def __getitem__(self, name: str) -> str:
+        return self._values[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def get_dict(self) -> dict[str, str]:
+        return dict(self._values)
+
 
 CookieTypes = Cookies | CookieJar | dict[str, str] | list[tuple[str, str]]
 
@@ -139,6 +216,13 @@ def _header_items(headers: HeaderInput | None) -> list[tuple[str, str]]:
         return [(str(name), str(value)) for name, value in headers]
     except (TypeError, ValueError) as error:
         raise TypeError("headers必须是Mapping或(name, value)序列") from error
+
+
+def _is_form_sequence(value: Any) -> bool:
+    """识别curl_cffi接受的有序二元组表单，保留重复键与输入顺序。"""
+    if not isinstance(value, (list, tuple)):
+        return False
+    return all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value)
 
 
 def _append_query(url: str, values: Mapping[str, Any]) -> str:
@@ -186,6 +270,13 @@ def _validate_timeout(name: str, value: float | None, *, optional: bool = False)
         raise ValueError(f"{name}必须是有限正数")
 
 
+def _status_reason(status_code: int) -> str:
+    try:
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        return ""
+
+
 def _normalize_http_version(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("http_version必须是字符串")
@@ -230,6 +321,8 @@ class Response:
         impersonate = os.fspath(impersonate)
         self.impersonate = impersonate
         self.http_version = http_version
+        self.reason = _status_reason(status_code)
+        self.cookies = ResponseCookies(self.headers.get_list("set-cookie"), url)
         self._content = content
         self._stream = stream
         self.transfer_stats = None
@@ -248,6 +341,7 @@ class Response:
         response.fingerprint_id = native.fingerprint_id
         response.impersonate = native.impersonate
         response.http_version = native.http_version
+        response.reason = _status_reason(response.status_code)
         response.transfer_stats = native.transfer_stats
         response._content = native.content
         response._stream = None
@@ -255,6 +349,7 @@ class Response:
         response._async_stream = False
         response._close_task = None
         response._history = None
+        response.cookies = ResponseCookies(response.headers.get_list("set-cookie"), response.url)
         return response
 
     @property
@@ -576,7 +671,7 @@ class Session:
     def __init__(
         self,
         *,
-        impersonate: FingerprintInput,
+        impersonate: FingerprintInput = "chrome152",
         fingerprint_rotation: bool = True,
         headers: HeaderInput | None = None,
         proxy: str | None = None,
@@ -598,7 +693,12 @@ class Session:
         max_websocket_message_bytes: int = 16 * 1024 * 1024,
         cookie_store: bool = True,
         http_version: str = "http2",
+        max_clients: int | None = None,
     ) -> None:
+        if max_clients is not None:
+            if max_connections != 50 and max_connections != max_clients:
+                raise TypeError("max_connections和max_clients不能设置为不同值")
+            max_connections = max_clients
         _validate_timeout("timeout", timeout)
         _validate_timeout("connect_timeout", connect_timeout, optional=True)
         _validate_timeout("read_timeout", read_timeout, optional=True)
@@ -673,12 +773,13 @@ class Session:
             native_impersonate = os.fspath(impersonate)
         self.impersonate = native_impersonate
         self.fingerprint_rotation = fingerprint_rotation
-        self.headers = _header_items(headers)
+        self.headers = MutableHeaders(headers)
         self._native_headers = tuple(self.headers)
         self._default_has_content_type = any(name.lower() == "content-type" for name, _ in self.headers)
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        self.verify = verify
         self.proxy = proxy
         self.proxies = dict(proxies) if proxies is not None else None
         self.fingerprints_path = fingerprints_path
@@ -806,7 +907,7 @@ class Session:
                 ).encode()
             if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/json"))
-        elif isinstance(data, Mapping):
+        elif isinstance(data, Mapping) or _is_form_sequence(data):
             body = urlencode(data, doseq=True).encode("ascii")
             if not self._default_has_content_type and not any(name.lower() == "content-type" for name, _ in merged_headers):
                 merged_headers.append(("content-type", "application/x-www-form-urlencoded"))
@@ -934,7 +1035,16 @@ class Session:
         dns_servers: Sequence[str] | None = None,
         dns_timeout: float | None = None,
         http_version: str | None = None,
+        discard_cookies: bool = False,
+        impersonate: FingerprintInput | None = None,
+        verify: bool | None = None,
     ) -> Response:
+        if not isinstance(discard_cookies, bool):
+            raise TypeError("discard_cookies必须是bool")
+        if impersonate is not None and os.fspath(impersonate) != self.impersonate:
+            raise ValueError("请求级impersonate必须与Session指纹一致")
+        if verify is not None and verify != self.verify:
+            raise ValueError("请求级verify必须与Session配置一致")
         if files is not None and json is not None:
             raise ValueError("files不能和json同时使用")
         if transfer_stats and stream:
@@ -1009,6 +1119,7 @@ class Session:
                 dns_override,
                 native_dns_servers,
                 request_dns_timeout,
+                discard_cookies,
             )
             return Response._from_native(result)
         if stream:
@@ -1028,6 +1139,7 @@ class Session:
                 dns_override,
                 native_dns_servers,
                 request_dns_timeout,
+                discard_cookies,
             )
             history = _build_history(
                 native.history,
@@ -1062,6 +1174,7 @@ class Session:
             dns_override,
             native_dns_servers,
             request_dns_timeout,
+            discard_cookies,
         )
         return Response._from_native(result)
 
@@ -1097,9 +1210,21 @@ class Session:
 
 
 class AsyncSession:
-    def __init__(self, *, max_connections: int = 50, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        max_connections: int = 50,
+        max_clients: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if max_clients is not None:
+            if max_connections != 50 and max_connections != max_clients:
+                raise TypeError("max_connections和max_clients不能设置为不同值")
+            max_connections = max_clients
         self._session = Session(max_connections=max_connections, **kwargs)
         self.max_connections = max_connections
+        self.max_clients = max_connections
+        self.headers = self._session.headers
         self.cookies = self._session.cookies
 
     @property
@@ -1131,6 +1256,15 @@ class AsyncSession:
         dns_servers = kwargs.pop("dns_servers", None)
         dns_timeout = kwargs.pop("dns_timeout", None)
         http_version = kwargs.pop("http_version", None)
+        discard_cookies = kwargs.pop("discard_cookies", False)
+        impersonate = kwargs.pop("impersonate", None)
+        verify = kwargs.pop("verify", None)
+        if not isinstance(discard_cookies, bool):
+            raise TypeError("discard_cookies必须是bool")
+        if impersonate is not None and os.fspath(impersonate) != self._session.impersonate:
+            raise ValueError("请求级impersonate必须与Session指纹一致")
+        if verify is not None and verify != self._session.verify:
+            raise ValueError("请求级verify必须与Session配置一致")
         data = kwargs.pop("data", None)
         json = kwargs.pop("json", None)
         if files is not None and json is not None:
@@ -1211,6 +1345,7 @@ class AsyncSession:
                 dns_override,
                 native_dns_servers,
                 request_dns_timeout,
+                discard_cookies,
             )
             return _response_from_native(result)
         if stream:
@@ -1221,6 +1356,7 @@ class AsyncSession:
                 dns_override,
                 native_dns_servers,
                 request_dns_timeout,
+                discard_cookies,
             )
             return _response_from_stream(native, async_stream=True)
         result = await self._session._native.request_async(
@@ -1231,6 +1367,7 @@ class AsyncSession:
             dns_override,
             native_dns_servers,
             request_dns_timeout,
+            discard_cookies,
         )
         return _response_from_native(result)
 
