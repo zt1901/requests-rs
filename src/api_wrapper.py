@@ -22,6 +22,66 @@ FingerprintInput = str | os.PathLike[str] | FingerprintDocument
 _UNSET = object()
 
 
+class RequestException(RuntimeError):
+    """所有 requests-rs 请求异常的公共基类，并兼容既有 RuntimeError 捕获。"""
+
+    def __init__(self, message: str, *, request: Any = None, response: Any = None) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+
+class ConnectionError(RequestException):
+    """DNS、TCP、TLS 或响应体传输失败。"""
+
+
+class ProxyError(ConnectionError):
+    """HTTP CONNECT 或 SOCKS 代理握手失败。"""
+
+
+class Timeout(RequestException):
+    """连接、请求总时限或响应体读取超时。"""
+
+
+class HTTPError(RequestException):
+    """raise_for_status检测到非2xx/3xx状态。"""
+
+
+def _translate_transport_error(error: BaseException) -> RequestException:
+    """将Rust边界的RuntimeError稳定映射为可分类的requests风格异常。"""
+    if isinstance(error, RequestException):
+        return error
+    message = str(error)
+    lowered = message.casefold()
+    proxy_markers = (
+        "connection established",
+        "connect tunnel",
+        "proxy connect",
+        "proxy error",
+        "socks5",
+    )
+    timeout_markers = ("timed out", "timeout", "deadline has elapsed")
+    if any(marker in lowered for marker in proxy_markers):
+        return ProxyError(message)
+    if any(marker in lowered for marker in timeout_markers):
+        return Timeout(message)
+    return ConnectionError(message)
+
+
+def _native_call(function: Any, *args: Any) -> Any:
+    try:
+        return function(*args)
+    except RuntimeError as error:
+        raise _translate_transport_error(error) from error
+
+
+async def _native_await(function: Any, *args: Any) -> Any:
+    try:
+        return await function(*args)
+    except RuntimeError as error:
+        raise _translate_transport_error(error) from error
+
+
 class Headers(Mapping[str, str]):
     def __init__(self, values: Sequence[tuple[str, str]] = ()) -> None:
         self._native = build_response_headers(list(values))
@@ -447,8 +507,16 @@ class Response:
         return 200 <= self.status_code < 400
 
     def raise_for_status(self) -> None:
+        if self.status_code <= 0:
+            raise ProxyError(
+                f"HTTP {self.status_code}: proxy tunnel did not return an origin response: {self.url}",
+                response=self,
+            )
         if not self.ok:
-            raise RuntimeError(f"HTTP {self.status_code}: {self.url}")
+            raise HTTPError(
+                f"HTTP {self.status_code}: {self.reason} for url: {self.url}",
+                response=self,
+            )
 
     def iter_content(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
         if chunk_size <= 0:
@@ -1102,7 +1170,8 @@ class Session:
                     native_files.append((name, os.fspath(path), filename, content_type))
                 else:
                     native_files.append((name, os.fspath(file_value), None, None))
-            result = self._native.request_multipart(
+            result = _native_call(
+                self._native.request_multipart,
                 method.upper(),
                 url,
                 merged_headers,
@@ -1123,7 +1192,8 @@ class Session:
             )
             return Response._from_native(result)
         if stream:
-            native = self._native.request_stream(
+            native = _native_call(
+                self._native.request_stream,
                 method,
                 url,
                 merged_headers,
@@ -1157,7 +1227,8 @@ class Session:
                 history=history,
             )
 
-        result = self._native.request(
+        result = _native_call(
+            self._native.request,
             method,
             url,
             merged_headers,
@@ -1328,7 +1399,8 @@ class AsyncSession:
                 request_cookies,
                 request_http_version,
             ) = prepared
-            result = await self._session._native.request_multipart_async(
+            result = await _native_await(
+                self._session._native.request_multipart_async,
                 method,
                 url,
                 headers,
@@ -1349,7 +1421,8 @@ class AsyncSession:
             )
             return _response_from_native(result)
         if stream:
-            native = await self._session._native.request_stream_async(
+            native = await _native_await(
+                self._session._native.request_stream_async,
                 *prepared,
                 allow_redirects,
                 max_redirects,
@@ -1359,7 +1432,8 @@ class AsyncSession:
                 discard_cookies,
             )
             return _response_from_stream(native, async_stream=True)
-        result = await self._session._native.request_async(
+        result = await _native_await(
+            self._session._native.request_async,
             *prepared,
             allow_redirects,
             max_redirects,

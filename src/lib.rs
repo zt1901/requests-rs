@@ -5085,6 +5085,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     for name in [
         "Response",
+        "RequestException",
+        "ConnectionError",
+        "ProxyError",
+        "Timeout",
+        "HTTPError",
         "Headers",
         "Cookie",
         "Cookies",

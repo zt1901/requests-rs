@@ -394,7 +394,8 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 - `timeout`、`connect_timeout`、`read_timeout`和非空`happy_eyeballs_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
 - 无效方法、Header、代理、URL、重定向、连接、TLS、QUIC和Body错误转换为Python异常；协议偏好会在能力允许的范围内降级，最终协议见`response.http_version`。
-- `raise_for_status()`在状态码不属于200至399时抛出 `RuntimeError`。
+- `raise_for_status()`在普通非2xx/3xx状态抛出`HTTPError`；HTTP 0代理隧道伪响应抛出`ProxyError`。
+- 网络异常统一继承`RequestException`和`RuntimeError`：`ConnectionError`、`ProxyError`、`Timeout`。现有捕获`RuntimeError`的代码保持兼容，新代码应优先捕获具体异常。
 - `Response.ok`定义为 `200 <= status_code < 400`。
 
 ## 已验证范围

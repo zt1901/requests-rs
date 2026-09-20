@@ -57,6 +57,41 @@ def response(stream, *, asynchronous=False):
 
 
 class ResponseTests(unittest.TestCase):
+    def test_exception_hierarchy_and_status_classification(self):
+        self.assertTrue(issubclass(api.ProxyError, api.ConnectionError))
+        self.assertTrue(issubclass(api.ConnectionError, api.RequestException))
+        self.assertTrue(issubclass(api.HTTPError, api.RequestException))
+        self.assertTrue(issubclass(api.RequestException, RuntimeError))
+
+        not_found = api.Response(
+            status_code=404, headers=[], content=b"", url="https://example.test/missing",
+            fingerprint_id="test", impersonate="chrome152",
+        )
+        with self.assertRaises(api.HTTPError) as raised:
+            not_found.raise_for_status()
+        self.assertIs(raised.exception.response, not_found)
+
+        tunnel = api.Response(
+            status_code=0, headers=[], content=b"", url="https://example.test/",
+            fingerprint_id="test", impersonate="chrome152",
+        )
+        with self.assertRaises(api.ProxyError):
+            tunnel.raise_for_status()
+
+    def test_native_runtime_errors_are_classified(self):
+        self.assertIsInstance(
+            api._translate_transport_error(RuntimeError("HTTP Error 0: Connection established")),
+            api.ProxyError,
+        )
+        self.assertIsInstance(
+            api._translate_transport_error(RuntimeError("operation timed out")),
+            api.Timeout,
+        )
+        self.assertIsInstance(
+            api._translate_transport_error(RuntimeError("connection reset by peer")),
+            api.ConnectionError,
+        )
+
     def test_content_does_not_steal_from_iterator(self):
         stream = Stream()
         result = response(stream)
