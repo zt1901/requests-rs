@@ -235,7 +235,7 @@ def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> Non
     with Session(impersonate=测试版本, verify=False, http_version="http3") as session:
         try:
             session.get(url + "/echo", timeout=1)
-        except RuntimeError:
+        except requests.RequestException:
             pass
         else:
             raise AssertionError("模板请求不应进入无法回放浏览器指纹的通用HTTP/3后端")
@@ -328,7 +328,7 @@ def verify_schema2_http3(url: str) -> None:
     ) as limited:
         try:
             limited.get(url + "/gzip", timeout=10)
-        except RuntimeError as error:
+        except requests.RequestException as error:
             assert "max_response_bytes" in str(error)
         else:
             raise AssertionError("模板HTTP/3响应Body上限没有生效")
