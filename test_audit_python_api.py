@@ -61,7 +61,8 @@ class ResponseTests(unittest.TestCase):
         self.assertTrue(issubclass(api.ProxyError, api.ConnectionError))
         self.assertTrue(issubclass(api.ConnectionError, api.RequestException))
         self.assertTrue(issubclass(api.HTTPError, api.RequestException))
-        self.assertTrue(issubclass(api.RequestException, RuntimeError))
+        self.assertTrue(issubclass(api.RequestException, OSError))
+        self.assertFalse(issubclass(api.RequestException, RuntimeError))
 
         not_found = api.Response(
             status_code=404, headers=[], content=b"", url="https://example.test/missing",

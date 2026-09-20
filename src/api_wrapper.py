@@ -22,8 +22,8 @@ FingerprintInput = str | os.PathLike[str] | FingerprintDocument
 _UNSET = object()
 
 
-class RequestException(RuntimeError):
-    """所有 requests-rs 请求异常的公共基类，并兼容既有 RuntimeError 捕获。"""
+class RequestException(OSError):
+    """所有 requests-rs 请求异常的公共基类，与requests/curl_cffi保持一致。"""
 
     def __init__(self, message: str, *, request: Any = None, response: Any = None) -> None:
         super().__init__(message)
@@ -47,7 +47,11 @@ class HTTPError(RequestException):
     """raise_for_status检测到非2xx/3xx状态。"""
 
 
-def _translate_transport_error(error: BaseException) -> RequestException:
+def _translate_transport_error(
+    error: BaseException,
+    *,
+    proxy_used: bool = False,
+) -> RequestException:
     """将Rust边界的RuntimeError稳定映射为可分类的requests风格异常。"""
     if isinstance(error, RequestException):
         return error
@@ -57,29 +61,31 @@ def _translate_transport_error(error: BaseException) -> RequestException:
         "connection established",
         "connect tunnel",
         "proxy connect",
+        "proxyconnect",
         "proxy error",
+        "tunnel error",
         "socks5",
     )
     timeout_markers = ("timed out", "timeout", "deadline has elapsed")
-    if any(marker in lowered for marker in proxy_markers):
+    if proxy_used or any(marker in lowered for marker in proxy_markers):
         return ProxyError(message)
     if any(marker in lowered for marker in timeout_markers):
         return Timeout(message)
     return ConnectionError(message)
 
 
-def _native_call(function: Any, *args: Any) -> Any:
+def _native_call(function: Any, *args: Any, proxy_used: bool = False) -> Any:
     try:
         return function(*args)
     except RuntimeError as error:
-        raise _translate_transport_error(error) from error
+        raise _translate_transport_error(error, proxy_used=proxy_used) from error
 
 
-async def _native_await(function: Any, *args: Any) -> Any:
+async def _native_await(function: Any, *args: Any, proxy_used: bool = False) -> Any:
     try:
         return await function(*args)
     except RuntimeError as error:
-        raise _translate_transport_error(error) from error
+        raise _translate_transport_error(error, proxy_used=proxy_used) from error
 
 
 class Headers(Mapping[str, str]):
@@ -1189,6 +1195,7 @@ class Session:
                 native_dns_servers,
                 request_dns_timeout,
                 discard_cookies,
+                proxy_used=request_proxy is not None,
             )
             return Response._from_native(result)
         if stream:
@@ -1210,6 +1217,7 @@ class Session:
                 native_dns_servers,
                 request_dns_timeout,
                 discard_cookies,
+                proxy_used=request_proxy is not None,
             )
             history = _build_history(
                 native.history,
@@ -1246,6 +1254,7 @@ class Session:
             native_dns_servers,
             request_dns_timeout,
             discard_cookies,
+            proxy_used=request_proxy is not None,
         )
         return Response._from_native(result)
 
@@ -1418,6 +1427,7 @@ class AsyncSession:
                 native_dns_servers,
                 request_dns_timeout,
                 discard_cookies,
+                proxy_used=proxy is not None,
             )
             return _response_from_native(result)
         if stream:
@@ -1430,6 +1440,7 @@ class AsyncSession:
                 native_dns_servers,
                 request_dns_timeout,
                 discard_cookies,
+                proxy_used=prepared[7] is not None,
             )
             return _response_from_stream(native, async_stream=True)
         result = await _native_await(
@@ -1442,6 +1453,7 @@ class AsyncSession:
             native_dns_servers,
             request_dns_timeout,
             discard_cookies,
+            proxy_used=prepared[7] is not None,
         )
         return _response_from_native(result)
 

@@ -36,27 +36,27 @@ class ErrorDetails(unittest.TestCase):
         for code in (403, 407, 429, 502, 503, 504, 599, 631, 999):
             with self.subTest(code=code), proxy(f"HTTP/1.1 {code} Rejected\r\nContent-Length: 0\r\n\r\n".encode()) as address:
                 with requests.Session(impersonate="chrome152") as client:
-                    with self.assertRaisesRegex(RuntimeError, str(code)):
+                    with self.assertRaisesRegex(requests.ProxyError, str(code)):
                         client.get("https://example.invalid/", proxy=address, timeout=2)
                 async def check():
                     async with requests.AsyncSession(impersonate="chrome152") as client:
-                        with self.assertRaisesRegex(RuntimeError, str(code)):
+                        with self.assertRaisesRegex(requests.ProxyError, str(code)):
                             await client.get("https://example.invalid/", proxy=address, timeout=2)
                 asyncio.run(check())
 
     def test_proxy_eof(self):
         with proxy(b"") as address, requests.Session(impersonate="chrome152") as client:
-            with self.assertRaisesRegex(RuntimeError, "unexpected end of file"):
+            with self.assertRaisesRegex(requests.ProxyError, "unexpected end of file"):
                 client.get("https://example.invalid/", proxy=address, timeout=2)
 
     def test_proxy_malformed_response(self):
         with proxy(b"NOT-HTTP\r\n\r\n") as address, requests.Session(impersonate="chrome152") as client:
-            with self.assertRaisesRegex(RuntimeError, "invalid proxy response"):
+            with self.assertRaisesRegex(requests.ProxyError, "invalid proxy response"):
                 client.get("https://example.invalid/", proxy=address, timeout=2)
 
     def test_proxy_timeout(self):
         with proxy(b"", .2) as address, requests.Session(impersonate="chrome152") as client:
-            with self.assertRaisesRegex(RuntimeError, "(?i)timeout|timed out|超时"):
+            with self.assertRaisesRegex(requests.ProxyError, "(?i)timeout|timed out|超时"):
                 client.get("https://example.invalid/", proxy=address, timeout=.05)
 
 if __name__ == "__main__": unittest.main()

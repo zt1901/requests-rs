@@ -449,7 +449,7 @@ response.impersonate
 response.http_version
 response.raise_for_status()
 
-# 所有请求异常同时继承RequestException与RuntimeError，便于精准分类且保持向后兼容。
+# 所有网络请求异常继承RequestException(OSError)，不继承RuntimeError。
 try:
     response.raise_for_status()
 except requests.HTTPError as error:
