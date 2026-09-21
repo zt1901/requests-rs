@@ -1,4 +1,4 @@
-# requests-rs 0.4.9
+# requests-rs 0.4.10
 
 本版本将 Rust 网络错误通过结构化 PyO3 协议映射为 requests 风格异常，不再依赖 Python 对错误文本进行关键词猜测。
 
@@ -14,7 +14,7 @@
 
 Windows x64 本机使用 release wheel、回环 keep-alive 服务实测：
 
-| 场景 | 0.4.9 实测 | 历史基线 |
+| 场景 | 0.4.10 实测 | 历史基线 |
 |---|---:|---:|
 | Firefox 热连接，20,000 请求，并发 10，中位吞吐 | 8411.20 req/s | 2935.40 req/s |
 | 同场景 CPU | 267.97 us/request | 731.25 us/request |

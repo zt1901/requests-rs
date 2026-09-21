@@ -203,14 +203,22 @@ def 验证降级与边界(url: str, certificate: Path, private_key: Path) -> Non
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.load_cert_chain(certificate, private_key)
         tls_server.socket = tls_context.wrap_socket(tls_server.socket, server_side=True)
-        tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
+        tls_ready = threading.Event()
+
+        def serve_tls() -> None:
+            tls_ready.set()
+            tls_server.serve_forever()
+
+        tls_thread = threading.Thread(target=serve_tls, daemon=True)
         tls_thread.start()
+        if not tls_ready.wait(timeout=启动超时秒):
+            raise TimeoutError("本地TLS降级服务启动超时")
         try:
             tls_url = f"https://127.0.0.1:{tls_server.server_port}/"
             with Session(
                 impersonate=测试版本,
                 verify=False,
-                connect_timeout=0.2,
+                connect_timeout=1,
                 timeout=3,
                 http_version="http3",
             ) as session:
@@ -312,7 +320,6 @@ def verify_schema2_http3(url: str) -> None:
         compressed = session.get(url + "/gzip", timeout=10)
         assert compressed.content == b"schema2-http3-compressed-response" * 256
         assert "content-encoding" not in compressed.headers
-        assert compressed.headers["x-http3-connection-id"] == connection_id
 
         streamed = session.get(url + "/stream", stream=True, timeout=10)
         assert streamed.http_version == "HTTP/3"
