@@ -1,6 +1,6 @@
 //! Network connection types and utilities.
 
-pub(super) mod tcp;
+pub(crate) mod tcp;
 
 if_any_rt!(
     mod io;

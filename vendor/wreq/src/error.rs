@@ -226,6 +226,22 @@ impl Error {
         false
     }
 
+    /// Returns true if the error was caused by DNS resolution.
+    pub fn is_dns(&self) -> bool {
+        let mut source = self.source();
+
+        while let Some(err) = source {
+            if let Some(err) = err.downcast_ref::<crate::conn::net::tcp::ConnectError>() {
+                if err.is_dns() {
+                    return true;
+                }
+            }
+            source = err.source();
+        }
+
+        false
+    }
+
     /// Returns true if the error is related to proxy connect
     pub fn is_proxy_connect(&self) -> bool {
         use crate::client::layer::client::Error;
@@ -252,6 +268,22 @@ impl Error {
         while let Some(err) = source {
             if let Some(io) = err.downcast_ref::<io::Error>() {
                 if io.kind() == io::ErrorKind::ConnectionReset {
+                    return true;
+                }
+            }
+            source = err.source();
+        }
+
+        false
+    }
+
+    /// Returns true if the peer ended the response before its declared length.
+    pub fn is_incomplete_message(&self) -> bool {
+        let mut source = self.source();
+
+        while let Some(err) = source {
+            if let Some(core_err) = err.downcast_ref::<wreq_proto::Error>() {
+                if core_err.is_incomplete_message() {
                     return true;
                 }
             }

@@ -409,6 +409,10 @@ impl ConnectError {
     {
         move |cause| ConnectError::new(msg, cause)
     }
+
+    pub(crate) fn is_dns(&self) -> bool {
+        self.msg == "dns error"
+    }
 }
 
 impl fmt::Debug for ConnectError {

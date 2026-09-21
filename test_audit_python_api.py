@@ -60,6 +60,9 @@ class ResponseTests(unittest.TestCase):
     def test_exception_hierarchy_and_status_classification(self):
         self.assertTrue(issubclass(api.ProxyError, api.ConnectionError))
         self.assertTrue(issubclass(api.ConnectionError, api.RequestException))
+        self.assertTrue(issubclass(api.ConnectTimeout, api.ConnectionError))
+        self.assertTrue(issubclass(api.ConnectTimeout, api.Timeout))
+        self.assertTrue(issubclass(api.ReadTimeout, api.Timeout))
         self.assertTrue(issubclass(api.HTTPError, api.RequestException))
         self.assertTrue(issubclass(api.RequestException, OSError))
         self.assertFalse(issubclass(api.RequestException, RuntimeError))
@@ -79,19 +82,62 @@ class ResponseTests(unittest.TestCase):
         with self.assertRaises(api.ProxyError):
             tunnel.raise_for_status()
 
-    def test_native_runtime_errors_are_classified(self):
+    def test_native_error_kinds_are_classified(self):
         self.assertIsInstance(
-            api._translate_transport_error(RuntimeError("HTTP Error 0: Connection established")),
+            api._translate_native_error(api.NativeRequestError("proxy", "proxy failed", [])),
             api.ProxyError,
         )
         self.assertIsInstance(
-            api._translate_transport_error(RuntimeError("operation timed out")),
+            api._translate_native_error(api.NativeRequestError("timeout", "operation timed out", [])),
             api.Timeout,
         )
         self.assertIsInstance(
-            api._translate_transport_error(RuntimeError("connection reset by peer")),
+            api._translate_native_error(api.NativeRequestError("connection", "connection reset", [])),
             api.ConnectionError,
         )
+
+    def test_detailed_requests_style_error_classes(self):
+        request = api.PreparedRequest("GET", "https://example.test/")
+        cases = [
+            ("too_many_redirects", api.TooManyRedirects),
+            ("response_too_large", api.ResponseTooLarge),
+            ("chunked_encoding", api.ChunkedEncodingError),
+            ("ssl", api.SSLError),
+            ("dns", api.DNSError),
+        ]
+        for kind, exception_type in cases:
+            with self.subTest(kind=kind):
+                error = api._translate_native_error(
+                    api.NativeRequestError(kind, "detail", ["root cause"]),
+                    request=request,
+                )
+                self.assertIsInstance(error, exception_type)
+                self.assertIs(error.request, request)
+                self.assertEqual(error.kind, kind)
+                self.assertEqual(error.source_chain, ["root cause"])
+                self.assertIn("root cause", str(error))
+
+    def test_url_errors_and_json_decode_are_requests_style(self):
+        session = api.Session.__new__(api.Session)
+        session.timeout = 30
+        with self.assertRaises(api.MissingSchema):
+            session._prepare_request(
+                "GET", "example.test/path", params=None, headers=None, cookies=None,
+                data=None, json=None, timeout=None, read_timeout=None,
+                proxy=api._UNSET, proxies=None, max_redirects=10, http_version=None,
+            )
+        with self.assertRaises(api.InvalidSchema):
+            session._prepare_request(
+                "GET", "ftp://example.test/file", params=None, headers=None, cookies=None,
+                data=None, json=None, timeout=None, read_timeout=None,
+                proxy=api._UNSET, proxies=None, max_redirects=10, http_version=None,
+            )
+        invalid = api.Response(
+            status_code=200, headers=[], content=b"{bad", url="https://example.test/",
+            fingerprint_id="test", impersonate="chrome152",
+        )
+        with self.assertRaises(api.JSONDecodeError):
+            invalid.json()
 
     def test_content_does_not_steal_from_iterator(self):
         stream = Stream()

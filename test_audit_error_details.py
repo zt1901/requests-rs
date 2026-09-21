@@ -56,7 +56,7 @@ class ErrorDetails(unittest.TestCase):
 
     def test_proxy_timeout(self):
         with proxy(b"", .2) as address, requests.Session(impersonate="chrome152") as client:
-            with self.assertRaisesRegex(requests.ProxyError, "(?i)timeout|timed out|超时"):
+            with self.assertRaisesRegex(requests.Timeout, "(?i)timeout|timed out|超时"):
                 client.get("https://example.invalid/", proxy=address, timeout=.05)
 
 if __name__ == "__main__": unittest.main()

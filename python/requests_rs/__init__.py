@@ -1,5 +1,5 @@
 """Public package for requests-rs."""
 
-from . import requests
+from . import exceptions, requests
 
-__all__ = ["requests"]
+__all__ = ["requests", "exceptions"]

@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
+    error::Error as StdError,
 };
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,7 @@ use hickory_resolver::{
 use lru::LruCache;
 use once_cell::sync::OnceCell;
 use pyo3::{
+    create_exception,
     exceptions::PyRuntimeError,
     ffi::c_str,
     prelude::*,
@@ -68,6 +70,37 @@ use wreq::{
         message::{CloseCode, CloseFrame, Message, Utf8Bytes},
     },
 };
+
+create_exception!(requests_rs._native, NativeRequestError, PyRuntimeError);
+
+#[derive(Debug, Clone)]
+struct NativeErrorData {
+    kind: &'static str,
+    message: String,
+    source_chain: Vec<String>,
+}
+
+impl NativeErrorData {
+    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source_chain: Vec::new(),
+        }
+    }
+
+    fn from_error(kind: &'static str, error: &(dyn StdError + 'static)) -> Self {
+        Self {
+            kind,
+            message: error.to_string(),
+            source_chain: error_sources(error),
+        }
+    }
+
+    fn into_pyerr(self) -> PyErr {
+        NativeRequestError::new_err((self.kind, self.message, self.source_chain))
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CustomDnsResolver {
@@ -268,7 +301,7 @@ fn native_headers_from_map(headers: &HeaderMap) -> NativeHeaders {
 fn build_response_headers(headers: Vec<(String, String)>) -> NativeHeaders {
     native_headers(headers)
 }
-type NativeBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
+type NativeBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, NativeErrorData>> + Send>>;
 
 static 共享运行时: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
 static 指纹记录缓存: OnceLock<Result<Vec<Arc<Record>>, String>> = OnceLock::new();
@@ -1285,11 +1318,11 @@ async fn acquire_connection_slot(
     let started = Instant::now();
     let permit = tokio::time::timeout(timeout, state.connection_slots.clone().acquire_owned())
         .await
-        .map_err(|_| PyRuntimeError::new_err("request timeout waiting for connection slot"))?
+        .map_err(|_| native_request_error("timeout", "request timeout waiting for connection slot"))?
         .map_err(|_| PyRuntimeError::new_err("Session已经关闭"))?;
     // Pool contention consumes the same budget as the request, not a fresh timeout.
     let remaining = timeout.checked_sub(started.elapsed()).filter(|value| !value.is_zero())
-        .ok_or_else(|| PyRuntimeError::new_err("request timeout waiting for connection slot"))?;
+        .ok_or_else(|| native_request_error("timeout", "request timeout waiting for connection slot"))?;
     Ok((permit, remaining))
 }
 
@@ -2711,7 +2744,7 @@ async fn execute_request(
     if let Some(body) = body {
         request = request.body(body);
     }
-    let response = request.send().await.map_err(to_py_error)?;
+    let response = request.send().await.map_err(to_py_transport_error)?;
     let status = response.status().as_u16();
     let final_url = response.uri().to_string();
     let http_version = http_version_name(response.version()).to_string();
@@ -2742,13 +2775,20 @@ async fn execute_request(
 async fn collect_response_body<S, E>(mut stream: S, limit: usize) -> PyResult<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
-    E: std::fmt::Display,
+    E: StdError + 'static,
 {
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let chunk = chunk.map_err(|error| {
+            let kind = if let Some(error) = (&error as &dyn StdError).downcast_ref::<wreq::Error>() {
+                classify_wreq_error(error)
+            } else {
+                "chunked_encoding"
+            };
+            NativeErrorData::from_error(kind, &error).into_pyerr()
+        })?;
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(PyRuntimeError::new_err(format!(
+            return Err(native_request_error("response_too_large", format!(
                 "响应Body超过max_response_bytes限制: {limit}字节"
             )));
         }
@@ -2797,7 +2837,7 @@ async fn execute_stream_request(
     if let Some(body) = body {
         request = request.body(body);
     }
-    let response = request.send().await.map_err(to_py_error)?;
+    let response = request.send().await.map_err(to_py_transport_error)?;
     let status_code = response.status().as_u16();
     let history = response
         .extensions()
@@ -2816,11 +2856,9 @@ async fn execute_stream_request(
         .collect();
     let final_url = response.uri().to_string();
     let http_version = http_version_name(response.version()).to_string();
-    let stream: NativeBodyStream = Box::pin(
-        response
-            .bytes_stream()
-            .map(|result| result.map_err(|error| error.to_string())),
-    );
+    let stream: NativeBodyStream = Box::pin(response.bytes_stream().map(|result| {
+        result.map_err(|error| NativeErrorData::from_error(classify_wreq_error(&error), &error))
+    }));
     Ok(NativeStreamResponse {
         status_code,
         headers: response_headers,
@@ -3028,11 +3066,11 @@ async fn execute_preferred_request(
                     }
                     Err(error) if error.response_received => {
                         store_http3_capability(&state, capability_key, true)?;
-                        return Err(error.error);
+                        return Err(wrap_existing_pyerr(error.error, "http3"));
                     }
                     Err(error) if !safe_method => {
                         store_http3_capability(&state, capability_key, false)?;
-                        return Err(error.error);
+                        return Err(wrap_existing_pyerr(error.error, "http3"));
                     }
                     Err(_) => {
                         store_http3_capability(&state, capability_key, false)?;
@@ -3163,11 +3201,11 @@ async fn execute_preferred_stream_request(
                     }
                     Err(error) if error.response_received => {
                         store_http3_capability(&state, capability_key, true)?;
-                        return Err(error.error);
+                        return Err(wrap_existing_pyerr(error.error, "http3"));
                     }
                     Err(error) if !safe_method => {
                         store_http3_capability(&state, capability_key, false)?;
-                        return Err(error.error);
+                        return Err(wrap_existing_pyerr(error.error, "http3"));
                     }
                     Err(_) => {
                         store_http3_capability(&state, capability_key, false)?;
@@ -3268,7 +3306,7 @@ async fn execute_multipart_request(
     if let Some(proxy) = proxy {
         request = request.proxy(proxy);
     }
-    let response = request.send().await.map_err(to_py_error)?;
+    let response = request.send().await.map_err(to_py_transport_error)?;
     let status = response.status().as_u16();
     let final_url = response.uri().to_string();
     let http_version = http_version_name(response.version()).to_string();
@@ -3744,7 +3782,7 @@ struct StreamState {
     stream: Option<NativeBodyStream>,
     buffered: Vec<u8>,
     offset: usize,
-    terminal_error: Option<String>,
+    terminal_error: Option<NativeErrorData>,
     received_bytes: usize,
     max_response_bytes: usize,
 }
@@ -3795,7 +3833,7 @@ async fn read_stream(
     let mut state = state.lock().await;
     if let Some(error) = &state.terminal_error {
         permit.lock().ok().and_then(|mut permit| permit.take());
-        return Err(PyRuntimeError::new_err(error.clone()));
+        return Err(error.clone().into_pyerr());
     }
     while state.buffered.len().saturating_sub(state.offset) < requested {
         if closed.load(Ordering::Acquire) {
@@ -3816,27 +3854,26 @@ async fn read_stream(
         } {
             Some(Ok(chunk)) => {
                 if chunk.len() > state.max_response_bytes.saturating_sub(state.received_bytes) {
-                    let message = format!(
+                    let error = NativeErrorData::new("response_too_large", format!(
                         "响应Body超过max_response_bytes限制: {}字节", state.max_response_bytes
-                    );
+                    ));
                     state.stream = None;
                     state.buffered.clear();
                     state.offset = 0;
-                    state.terminal_error = Some(message.clone());
+                    state.terminal_error = Some(error.clone());
                     permit.lock().ok().and_then(|mut permit| permit.take());
-                    return Err(PyRuntimeError::new_err(message));
+                    return Err(error.into_pyerr());
                 }
                 state.received_bytes += chunk.len();
                 state.buffered.extend_from_slice(&chunk);
             },
             Some(Err(error)) => {
-                let message = error.to_string();
                 state.stream = None;
                 state.buffered.clear();
                 state.offset = 0;
-                state.terminal_error = Some(message.clone());
+                state.terminal_error = Some(error.clone());
                 permit.lock().ok().and_then(|mut permit| permit.take());
-                return Err(PyRuntimeError::new_err(message));
+                return Err(error.into_pyerr());
             }
             None => {
                 state.stream = None;
@@ -5034,6 +5071,64 @@ fn history_entries(history: &redirect::History) -> Vec<NativeHistoryEntry> {
         .collect()
 }
 
+fn error_sources(error: &(dyn StdError + 'static)) -> Vec<String> {
+    let message = error.to_string();
+    let mut source = error.source();
+    let mut seen = HashSet::new();
+    seen.insert(message.clone());
+    let mut sources = Vec::new();
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !detail.is_empty() && !message.contains(&detail) && seen.insert(detail.clone()) {
+            sources.push(detail);
+        }
+        source = cause.source();
+    }
+    sources
+}
+
+fn classify_wreq_error(error: &wreq::Error) -> &'static str {
+    if error.is_proxy_connect() {
+        "proxy"
+    } else if error.is_dns() {
+        "dns"
+    } else if error.is_timeout() {
+        "timeout"
+    } else if error.is_redirect() {
+        "too_many_redirects"
+    } else if error.is_tls() {
+        "ssl"
+    } else if error.is_incomplete_message() {
+        "chunked_encoding"
+    } else if error.is_decode() {
+        "content_decoding"
+    } else if error.is_body() {
+        "chunked_encoding"
+    } else if error.is_connect() || error.is_connection_reset() {
+        "connection"
+    } else {
+        "request"
+    }
+}
+
+fn native_request_error(kind: &'static str, message: impl Into<String>) -> PyErr {
+    NativeErrorData::new(kind, message).into_pyerr()
+}
+
+fn wrap_existing_pyerr(error: PyErr, kind: &'static str) -> PyErr {
+    Python::attach(|py| {
+        if error.is_instance_of::<NativeRequestError>(py) {
+            error
+        } else {
+            native_request_error(kind, error.to_string())
+        }
+    })
+}
+
+fn to_py_transport_error(error: wreq::Error) -> PyErr {
+    NativeErrorData::from_error(classify_wreq_error(&error), &error).into_pyerr()
+}
+
 fn to_py_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
@@ -5074,6 +5169,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeStreamResponse>()?;
     module.add_class::<NativeHeaders>()?;
     module.add_class::<NativeResponse>()?;
+    module.add("NativeRequestError", module.py().get_type::<NativeRequestError>())?;
     module.add_function(wrap_pyfunction!(available_profiles, module)?)?;
     module.add_function(wrap_pyfunction!(build_response_headers, module)?)?;
     module.add("readme", 版权说明)?;
@@ -5087,9 +5183,22 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "Response",
         "RequestException",
         "ConnectionError",
+        "DNSError",
         "ProxyError",
         "Timeout",
+        "ConnectTimeout",
+        "ReadTimeout",
         "HTTPError",
+        "TooManyRedirects",
+        "InvalidURL",
+        "MissingSchema",
+        "InvalidSchema",
+        "SSLError",
+        "ChunkedEncodingError",
+        "ContentDecodingError",
+        "ResponseTooLarge",
+        "JSONDecodeError",
+        "PreparedRequest",
         "Headers",
         "Cookie",
         "Cookies",

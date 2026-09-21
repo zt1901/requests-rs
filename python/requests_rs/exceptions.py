@@ -1,0 +1,41 @@
+"""与 requests 同名的公开异常入口。"""
+
+from ._native import (
+    ChunkedEncodingError,
+    ConnectTimeout,
+    ConnectionError,
+    DNSError,
+    ContentDecodingError,
+    HTTPError,
+    InvalidSchema,
+    InvalidURL,
+    JSONDecodeError,
+    MissingSchema,
+    ProxyError,
+    ReadTimeout,
+    RequestException,
+    ResponseTooLarge,
+    SSLError,
+    Timeout,
+    TooManyRedirects,
+)
+
+__all__ = [
+    "RequestException",
+    "ConnectionError",
+    "DNSError",
+    "ProxyError",
+    "SSLError",
+    "Timeout",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "HTTPError",
+    "TooManyRedirects",
+    "InvalidURL",
+    "MissingSchema",
+    "InvalidSchema",
+    "ChunkedEncodingError",
+    "ContentDecodingError",
+    "ResponseTooLarge",
+    "JSONDecodeError",
+]

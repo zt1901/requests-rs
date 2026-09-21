@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request
 
-from ._native import NativeSession, build_response_headers
+from ._native import NativeRequestError, NativeSession, build_response_headers
 
 
 HeaderInput = Mapping[str, str] | Sequence[tuple[str, str]]
@@ -35,6 +35,10 @@ class ConnectionError(RequestException):
     """DNS、TCP、TLS 或响应体传输失败。"""
 
 
+class DNSError(ConnectionError):
+    """目标主机或代理域名解析失败。"""
+
+
 class ProxyError(ConnectionError):
     """HTTP CONNECT 或 SOCKS 代理握手失败。"""
 
@@ -43,49 +47,133 @@ class Timeout(RequestException):
     """连接、请求总时限或响应体读取超时。"""
 
 
+class ConnectTimeout(ConnectionError, Timeout):
+    """建立DNS、TCP、代理或TLS连接时超时。"""
+
+
+class ReadTimeout(Timeout):
+    """等待响应头或响应体时超时。"""
+
+
 class HTTPError(RequestException):
     """raise_for_status检测到非2xx/3xx状态。"""
 
 
-def _translate_transport_error(
-    error: BaseException,
+class TooManyRedirects(RequestException):
+    """重定向次数超过请求限制。"""
+
+
+class InvalidURL(RequestException, ValueError):
+    """请求URL无法解析或缺少必要部分。"""
+
+
+class MissingSchema(InvalidURL):
+    """请求URL缺少协议。"""
+
+
+class InvalidSchema(InvalidURL):
+    """请求URL使用不支持的协议。"""
+
+
+class SSLError(ConnectionError):
+    """TLS握手或证书验证失败。"""
+
+
+class ChunkedEncodingError(RequestException):
+    """响应体提前结束或传输编码损坏。"""
+
+
+class ContentDecodingError(RequestException):
+    """响应体解压或解码失败。"""
+
+
+class ResponseTooLarge(RequestException):
+    """响应体超过Session配置的内存上限。"""
+
+
+class JSONDecodeError(RequestException, json_module.JSONDecodeError):
+    """响应正文不是有效JSON。"""
+
+    def __init__(self, message: str, document: str, position: int) -> None:
+        json_module.JSONDecodeError.__init__(self, message, document, position)
+        self.request = None
+        self.response = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    method: str
+    url: str
+    headers: tuple[tuple[str, str], ...] = ()
+    body: bytes | None = None
+
+
+_NATIVE_ERROR_TYPES = {
+    "request": RequestException,
+    "connection": ConnectionError,
+    "dns": DNSError,
+    "proxy": ProxyError,
+    "ssl": SSLError,
+    "timeout": Timeout,
+    "connect_timeout": ConnectTimeout,
+    "read_timeout": ReadTimeout,
+    "too_many_redirects": TooManyRedirects,
+    "invalid_url": InvalidURL,
+    "missing_schema": MissingSchema,
+    "invalid_schema": InvalidSchema,
+    "chunked_encoding": ChunkedEncodingError,
+    "content_decoding": ContentDecodingError,
+    "response_too_large": ResponseTooLarge,
+    "http3": ConnectionError,
+}
+
+
+def _translate_native_error(
+    error: NativeRequestError,
     *,
-    proxy_used: bool = False,
+    request: PreparedRequest | None = None,
 ) -> RequestException:
-    """将Rust边界的RuntimeError稳定映射为可分类的requests风格异常。"""
-    if isinstance(error, RequestException):
-        return error
-    message = str(error)
-    lowered = message.casefold()
-    proxy_markers = (
-        "connection established",
-        "connect tunnel",
-        "proxy connect",
-        "proxyconnect",
-        "proxy error",
-        "tunnel error",
-        "socks5",
-    )
-    timeout_markers = ("timed out", "timeout", "deadline has elapsed")
-    if proxy_used or any(marker in lowered for marker in proxy_markers):
-        return ProxyError(message)
-    if any(marker in lowered for marker in timeout_markers):
-        return Timeout(message)
-    return ConnectionError(message)
+    try:
+        kind, message, source_chain = error.args
+    except (TypeError, ValueError):
+        return RequestException(str(error), request=request)
+    exception_type = _NATIVE_ERROR_TYPES.get(kind, RequestException)
+    details = [str(item) for item in source_chain if item and str(item) not in message]
+    full_message = message
+    if details:
+        full_message += "; caused by: " + "; caused by: ".join(details)
+    result = exception_type(full_message, request=request)
+    result.kind = kind
+    result.source_chain = list(source_chain)
+    return result
 
 
-def _native_call(function: Any, *args: Any, proxy_used: bool = False) -> Any:
+def _native_call(
+    function: Any,
+    *args: Any,
+    proxy_used: bool = False,
+    request: PreparedRequest | None = None,
+) -> Any:
     try:
         return function(*args)
+    except NativeRequestError as error:
+        raise _translate_native_error(error, request=request) from error
     except RuntimeError as error:
-        raise _translate_transport_error(error, proxy_used=proxy_used) from error
+        raise RequestException(str(error), request=request) from error
 
 
-async def _native_await(function: Any, *args: Any, proxy_used: bool = False) -> Any:
+async def _native_await(
+    function: Any,
+    *args: Any,
+    proxy_used: bool = False,
+    request: PreparedRequest | None = None,
+) -> Any:
     try:
         return await function(*args)
+    except NativeRequestError as error:
+        raise _translate_native_error(error, request=request) from error
     except RuntimeError as error:
-        raise _translate_transport_error(error, proxy_used=proxy_used) from error
+        raise RequestException(str(error), request=request) from error
 
 
 class Headers(Mapping[str, str]):
@@ -396,6 +484,7 @@ class Response:
         self._async_stream = False
         self._close_task = None
         self.history = list(history)
+        self.request = None
 
     @classmethod
     def _from_native(cls, native: Any) -> "Response":
@@ -415,6 +504,7 @@ class Response:
         response._async_stream = False
         response._close_task = None
         response._history = None
+        response.request = None
         response.cookies = ResponseCookies(response.headers.get_list("set-cookie"), response.url)
         return response
 
@@ -503,10 +593,17 @@ class Response:
         return content.decode(self._charset(self.headers.get("content-type", "")), errors="replace")
 
     async def ajson(self) -> Any:
-        return json_module.loads(await self.aread())
+        content = await self.aread()
+        try:
+            return json_module.loads(content)
+        except json_module.JSONDecodeError as error:
+            raise JSONDecodeError(error.msg, error.doc, error.pos) from error
 
     def json(self) -> Any:
-        return json_module.loads(self.content)
+        try:
+            return json_module.loads(self.content)
+        except json_module.JSONDecodeError as error:
+            raise JSONDecodeError(error.msg, error.doc, error.pos) from error
 
     @property
     def ok(self) -> bool:
@@ -521,6 +618,7 @@ class Response:
         if not self.ok:
             raise HTTPError(
                 f"HTTP {self.status_code}: {self.reason} for url: {self.url}",
+                request=self.request,
                 response=self,
             )
 
@@ -932,6 +1030,17 @@ class Session:
         max_redirects: int,
         http_version: str | None,
     ):
+        if not isinstance(url, str):
+            raise InvalidURL(f"Invalid URL {url!r}: URL must be a string")
+        parsed_url = urlsplit(url)
+        if not parsed_url.scheme:
+            raise MissingSchema(
+                f"Invalid URL {url!r}: No scheme supplied. Perhaps you meant https://{url}?"
+            )
+        if parsed_url.scheme.casefold() not in {"http", "https"}:
+            raise InvalidSchema(f"No connection adapters were found for {url!r}")
+        if not parsed_url.hostname:
+            raise InvalidURL(f"Invalid URL {url!r}: No host supplied")
         request_timeout = self.timeout if timeout is None else timeout
         _validate_timeout("timeout", request_timeout)
         request_read_timeout = self.read_timeout if read_timeout is None else read_timeout
@@ -1161,6 +1270,7 @@ class Session:
             request_cookies,
             request_http_version,
         ) = prepared
+        request_context = PreparedRequest(method, url, tuple(merged_headers), body)
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -1196,8 +1306,11 @@ class Session:
                 request_dns_timeout,
                 discard_cookies,
                 proxy_used=request_proxy is not None,
+                request=request_context,
             )
-            return Response._from_native(result)
+            response = Response._from_native(result)
+            response.request = request_context
+            return response
         if stream:
             native = _native_call(
                 self._native.request_stream,
@@ -1218,13 +1331,14 @@ class Session:
                 request_dns_timeout,
                 discard_cookies,
                 proxy_used=request_proxy is not None,
+                request=request_context,
             )
             history = _build_history(
                 native.history,
                 native.fingerprint_id,
                 native.impersonate,
             )
-            return Response(
+            response = Response(
                 status_code=native.status_code,
                 headers=native.headers,
                 url=native.url,
@@ -1234,6 +1348,8 @@ class Session:
                 http_version=native.http_version,
                 history=history,
             )
+            response.request = request_context
+            return response
 
         result = _native_call(
             self._native.request,
@@ -1255,8 +1371,11 @@ class Session:
             request_dns_timeout,
             discard_cookies,
             proxy_used=request_proxy is not None,
+            request=request_context,
         )
-        return Response._from_native(result)
+        response = Response._from_native(result)
+        response.request = request_context
+        return response
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return self.request("GET", url, **kwargs)
@@ -1381,6 +1500,9 @@ class AsyncSession:
             unexpected = next(iter(kwargs))
             raise TypeError(f"request() got an unexpected keyword argument {unexpected!r}")
         request_http_version = prepared[-1]
+        request_context = PreparedRequest(
+            prepared[0], prepared[1], tuple(prepared[2]), prepared[3]
+        )
         if files is not None:
             if stream:
                 raise ValueError("multipart响应暂不支持stream=True")
@@ -1428,8 +1550,11 @@ class AsyncSession:
                 request_dns_timeout,
                 discard_cookies,
                 proxy_used=proxy is not None,
+                request=request_context,
             )
-            return _response_from_native(result)
+            response = _response_from_native(result)
+            response.request = request_context
+            return response
         if stream:
             native = await _native_await(
                 self._session._native.request_stream_async,
@@ -1441,8 +1566,11 @@ class AsyncSession:
                 request_dns_timeout,
                 discard_cookies,
                 proxy_used=prepared[7] is not None,
+                request=request_context,
             )
-            return _response_from_stream(native, async_stream=True)
+            response = _response_from_stream(native, async_stream=True)
+            response.request = request_context
+            return response
         result = await _native_await(
             self._session._native.request_async,
             *prepared,
@@ -1454,8 +1582,11 @@ class AsyncSession:
             request_dns_timeout,
             discard_cookies,
             proxy_used=prepared[7] is not None,
+            request=request_context,
         )
-        return _response_from_native(result)
+        response = _response_from_native(result)
+        response.request = request_context
+        return response
 
     async def websocket(
         self,
