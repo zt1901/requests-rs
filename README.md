@@ -113,13 +113,15 @@ asyncio.run(main())
 python -m pip install -U requests-rs
 ```
 
-当前 wheel 使用 CPython Stable ABI，支持 CPython 3.10 及以上版本。PyPI 已提供 Windows x64 与 manylinux2014 x64 wheel；其他平台请查看下方支持矩阵或从源码构建。
+当前 wheel 使用 CPython Stable ABI，支持 CPython 3.10 及以上版本。PyPI 提供 Windows x64/ARM64、Linux x64/ARM64 与 macOS Apple Silicon wheel；平台要求见下方矩阵。
 
-唯一公开导入入口：
+公开导入入口：
 
 ```python
 from requests_rs import requests
 ```
+
+完整参数、异常处理和流式用法见 [使用手册](API_USAGE.md)。
 
 ### 同步请求
 
@@ -348,7 +350,7 @@ HTTP/3 仍在持续进行独立互操作验证，不应把“请求成功”误�
 - 每个指纹变体拥有隔离的 Client、TLS session 与请求级 DNS Client 缓存；
 - `set_proxy()` 通过原子快照切换默认代理，并清理旧 Client、DNS、H3、Origin 与 TLS ticket 状态；
 - `max_cached_origins` 为高基数域名和代理身份提供有界缓存边界；
-- `max_response_bytes` 默认限制解压后的响应累计大小，阻止压缩炸弹和并发大 Body 无限吃内存；
+- `max_response_bytes` 默认限制完整响应及流式响应累计解压后的 Body 大小，阻止压缩炸弹和并发大 Body 无限吃内存；
 - H1/H2 流式响应支持分块消费，EOF、错误、取消或关闭时释放原生许可；
 - Session 关闭后拒绝新请求，并唤醒正在等待并发槽位的任务。
 
@@ -359,10 +361,10 @@ HTTP/3 仍在持续进行独立互操作验证，不应把“请求成功”误�
 | 平台 | Rust target | wheel 标签 | 当前发布状态 |
 |---|---|---|---|
 | Windows x64 | `x86_64-pc-windows-msvc` | `win_amd64` | PyPI wheel |
-| Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux2014_x86_64` | PyPI wheel，glibc >= 2.17 |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | CI 构建与安装验证，暂未发布 PyPI |
+| Linux x64 | `x86_64-unknown-linux-gnu` | `manylinux_2_34_x86_64` | PyPI wheel，glibc >= 2.34 |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `win_arm64` | PyPI wheel，原生 ARM64 回归通过 |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `manylinux_2_34_aarch64` | PyPI wheel，glibc >= 2.34，原生 ARM64 完整回归通过 |
-| macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | CI 构建与安装验证，暂未发布 PyPI |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `macosx_11_0_arm64` | PyPI wheel，原生平台回归通过 |
 
 Alpine musl 与 macOS Intel 当前不在公开发布矩阵中。安装时必须选择与操作系统和 CPU 匹配的 wheel。
 
@@ -371,7 +373,7 @@ Alpine musl 与 macOS Intel 当前不在公开发布矩阵中。安装时必须�
 - [`examples/basic_sync.py`](examples/basic_sync.py)：同步请求与响应字段。
 - [`examples/async_concurrency.py`](examples/async_concurrency.py)：复用一个 `AsyncSession` 进行原生异步并发。
 - [`examples/custom_fingerprint.py`](examples/custom_fingerprint.py)：动态加载捕获器 JSON 并保留 Header 顺序。
-- [API 使用手册](API_USAGE.md)：完整参数、DNS、代理、Cookie、WebSocket、流和 multipart。
+- [使用手册](API_USAGE.md)：安装、参数、响应与异常、DNS、代理、WebSocket、流和 multipart。
 - [AI 与维护者手册](AI_USAGE_GUIDE.md)：并发语义、资源边界、错误模型与工程决策。
 - [指纹研究边界](RESEARCH_BASELINE.md)：profile 与业务 Header/Cookie/Token 的职责边界。
 - [仓库与发布约定](REPOSITORY_DISTRIBUTION.md)：构建矩阵、发布和交付规则。

@@ -1,10 +1,10 @@
-# requests-rs 0.4.0 AI使用手册
+# requests-rs 0.4.10 维护者手册
 
 ## 定位
 
-`requests-rs`是Python 3.10+的浏览器指纹HTTP、HTTP/3、代理和WebSocket原生扩展，唯一公开调用方式是`from requests_rs import requests`。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过quiche/BoringSSL执行schema 2模板驱动的HTTP/3，并通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
+`requests-rs`是Python 3.10+的浏览器指纹HTTP、HTTP/3、代理和WebSocket原生扩展。公开入口为`from requests_rs import requests`，异常也可通过`from requests_rs import exceptions`导入。Python负责逐请求参数描述和结果消费；Rust通过wreq/BoringSSL执行HTTP/1.1/2，通过quiche/BoringSSL执行schema 2模板驱动的HTTP/3，并通过统一Tokio Runtime管理DNS、IPv4/IPv6、连接池、Cookie、超时、流、multipart和并发调度。异步网络路径不经过`asyncio.to_thread`。
 
-当前完整回归成品为`requests_rs-0.4.0-cp310-abi3-win_amd64.whl`，支持64位CPython 3.10及以上普通GIL版本。wheel内置BoringSSL、wreq、quiche、Tokio、指纹和Python API包装，不需要Rust、CMake、Visual Studio、Playwright、curl_cffi或额外VC++运行库。Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon wheel由对应原生GitHub runner构建和安装冒烟；必须安装与平台、CPU匹配的wheel。
+当前发布版本为`0.4.10`，要求CPython 3.10及以上；Windows x64/ARM64、Linux x64/ARM64及macOS Apple Silicon wheel已在各自平台完成CI回归并发布到PyPI。wheel内置BoringSSL、wreq、quiche、Tokio、指纹和Python API包装，安装wheel无需Rust、CMake、Visual Studio、Playwright或curl_cffi。安装包必须与平台、CPU匹配；Linux wheel要求glibc 2.34及以上。
 
 ## 导入
 
@@ -395,7 +395,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 - `timeout`、`connect_timeout`、`read_timeout`和非空`happy_eyeballs_timeout`必须是有限正数；NaN、Infinity、0和负数会被拒绝，不会触发Rust panic。
 - 无效方法、Header、代理、URL、重定向、连接、TLS、QUIC和Body错误转换为Python异常；协议偏好会在能力允许的范围内降级，最终协议见`response.http_version`。
 - `raise_for_status()`在普通非2xx/3xx状态抛出`HTTPError`；HTTP 0代理隧道伪响应抛出`ProxyError`。
-- 网络异常统一继承`RequestException(OSError)`：`ConnectionError`、`ProxyError`、`Timeout`；普通HTTP状态错误使用`HTTPError`。`RuntimeError`只表示流生命周期、Session关闭或其他内部状态错误。
+- 网络异常经PyO3传递结构化`NativeRequestError(kind, message, source_chain)`，公开异常按`kind`映射，不解析报错文案。`DNSError`、`ConnectionError`、`ProxyError`、`SSLError`、`Timeout`、`TooManyRedirects`、正文错误等均继承`RequestException(OSError)`；普通HTTP状态错误使用`HTTPError`，并绑定`request`与`response`。底层错误链可通过`source_chain`查看。
 - `Response.ok`定义为 `200 <= status_code < 400`。
 
 ## 已验证范围
@@ -414,7 +414,7 @@ await asyncio.gather(*(worker() for _ in range(concurrency)))
 
 ## 已知边界
 
-- 原生wheel必须与操作系统和CPU架构匹配；Windows ARM64、Linux x64、Linux ARM64和macOS Apple Silicon已通过原生安装冒烟，当前完整协议回归以Windows x64为准。
+- 原生wheel必须与操作系统和CPU架构匹配；Windows x64/ARM64、Linux x64/ARM64和macOS Apple Silicon均已在原生CI完成构建及对应平台回归，`0.4.10`五个平台wheel均已发布到PyPI。
 - 当前manylinux目标依赖glibc，不代表Alpine musl支持。
 - schema 2完整模板的直连HTTPS请求可走可验证的quiche+BoringSSL H3路径；schema 1、代理及其他不支持H3的场景走H2/H1.1。WebSocket单独配置。
 - 不支持跨指纹连接池复用，这是保证指纹真实性的必要限制。
